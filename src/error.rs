@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+use crate::judge::JudgeError;
 use crate::persist::PersistError;
 use crate::provider::ProviderError;
 use crate::task::TaskError;
@@ -14,6 +15,8 @@ pub enum Error {
     Task(#[from] TaskError),
     #[error(transparent)]
     Persist(#[from] PersistError),
+    #[error(transparent)]
+    Judge(#[from] JudgeError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }

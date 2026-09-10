@@ -1,16 +1,19 @@
+use serde::Serialize;
 use std::fs;
 use std::path::Path;
 
-use serde::Serialize;
 use thiserror::Error;
 
 use crate::compare::Comparison;
 use crate::evaluate::EvaluatedResult;
+use crate::judge::Judgment;
 
 #[derive(Debug, Serialize)]
 pub struct Output {
     pub results: Vec<EvaluatedResult>,
     pub comparisons: Vec<Comparison>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub judgments: Vec<Judgment>,
 }
 
 #[derive(Debug, Error)]

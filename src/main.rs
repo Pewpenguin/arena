@@ -5,6 +5,7 @@ use arena::compare::compare_all;
 use arena::error::Result;
 use arena::evaluate::evaluate_result;
 use arena::execute::execute_models;
+use arena::judge::judge_pair;
 use arena::persist::{self, Output};
 use arena::provider::{CompletionRequest, DeepInfraProvider, ModelId, ModelProvider};
 use arena::task;
@@ -28,6 +29,7 @@ async fn main() -> Result<()> {
             tasks,
             models,
             output,
+            judge,
         } => {
             let provider = DeepInfraProvider::from_env()?;
             let tasks = task::load(tasks)?;
@@ -41,9 +43,37 @@ async fn main() -> Result<()> {
             }
 
             let comparisons = compare_all(&results);
+
+            let mut judgments = Vec::new();
+            if let Some(judge_model) = judge {
+                let judge_model = ModelId::new(judge_model);
+                for task in &tasks {
+                    let task_results: Vec<_> = results
+                        .iter()
+                        .filter(|result| result.task_id == task.id)
+                        .collect();
+
+                    for i in 0..task_results.len() {
+                        for j in (i + 1)..task_results.len() {
+                            judgments.push(
+                                judge_pair(
+                                    &provider,
+                                    judge_model.clone(),
+                                    task,
+                                    task_results[i],
+                                    task_results[j],
+                                )
+                                .await?,
+                            );
+                        }
+                    }
+                }
+            }
+
             let output_data = Output {
                 results,
                 comparisons,
+                judgments,
             };
 
             if let Some(path) = output {

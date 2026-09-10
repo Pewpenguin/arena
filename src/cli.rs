@@ -24,5 +24,7 @@ pub enum Command {
         models: Vec<String>,
         #[arg(long)]
         output: Option<PathBuf>,
+        #[arg(long)]
+        judge: Option<String>,
     },
 }
