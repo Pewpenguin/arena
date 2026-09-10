@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod compare;
 pub mod error;
 pub mod evaluate;
 pub mod execute;

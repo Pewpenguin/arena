@@ -1,10 +1,11 @@
 use clap::Parser;
 
 use arena::cli::{Cli, Command};
+use arena::compare::compare_all;
 use arena::error::Result;
 use arena::evaluate::evaluate_result;
 use arena::execute::execute_models;
-use arena::persist;
+use arena::persist::{self, Output};
 use arena::provider::{CompletionRequest, DeepInfraProvider, ModelId, ModelProvider};
 use arena::task;
 
@@ -39,10 +40,16 @@ async fn main() -> Result<()> {
                 }
             }
 
+            let comparisons = compare_all(&results);
+            let output_data = Output {
+                results,
+                comparisons,
+            };
+
             if let Some(path) = output {
-                persist::write(path, &results)?;
+                persist::write(path, &output_data)?;
             } else {
-                println!("{}", serde_json::to_string_pretty(&results)?);
+                println!("{}", serde_json::to_string_pretty(&output_data)?);
             }
         }
     }
