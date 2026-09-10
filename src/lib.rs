@@ -1,5 +1,4 @@
 pub mod cli;
-pub mod config;
 pub mod error;
 pub mod evaluate;
 pub mod execute;

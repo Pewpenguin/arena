@@ -3,7 +3,7 @@ use std::path::Path;
 
 use thiserror::Error;
 
-use crate::execute::ExecutionResult;
+use crate::evaluate::EvaluatedResult;
 
 #[derive(Debug, Error)]
 pub enum PersistError {
@@ -13,7 +13,7 @@ pub enum PersistError {
     Serialize(#[from] serde_json::Error),
 }
 
-pub fn write(path: impl AsRef<Path>, results: &[ExecutionResult]) -> Result<(), PersistError> {
+pub fn write(path: impl AsRef<Path>, results: &[EvaluatedResult]) -> Result<(), PersistError> {
     let contents = serde_json::to_string_pretty(results)?;
     fs::write(path, contents)?;
     Ok(())

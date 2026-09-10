@@ -8,6 +8,15 @@ use thiserror::Error;
 pub struct Task {
     pub id: String,
     pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation: Option<TaskEvaluation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum TaskEvaluation {
+    #[serde(rename = "exact")]
+    Exact { expected: String },
 }
 
 #[derive(Debug, Error)]
@@ -32,27 +41,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_task_list() {
+    fn parses_task_without_evaluation() {
+        let tasks = parse(r#"[{"id": "t1", "prompt": "Say hello"}]"#).unwrap();
+
+        assert_eq!(
+            tasks,
+            vec![Task {
+                id: "t1".into(),
+                prompt: "Say hello".into(),
+                evaluation: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_task_with_exact_evaluation() {
         let tasks = parse(
             r#"[
-                {"id": "t1", "prompt": "Say hello"},
-                {"id": "t2", "prompt": "Say goodbye"}
+                {
+                    "id": "t2",
+                    "prompt": "What is the capital of France? Answer with only the city name.",
+                    "evaluation": {
+                        "type": "exact",
+                        "expected": "Paris"
+                    }
+                }
             ]"#,
         )
         .unwrap();
 
         assert_eq!(
             tasks,
-            vec![
-                Task {
-                    id: "t1".into(),
-                    prompt: "Say hello".into(),
-                },
-                Task {
-                    id: "t2".into(),
-                    prompt: "Say goodbye".into(),
-                },
-            ]
+            vec![Task {
+                id: "t2".into(),
+                prompt: "What is the capital of France? Answer with only the city name.".into(),
+                evaluation: Some(TaskEvaluation::Exact {
+                    expected: "Paris".into(),
+                }),
+            }]
         );
     }
 

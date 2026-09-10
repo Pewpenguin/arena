@@ -1,0 +1,14 @@
+[
+  {
+    "id": "t1",
+    "prompt": "Explain Rust ownership in two sentences."
+  },
+  {
+    "id": "t2",
+    "prompt": "What is the capital of France? Answer with only the city name.",
+    "evaluation": {
+      "type": "exact",
+      "expected": "Paris"
+    }
+  }
+]

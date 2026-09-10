@@ -1,9 +1,8 @@
 use clap::Parser;
-use tracing_subscriber::EnvFilter;
 
 use arena::cli::{Cli, Command};
-use arena::config::Config;
-use arena::error::{Error, Result};
+use arena::error::Result;
+use arena::evaluate::evaluate_result;
 use arena::execute::execute_models;
 use arena::persist;
 use arena::provider::{CompletionRequest, DeepInfraProvider, ModelId, ModelProvider};
@@ -12,8 +11,6 @@ use arena::task;
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config = Config::from_cli(&cli);
-    init_tracing(&config)?;
 
     match cli.command {
         Command::Run { model, prompt } => {
@@ -37,7 +34,9 @@ async fn main() -> Result<()> {
 
             let mut results = Vec::new();
             for task in &tasks {
-                results.extend(execute_models(&provider, task, &models).await?);
+                for result in execute_models(&provider, task, &models).await? {
+                    results.push(evaluate_result(task, result));
+                }
             }
 
             if let Some(path) = output {
@@ -47,19 +46,6 @@ async fn main() -> Result<()> {
             }
         }
     }
-
-    Ok(())
-}
-
-fn init_tracing(config: &Config) -> Result<()> {
-    let filter = EnvFilter::builder()
-        .with_default_directive(config.log_level.into())
-        .from_env_lossy();
-
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .try_init()
-        .map_err(|_| Error::LoggingInit)?;
 
     Ok(())
 }

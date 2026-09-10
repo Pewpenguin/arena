@@ -5,9 +5,6 @@ use clap::{Parser, Subcommand};
 #[derive(Debug, Parser)]
 #[command(name = "arena", version, about = "Arena")]
 pub struct Cli {
-    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
-    pub verbose: u8,
-
     #[command(subcommand)]
     pub command: Command,
 }
