@@ -7,6 +7,7 @@ use thiserror::Error;
 use crate::compare::Comparison;
 use crate::evaluate::EvaluatedResult;
 use crate::judge::Judgment;
+use crate::stats::ModelStats;
 
 #[derive(Debug, Serialize)]
 pub struct Output {
@@ -14,6 +15,8 @@ pub struct Output {
     pub comparisons: Vec<Comparison>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub judgments: Vec<Judgment>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub statistics: Vec<ModelStats>,
 }
 
 #[derive(Debug, Error)]

@@ -6,4 +6,5 @@ pub mod execute;
 pub mod judge;
 pub mod persist;
 pub mod provider;
+pub mod stats;
 pub mod task;

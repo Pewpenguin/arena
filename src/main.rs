@@ -8,6 +8,7 @@ use arena::execute::execute_models;
 use arena::judge::judge_pair;
 use arena::persist::{self, Output};
 use arena::provider::{CompletionRequest, DeepInfraProvider, ModelId, ModelProvider};
+use arena::stats;
 use arena::task;
 
 #[tokio::main]
@@ -70,10 +71,12 @@ async fn main() -> Result<()> {
                 }
             }
 
+            let statistics = stats::aggregate(&judgments);
             let output_data = Output {
                 results,
                 comparisons,
                 judgments,
+                statistics,
             };
 
             if let Some(path) = output {
