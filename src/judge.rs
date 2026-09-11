@@ -20,6 +20,13 @@ pub struct Judgment {
     pub model_b: ModelId,
     pub judge_model: ModelId,
     pub winner: JudgeDecision,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedDecision {
+    pub winner: JudgeDecision,
+    pub reason: String,
 }
 
 #[derive(Debug, Error)]
@@ -48,20 +55,21 @@ pub fn build_judge_prompt(task: &Task, response_a: &str, response_b: &str) -> St
          Which response better satisfies the user's task?\n\
          \n\
          Reply with only valid JSON in exactly one of these forms:\n\
-         {{\"winner\":\"a\"}}\n\
-         {{\"winner\":\"b\"}}\n\
-         {{\"winner\":\"draw\"}}",
+         {{\"winner\":\"a\",\"reason\":\"<short explanation>\"}}\n\
+         {{\"winner\":\"b\",\"reason\":\"<short explanation>\"}}\n\
+         {{\"winner\":\"draw\",\"reason\":\"<short explanation>\"}}",
         prompt = task.prompt,
         response_a = response_a,
         response_b = response_b,
     )
 }
 
-pub fn parse_decision(text: &str) -> Result<JudgeDecision, JudgeError> {
+pub fn parse_decision(text: &str) -> Result<ParsedDecision, JudgeError> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Payload {
         winner: JudgeDecision,
+        reason: String,
     }
 
     let trimmed = text.trim();
@@ -71,7 +79,12 @@ pub fn parse_decision(text: &str) -> Result<JudgeDecision, JudgeError> {
         let start = search_from + offset;
         let mut deserializer = serde_json::Deserializer::from_str(&trimmed[start..]);
         match Payload::deserialize(&mut deserializer) {
-            Ok(payload) => return Ok(payload.winner),
+            Ok(payload) => {
+                return Ok(ParsedDecision {
+                    winner: payload.winner,
+                    reason: payload.reason,
+                });
+            }
             Err(_) => search_from = start + 1,
         }
     }
@@ -101,14 +114,15 @@ pub async fn judge_pair(
         })
         .await?;
 
-    let winner = parse_decision(&response.text)?;
+    let decision = parse_decision(&response.text)?;
 
     Ok(Judgment {
         task_id: result_a.task_id.clone(),
         model_a: result_a.model.clone(),
         model_b: result_b.model.clone(),
         judge_model,
-        winner,
+        winner: decision.winner,
+        reason: decision.reason,
     })
 }
 
@@ -118,43 +132,53 @@ mod tests {
 
     #[test]
     fn parses_winner_a() {
-        assert_eq!(
-            parse_decision(r#"{"winner":"a"}"#).unwrap(),
-            JudgeDecision::A
-        );
+        let decision = parse_decision(r#"{"winner":"a","reason":"A is better"}"#).unwrap();
+        assert_eq!(decision.winner, JudgeDecision::A);
+        assert_eq!(decision.reason, "A is better");
     }
 
     #[test]
     fn parses_winner_b() {
-        assert_eq!(
-            parse_decision(r#"{"winner":"b"}"#).unwrap(),
-            JudgeDecision::B
-        );
+        let decision = parse_decision(r#"{"winner":"b","reason":"B is better"}"#).unwrap();
+        assert_eq!(decision.winner, JudgeDecision::B);
     }
 
     #[test]
     fn parses_draw() {
-        assert_eq!(
-            parse_decision(r#"{"winner":"draw"}"#).unwrap(),
-            JudgeDecision::Draw
-        );
+        let decision = parse_decision(r#"{"winner":"draw","reason":"equal"}"#).unwrap();
+        assert_eq!(decision.winner, JudgeDecision::Draw);
     }
 
     #[test]
     fn parses_json_embedded_in_surrounding_text() {
-        let text = "<think>\nreasoning about the answers\n</think>\n{\"winner\":\"b\"}\n";
-        assert_eq!(parse_decision(text).unwrap(), JudgeDecision::B);
+        let text =
+            "<think>\nreasoning about the answers\n</think>\n{\"winner\":\"b\",\"reason\":\"B\"}\n";
+        let decision = parse_decision(text).unwrap();
+        assert_eq!(decision.winner, JudgeDecision::B);
+        assert_eq!(decision.reason, "B");
     }
 
     #[test]
     fn rejects_invalid_winner() {
-        let error = parse_decision(r#"{"winner":"c"}"#).unwrap_err();
+        let error = parse_decision(r#"{"winner":"c","reason":"no"}"#).unwrap_err();
         assert!(matches!(error, JudgeError::InvalidJson(_)));
     }
 
     #[test]
     fn rejects_missing_winner() {
-        let error = parse_decision(r#"{"result":"a"}"#).unwrap_err();
+        let error = parse_decision(r#"{"reason":"no winner"}"#).unwrap_err();
+        assert!(matches!(error, JudgeError::InvalidJson(_)));
+    }
+
+    #[test]
+    fn rejects_missing_reason() {
+        let error = parse_decision(r#"{"winner":"a"}"#).unwrap_err();
+        assert!(matches!(error, JudgeError::InvalidJson(_)));
+    }
+
+    #[test]
+    fn rejects_non_string_reason() {
+        let error = parse_decision(r#"{"winner":"a","reason":1}"#).unwrap_err();
         assert!(matches!(error, JudgeError::InvalidJson(_)));
     }
 
