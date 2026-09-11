@@ -7,7 +7,7 @@ use arena::cli::{Cli, Command};
 use arena::compare::compare_all;
 use arena::error::Result;
 use arena::evaluate::evaluate_result;
-use arena::execute::execute;
+use arena::execute::execute_models;
 use arena::judge::judge_pair;
 use arena::persist::{self, Output};
 use arena::provider::{CompletionRequest, DeepInfraProvider, ModelId, ModelProvider};
@@ -42,15 +42,17 @@ async fn main() -> Result<()> {
             let mut results = Vec::new();
             let candidates = progress_bar((tasks.len() * models.len()) as u64);
             for task in &tasks {
-                for model in &models {
-                    candidates.set_message(format!("task {}  exec  {model}", task.id));
-                    let result = execute(&provider, model.clone(), task).await?;
+                candidates.set_message(format!("task {}  exec", task.id));
+                let executed = execute_models(&provider, task, &models, |result| {
                     candidates.println(format!(
-                        "exec  {}  {model}  {}ms",
-                        task.id, result.duration_ms
+                        "exec  {}  {}  {}ms",
+                        task.id, result.model, result.duration_ms
                     ));
-                    results.push(evaluate_result(task, result));
                     candidates.inc(1);
+                })
+                .await?;
+                for result in executed {
+                    results.push(evaluate_result(task, result));
                 }
             }
             candidates.finish_and_clear();
