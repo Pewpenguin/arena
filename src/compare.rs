@@ -62,6 +62,7 @@ mod tests {
                 text: String::new(),
             },
             evaluation: score.map(|score| Evaluation { score }),
+            duration_ms: 0,
         }
     }
 

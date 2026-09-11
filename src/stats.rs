@@ -63,6 +63,7 @@ mod tests {
             judge_model: ModelId::new("judge"),
             winner,
             reason: String::new(),
+            duration_ms: 0,
         }
     }
 

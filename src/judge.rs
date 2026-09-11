@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -21,6 +23,7 @@ pub struct Judgment {
     pub judge_model: ModelId,
     pub winner: JudgeDecision,
     pub reason: String,
+    pub duration_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,12 +110,13 @@ pub async fn judge_pair(
     }
 
     let prompt = build_judge_prompt(task, &result_a.response.text, &result_b.response.text);
-    let response = provider
-        .complete(CompletionRequest {
-            model: judge_model.clone(),
-            prompt,
-        })
-        .await?;
+    let request = CompletionRequest {
+        model: judge_model.clone(),
+        prompt,
+    };
+    let started = Instant::now();
+    let response = provider.complete(request).await?;
+    let duration_ms = started.elapsed().as_millis() as u64;
 
     let decision = parse_decision(&response.text)?;
 
@@ -123,6 +127,7 @@ pub async fn judge_pair(
         judge_model,
         winner: decision.winner,
         reason: decision.reason,
+        duration_ms,
     })
 }
 

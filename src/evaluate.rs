@@ -15,6 +15,7 @@ pub struct EvaluatedResult {
     pub response: CompletionResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evaluation: Option<Evaluation>,
+    pub duration_ms: u64,
 }
 
 pub fn evaluate_exact(task: &Task, result: &ExecutionResult) -> Option<Evaluation> {
@@ -37,6 +38,7 @@ pub fn evaluate_result(task: &Task, result: ExecutionResult) -> EvaluatedResult 
         task_id: result.task_id,
         model: result.model,
         response: result.response,
+        duration_ms: result.duration_ms,
     }
 }
 
@@ -49,6 +51,7 @@ mod tests {
             task_id: "t1".into(),
             model: ModelId::new("model"),
             response: CompletionResponse { text: text.into() },
+            duration_ms: 0,
         }
     }
 
@@ -89,5 +92,15 @@ mod tests {
         };
 
         assert!(evaluate_exact(&task, &result("Paris")).is_none());
+    }
+
+    #[test]
+    fn evaluate_result_preserves_duration_ms() {
+        let mut execution = result("Paris");
+        execution.duration_ms = 42;
+        let evaluated = evaluate_result(&exact_task("Paris"), execution);
+
+        assert_eq!(evaluated.duration_ms, 42);
+        assert_eq!(serde_json::to_value(&evaluated).unwrap()["duration_ms"], 42);
     }
 }
