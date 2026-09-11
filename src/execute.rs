@@ -1,12 +1,13 @@
 use std::time::Instant;
 
+use serde::Serialize;
+use thiserror::Error;
 use tokio::task::JoinSet;
 
 use crate::provider::{
     CompletionRequest, CompletionResponse, ModelId, ModelProvider, ProviderError,
 };
 use crate::task::Task;
-use serde::Serialize;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExecutionResult {
@@ -16,17 +17,33 @@ pub struct ExecutionResult {
     pub duration_ms: u64,
 }
 
+#[derive(Debug, Error)]
+#[error("execution failed for task {task_id} with model {model}: {source}")]
+pub struct ExecutionError {
+    pub task_id: String,
+    pub model: ModelId,
+    #[source]
+    pub source: ProviderError,
+}
+
 pub async fn execute(
     provider: &impl ModelProvider,
     model: ModelId,
     task: &Task,
-) -> Result<ExecutionResult, ProviderError> {
+) -> Result<ExecutionResult, ExecutionError> {
     let request = CompletionRequest {
         model: model.clone(),
         prompt: task.prompt.clone(),
     };
     let started = Instant::now();
-    let response = provider.complete(request).await?;
+    let response = provider
+        .complete(request)
+        .await
+        .map_err(|source| ExecutionError {
+            task_id: task.id.clone(),
+            model: model.clone(),
+            source,
+        })?;
     Ok(ExecutionResult {
         task_id: task.id.clone(),
         model,
@@ -40,7 +57,7 @@ pub async fn execute_models<P>(
     task: &Task,
     models: &[ModelId],
     mut on_complete: impl FnMut(&ExecutionResult),
-) -> Result<Vec<ExecutionResult>, ProviderError>
+) -> Result<Vec<ExecutionResult>, ExecutionError>
 where
     P: ModelProvider + Clone + Send + 'static,
 {
@@ -122,5 +139,34 @@ mod tests {
 
         assert_eq!(results[0].model, ModelId::new("slow"));
         assert_eq!(results[1].model, ModelId::new("fast"));
+    }
+
+    #[derive(Clone)]
+    struct FailingProvider;
+
+    impl ModelProvider for FailingProvider {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            Err(ProviderError::RequestFailed("upstream down".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_error_includes_task_and_model() {
+        let task = Task {
+            id: "t1".into(),
+            prompt: "p".into(),
+            evaluation: None,
+        };
+        let error = execute_models(&FailingProvider, &task, &[ModelId::new("m1")], |_| {})
+            .await
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("t1"), "{message}");
+        assert!(message.contains("m1"), "{message}");
+        assert!(message.contains("upstream down"), "{message}");
     }
 }

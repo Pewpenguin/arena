@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+use crate::execute::ExecutionError;
 use crate::judge::JudgeError;
 use crate::persist::PersistError;
 use crate::provider::ProviderError;
@@ -11,6 +12,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     #[error(transparent)]
     Provider(#[from] ProviderError),
+    #[error(transparent)]
+    Execute(#[from] ExecutionError),
     #[error(transparent)]
     Task(#[from] TaskError),
     #[error(transparent)]

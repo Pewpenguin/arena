@@ -34,8 +34,13 @@ pub struct ParsedDecision {
 
 #[derive(Debug, Error)]
 pub enum JudgeError {
-    #[error(transparent)]
-    Provider(#[from] ProviderError),
+    #[error("judge failed for task {task_id} with judge model {judge_model}: {source}")]
+    Provider {
+        task_id: String,
+        judge_model: ModelId,
+        #[source]
+        source: ProviderError,
+    },
     #[error("invalid judge response JSON: {0}")]
     InvalidJson(String),
     #[error("cannot judge results from different tasks")]
@@ -77,25 +82,24 @@ pub fn parse_decision(text: &str) -> Result<ParsedDecision, JudgeError> {
 
     let trimmed = text.trim();
     let mut search_from = 0;
+    let mut found = None;
 
     while let Some(offset) = trimmed[search_from..].find('{') {
         let start = search_from + offset;
         let mut deserializer = serde_json::Deserializer::from_str(&trimmed[start..]);
-        match Payload::deserialize(&mut deserializer) {
-            Ok(payload) => {
-                return Ok(ParsedDecision {
-                    winner: payload.winner,
-                    reason: payload.reason,
-                });
-            }
-            Err(_) => search_from = start + 1,
+        if let Ok(payload) = Payload::deserialize(&mut deserializer) {
+            found = Some(ParsedDecision {
+                winner: payload.winner,
+                reason: payload.reason,
+            });
         }
+        search_from = start + 1;
     }
 
-    let preview: String = trimmed.chars().take(500).collect();
-    Err(JudgeError::InvalidJson(format!(
-        "no valid judgment JSON found; response: {preview}"
-    )))
+    found.ok_or_else(|| {
+        let preview: String = trimmed.chars().take(500).collect();
+        JudgeError::InvalidJson(format!("no valid judgment JSON found; response: {preview}"))
+    })
 }
 
 pub async fn judge_pair(
@@ -115,7 +119,14 @@ pub async fn judge_pair(
         prompt,
     };
     let started = Instant::now();
-    let response = provider.complete(request).await?;
+    let response = provider
+        .complete(request)
+        .await
+        .map_err(|source| JudgeError::Provider {
+            task_id: task.id.clone(),
+            judge_model: judge_model.clone(),
+            source,
+        })?;
     let duration_ms = started.elapsed().as_millis() as u64;
 
     let decision = parse_decision(&response.text)?;
@@ -152,6 +163,15 @@ mod tests {
     fn parses_draw() {
         let decision = parse_decision(r#"{"winner":"draw","reason":"equal"}"#).unwrap();
         assert_eq!(decision.winner, JudgeDecision::Draw);
+    }
+
+    #[test]
+    fn chooses_last_valid_judgment_object() {
+        let text = r#"{"winner":"a","reason":"echoed"}
+{"winner":"b","reason":"final"}"#;
+        let decision = parse_decision(text).unwrap();
+        assert_eq!(decision.winner, JudgeDecision::B);
+        assert_eq!(decision.reason, "final");
     }
 
     #[test]

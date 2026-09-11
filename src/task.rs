@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
@@ -25,6 +26,8 @@ pub enum TaskError {
     Io(#[from] std::io::Error),
     #[error("failed to parse tasks file: {0}")]
     Parse(#[from] serde_json::Error),
+    #[error("duplicate task id: {0}")]
+    DuplicateId(String),
 }
 
 pub fn load(path: impl AsRef<Path>) -> Result<Vec<Task>, TaskError> {
@@ -33,7 +36,14 @@ pub fn load(path: impl AsRef<Path>) -> Result<Vec<Task>, TaskError> {
 }
 
 fn parse(contents: &str) -> Result<Vec<Task>, TaskError> {
-    Ok(serde_json::from_str(contents)?)
+    let tasks: Vec<Task> = serde_json::from_str(contents)?;
+    let mut seen = HashSet::new();
+    for task in &tasks {
+        if !seen.insert(task.id.as_str()) {
+            return Err(TaskError::DuplicateId(task.id.clone()));
+        }
+    }
+    Ok(tasks)
 }
 
 #[cfg(test)]
@@ -86,5 +96,21 @@ mod tests {
     fn rejects_malformed_json() {
         let error = parse(r#"{"id": "t1"}"#).unwrap_err();
         assert!(matches!(error, TaskError::Parse(_)));
+    }
+
+    #[test]
+    fn rejects_duplicate_task_ids() {
+        let error = parse(
+            r#"[
+                {"id": "t1", "prompt": "one"},
+                {"id": "t1", "prompt": "two"}
+            ]"#,
+        )
+        .unwrap_err();
+
+        match error {
+            TaskError::DuplicateId(id) => assert_eq!(id, "t1"),
+            other => panic!("unexpected error: {other}"),
+        }
     }
 }
