@@ -25,6 +25,7 @@ pub struct Judgment {
     pub winner: JudgeDecision,
     pub reason: String,
     pub duration_ms: u64,
+    pub agreement: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,8 +104,6 @@ pub fn parse_decision(text: &str) -> Result<ParsedDecision, JudgeError> {
     })
 }
 
-/// Map a winner from the swapped prompt orientation back to the original
-/// `(model_a, model_b)` frame, where swapped Response A was original model B.
 fn map_swapped_winner(winner: JudgeDecision) -> JudgeDecision {
     match winner {
         JudgeDecision::A => JudgeDecision::B,
@@ -113,19 +112,18 @@ fn map_swapped_winner(winner: JudgeDecision) -> JudgeDecision {
     }
 }
 
-fn resolve_winners(original: JudgeDecision, swapped: JudgeDecision) -> JudgeDecision {
+fn resolve_winners(original: JudgeDecision, swapped: JudgeDecision) -> (JudgeDecision, bool) {
     let mapped = map_swapped_winner(swapped);
     if original == mapped {
-        original
+        (original, true)
     } else {
-        JudgeDecision::Draw
+        (JudgeDecision::Draw, false)
     }
 }
 
 fn resolve_judgments(original: Judgment, swapped: Judgment, duration_ms: u64) -> Judgment {
-    let winner = resolve_winners(original.winner.clone(), swapped.winner.clone());
-    let agreed = original.winner == map_swapped_winner(swapped.winner);
-    let reason = if agreed {
+    let (winner, agreement) = resolve_winners(original.winner.clone(), swapped.winner.clone());
+    let reason = if agreement {
         original.reason
     } else {
         format!(
@@ -142,6 +140,7 @@ fn resolve_judgments(original: Judgment, swapped: Judgment, duration_ms: u64) ->
         winner,
         reason,
         duration_ms,
+        agreement,
     }
 }
 
@@ -182,6 +181,7 @@ pub async fn judge_pair(
         winner: decision.winner,
         reason: decision.reason,
         duration_ms,
+        agreement: true,
     })
 }
 
@@ -337,23 +337,23 @@ mod tests {
     fn resolves_agreement_and_disagreement() {
         assert_eq!(
             resolve_winners(JudgeDecision::A, JudgeDecision::B),
-            JudgeDecision::A
+            (JudgeDecision::A, true)
         );
         assert_eq!(
             resolve_winners(JudgeDecision::B, JudgeDecision::A),
-            JudgeDecision::B
-        );
-        assert_eq!(
-            resolve_winners(JudgeDecision::A, JudgeDecision::A),
-            JudgeDecision::Draw
-        );
-        assert_eq!(
-            resolve_winners(JudgeDecision::Draw, JudgeDecision::A),
-            JudgeDecision::Draw
+            (JudgeDecision::B, true)
         );
         assert_eq!(
             resolve_winners(JudgeDecision::Draw, JudgeDecision::Draw),
-            JudgeDecision::Draw
+            (JudgeDecision::Draw, true)
+        );
+        assert_eq!(
+            resolve_winners(JudgeDecision::A, JudgeDecision::A),
+            (JudgeDecision::Draw, false)
+        );
+        assert_eq!(
+            resolve_winners(JudgeDecision::Draw, JudgeDecision::A),
+            (JudgeDecision::Draw, false)
         );
     }
 
@@ -404,6 +404,7 @@ mod tests {
         assert_eq!(judgments[0].model_a, ModelId::new("m0"));
         assert_eq!(judgments[0].model_b, ModelId::new("m1"));
         assert_eq!(judgments[0].winner, JudgeDecision::Draw);
+        assert!(!judgments[0].agreement);
         assert!(judgments[0].reason.contains("position bias disagreement"));
     }
 
@@ -444,6 +445,7 @@ mod tests {
 
         assert_eq!(judgments.len(), 1);
         assert_eq!(judgments[0].winner, JudgeDecision::A);
+        assert!(judgments[0].agreement);
         assert_eq!(judgments[0].reason, "prefers better");
     }
 

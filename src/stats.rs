@@ -64,6 +64,7 @@ mod tests {
             winner,
             reason: String::new(),
             duration_ms: 0,
+            agreement: true,
         }
     }
 
