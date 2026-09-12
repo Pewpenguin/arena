@@ -103,6 +103,48 @@ pub fn parse_decision(text: &str) -> Result<ParsedDecision, JudgeError> {
     })
 }
 
+/// Map a winner from the swapped prompt orientation back to the original
+/// `(model_a, model_b)` frame, where swapped Response A was original model B.
+fn map_swapped_winner(winner: JudgeDecision) -> JudgeDecision {
+    match winner {
+        JudgeDecision::A => JudgeDecision::B,
+        JudgeDecision::B => JudgeDecision::A,
+        JudgeDecision::Draw => JudgeDecision::Draw,
+    }
+}
+
+fn resolve_winners(original: JudgeDecision, swapped: JudgeDecision) -> JudgeDecision {
+    let mapped = map_swapped_winner(swapped);
+    if original == mapped {
+        original
+    } else {
+        JudgeDecision::Draw
+    }
+}
+
+fn resolve_judgments(original: Judgment, swapped: Judgment, duration_ms: u64) -> Judgment {
+    let winner = resolve_winners(original.winner.clone(), swapped.winner.clone());
+    let agreed = original.winner == map_swapped_winner(swapped.winner);
+    let reason = if agreed {
+        original.reason
+    } else {
+        format!(
+            "position bias disagreement (original: {}; swapped: {})",
+            original.reason, swapped.reason
+        )
+    };
+
+    Judgment {
+        task_id: original.task_id,
+        model_a: original.model_a,
+        model_b: original.model_b,
+        judge_model: original.judge_model,
+        winner,
+        reason,
+        duration_ms,
+    }
+}
+
 pub async fn judge_pair(
     provider: &impl ModelProvider,
     judge_model: ModelId,
@@ -159,26 +201,48 @@ where
     let pair_count = pair_indices.len();
 
     let mut set = JoinSet::new();
+    let mut pair_started = Vec::with_capacity(pair_count);
+
     for (index, (i, j)) in pair_indices.into_iter().enumerate() {
-        let provider = provider.clone();
-        let judge_model = judge_model.clone();
-        let task = task.clone();
-        let result_a = results[i].clone();
-        let result_b = results[j].clone();
-        set.spawn(async move {
-            (
-                index,
-                judge_pair(&provider, judge_model, &task, &result_a, &result_b).await,
-            )
-        });
+        pair_started.push(Instant::now());
+
+        for (orientation, (result_a, result_b)) in [
+            (0u8, (results[i].clone(), results[j].clone())),
+            (1u8, (results[j].clone(), results[i].clone())),
+        ] {
+            let provider = provider.clone();
+            let judge_model = judge_model.clone();
+            let task = task.clone();
+            set.spawn(async move {
+                (
+                    index,
+                    orientation,
+                    judge_pair(&provider, judge_model, &task, &result_a, &result_b).await,
+                )
+            });
+        }
     }
 
+    let mut original = vec![None; pair_count];
+    let mut swapped = vec![None; pair_count];
     let mut ordered = vec![None; pair_count];
+
     while let Some(joined) = set.join_next().await {
-        let (index, result) = joined.expect("pairwise judging panicked");
-        let result = result?;
-        on_complete(&result);
-        ordered[index] = Some(result);
+        let (index, orientation, result) = joined.expect("pairwise judging panicked");
+        let judgment = result?;
+        on_complete(&judgment);
+
+        match orientation {
+            0 => original[index] = Some(judgment),
+            _ => swapped[index] = Some(judgment),
+        }
+
+        if original[index].is_some() && swapped[index].is_some() {
+            let orig = original[index].take().expect("original judgment");
+            let swap = swapped[index].take().expect("swapped judgment");
+            let duration_ms = pair_started[index].elapsed().as_millis() as u64;
+            ordered[index] = Some(resolve_judgments(orig, swap, duration_ms));
+        }
     }
 
     Ok(ordered
@@ -192,7 +256,7 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    use tokio::sync::oneshot;
+    use tokio::sync::Notify;
 
     use crate::provider::CompletionResponse;
 
@@ -269,6 +333,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn resolves_agreement_and_disagreement() {
+        assert_eq!(
+            resolve_winners(JudgeDecision::A, JudgeDecision::B),
+            JudgeDecision::A
+        );
+        assert_eq!(
+            resolve_winners(JudgeDecision::B, JudgeDecision::A),
+            JudgeDecision::B
+        );
+        assert_eq!(
+            resolve_winners(JudgeDecision::A, JudgeDecision::A),
+            JudgeDecision::Draw
+        );
+        assert_eq!(
+            resolve_winners(JudgeDecision::Draw, JudgeDecision::A),
+            JudgeDecision::Draw
+        );
+        assert_eq!(
+            resolve_winners(JudgeDecision::Draw, JudgeDecision::Draw),
+            JudgeDecision::Draw
+        );
+    }
+
     fn evaluated(model: &str, text: &str) -> EvaluatedResult {
         EvaluatedResult {
             task_id: "t1".into(),
@@ -280,9 +368,89 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct AlwaysPositionA;
+
+    impl ModelProvider for AlwaysPositionA {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            Ok(CompletionResponse {
+                text: r#"{"winner":"a","reason":"position a"}"#.into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn position_always_a_resolves_to_draw() {
+        let task = Task {
+            id: "t1".into(),
+            prompt: "p".into(),
+            evaluation: None,
+        };
+        let results = vec![evaluated("m0", "left"), evaluated("m1", "right")];
+
+        let judgments = judge_pairs(
+            &AlwaysPositionA,
+            ModelId::new("judge"),
+            &task,
+            &results,
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(judgments.len(), 1);
+        assert_eq!(judgments[0].model_a, ModelId::new("m0"));
+        assert_eq!(judgments[0].model_b, ModelId::new("m1"));
+        assert_eq!(judgments[0].winner, JudgeDecision::Draw);
+        assert!(judgments[0].reason.contains("position bias disagreement"));
+    }
+
+    #[derive(Clone)]
+    struct PrefersBetterText;
+
+    impl ModelProvider for PrefersBetterText {
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            let a_is_better = request.prompt.contains("Response A:\nbetter\n");
+            let winner = if a_is_better { "a" } else { "b" };
+            Ok(CompletionResponse {
+                text: format!(r#"{{"winner":"{winner}","reason":"prefers better"}}"#),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn consistent_preference_survives_position_swap() {
+        let task = Task {
+            id: "t1".into(),
+            prompt: "p".into(),
+            evaluation: None,
+        };
+        let results = vec![evaluated("m0", "better"), evaluated("m1", "worse")];
+
+        let judgments = judge_pairs(
+            &PrefersBetterText,
+            ModelId::new("judge"),
+            &task,
+            &results,
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(judgments.len(), 1);
+        assert_eq!(judgments[0].winner, JudgeDecision::A);
+        assert_eq!(judgments[0].reason, "prefers better");
+    }
+
+    #[derive(Clone)]
     struct GateJudgeProvider {
-        tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
-        rx: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+        released: Arc<Mutex<bool>>,
+        notify: Arc<Notify>,
     }
 
     impl ModelProvider for GateJudgeProvider {
@@ -290,16 +458,21 @@ mod tests {
             &self,
             request: CompletionRequest,
         ) -> Result<CompletionResponse, ProviderError> {
-            let slow_pair = request.prompt.contains("Response B:\nslow\n");
-            let fast_pair = request.prompt.contains("Response A:\nm0\n")
-                && request.prompt.contains("Response B:\nfast\n");
+            let involves_slow = request.prompt.contains("\nslow\n");
+            let involves_fast =
+                request.prompt.contains("\nfast\n") && request.prompt.contains("\nm0\n");
 
-            if slow_pair {
-                let rx = self.rx.lock().expect("slow gate").take().expect("slow rx");
-                rx.await.expect("gate");
-            } else if fast_pair {
-                let tx = self.tx.lock().expect("fast gate").take().expect("fast tx");
-                let _ = tx.send(());
+            if involves_slow {
+                loop {
+                    let notified = self.notify.notified();
+                    if *self.released.lock().expect("released") {
+                        break;
+                    }
+                    notified.await;
+                }
+            } else if involves_fast {
+                *self.released.lock().expect("released") = true;
+                self.notify.notify_waiters();
             }
 
             Ok(CompletionResponse {
@@ -310,10 +483,9 @@ mod tests {
 
     #[tokio::test]
     async fn judgments_follow_pair_order_when_completion_order_differs() {
-        let (tx, rx) = oneshot::channel();
         let provider = GateJudgeProvider {
-            tx: Arc::new(Mutex::new(Some(tx))),
-            rx: Arc::new(Mutex::new(Some(rx))),
+            released: Arc::new(Mutex::new(false)),
+            notify: Arc::new(Notify::new()),
         };
         let task = Task {
             id: "t1".into(),

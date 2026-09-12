@@ -118,7 +118,7 @@ async fn main() -> Result<()> {
 
 fn pair_count(tasks: usize, models: usize) -> u64 {
     let n = models as u64;
-    tasks as u64 * n.saturating_sub(1) * n / 2
+    tasks as u64 * n.saturating_sub(1) * n / 2 * 2
 }
 
 fn progress_bar(len: u64) -> ProgressBar {
