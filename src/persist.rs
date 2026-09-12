@@ -5,6 +5,7 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::compare::Comparison;
+use crate::elo::ModelRating;
 use crate::evaluate::EvaluatedResult;
 use crate::judge::Judgment;
 use crate::stats::ModelStats;
@@ -17,6 +18,8 @@ pub struct Output {
     pub judgments: Vec<Judgment>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub statistics: Vec<ModelStats>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ratings: Vec<ModelRating>,
 }
 
 #[derive(Debug, Error)]

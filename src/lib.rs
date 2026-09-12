@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod compare;
+pub mod elo;
 pub mod error;
 pub mod evaluate;
 pub mod execute;

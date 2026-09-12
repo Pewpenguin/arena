@@ -5,6 +5,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use arena::cli::{Cli, Command};
 use arena::compare::compare_all;
+use arena::elo;
 use arena::error::Result;
 use arena::evaluate::evaluate_result;
 use arena::execute::execute_models;
@@ -95,11 +96,13 @@ async fn main() -> Result<()> {
             }
 
             let statistics = stats::aggregate(&judgments);
+            let ratings = elo::rate(&judgments);
             let output_data = Output {
                 results,
                 comparisons,
                 judgments,
                 statistics,
+                ratings,
             };
 
             if let Some(path) = output {
