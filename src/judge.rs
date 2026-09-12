@@ -2,6 +2,7 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::task::JoinSet;
 
 use crate::evaluate::EvaluatedResult;
 use crate::provider::{CompletionRequest, ModelId, ModelProvider, ProviderError};
@@ -142,9 +143,58 @@ pub async fn judge_pair(
     })
 }
 
+pub async fn judge_pairs<P>(
+    provider: &P,
+    judge_model: ModelId,
+    task: &Task,
+    results: &[EvaluatedResult],
+    mut on_complete: impl FnMut(&Judgment),
+) -> Result<Vec<Judgment>, JudgeError>
+where
+    P: ModelProvider + Clone + Send + 'static,
+{
+    let pair_indices: Vec<_> = (0..results.len())
+        .flat_map(|i| ((i + 1)..results.len()).map(move |j| (i, j)))
+        .collect();
+    let pair_count = pair_indices.len();
+
+    let mut set = JoinSet::new();
+    for (index, (i, j)) in pair_indices.into_iter().enumerate() {
+        let provider = provider.clone();
+        let judge_model = judge_model.clone();
+        let task = task.clone();
+        let result_a = results[i].clone();
+        let result_b = results[j].clone();
+        set.spawn(async move {
+            (
+                index,
+                judge_pair(&provider, judge_model, &task, &result_a, &result_b).await,
+            )
+        });
+    }
+
+    let mut ordered = vec![None; pair_count];
+    while let Some(joined) = set.join_next().await {
+        let (index, result) = joined.expect("pairwise judging panicked");
+        let result = result?;
+        on_complete(&result);
+        ordered[index] = Some(result);
+    }
+
+    Ok(ordered
+        .into_iter()
+        .map(|result| result.expect("missing judgment"))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    use tokio::sync::oneshot;
+
+    use crate::provider::CompletionResponse;
 
     #[test]
     fn parses_winner_a() {
@@ -217,5 +267,75 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    fn evaluated(model: &str, text: &str) -> EvaluatedResult {
+        EvaluatedResult {
+            task_id: "t1".into(),
+            model: ModelId::new(model),
+            response: CompletionResponse { text: text.into() },
+            evaluation: None,
+            duration_ms: 0,
+        }
+    }
+
+    #[derive(Clone)]
+    struct GateJudgeProvider {
+        tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+        rx: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    }
+
+    impl ModelProvider for GateJudgeProvider {
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            let slow_pair = request.prompt.contains("Response B:\nslow\n");
+            let fast_pair = request.prompt.contains("Response A:\nm0\n")
+                && request.prompt.contains("Response B:\nfast\n");
+
+            if slow_pair {
+                let rx = self.rx.lock().expect("slow gate").take().expect("slow rx");
+                rx.await.expect("gate");
+            } else if fast_pair {
+                let tx = self.tx.lock().expect("fast gate").take().expect("fast tx");
+                let _ = tx.send(());
+            }
+
+            Ok(CompletionResponse {
+                text: r#"{"winner":"a","reason":"ok"}"#.into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn judgments_follow_pair_order_when_completion_order_differs() {
+        let (tx, rx) = oneshot::channel();
+        let provider = GateJudgeProvider {
+            tx: Arc::new(Mutex::new(Some(tx))),
+            rx: Arc::new(Mutex::new(Some(rx))),
+        };
+        let task = Task {
+            id: "t1".into(),
+            prompt: "p".into(),
+            evaluation: None,
+        };
+        let results = vec![
+            evaluated("m0", "m0"),
+            evaluated("m1", "slow"),
+            evaluated("m2", "fast"),
+        ];
+
+        let judgments = judge_pairs(&provider, ModelId::new("judge"), &task, &results, |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(judgments.len(), 3);
+        assert_eq!(judgments[0].model_a, ModelId::new("m0"));
+        assert_eq!(judgments[0].model_b, ModelId::new("m1"));
+        assert_eq!(judgments[1].model_a, ModelId::new("m0"));
+        assert_eq!(judgments[1].model_b, ModelId::new("m2"));
+        assert_eq!(judgments[2].model_a, ModelId::new("m1"));
+        assert_eq!(judgments[2].model_b, ModelId::new("m2"));
     }
 }

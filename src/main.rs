@@ -8,7 +8,7 @@ use arena::compare::compare_all;
 use arena::error::Result;
 use arena::evaluate::evaluate_result;
 use arena::execute::execute_models;
-use arena::judge::judge_pair;
+use arena::judge::judge_pairs;
 use arena::persist::{self, Output};
 use arena::provider::{CompletionRequest, DeepInfraProvider, ModelId, ModelProvider};
 use arena::stats;
@@ -68,32 +68,28 @@ async fn main() -> Result<()> {
                     let task_results: Vec<_> = results
                         .iter()
                         .filter(|result| result.task_id == task.id)
+                        .cloned()
                         .collect();
 
-                    for i in 0..task_results.len() {
-                        for j in (i + 1)..task_results.len() {
-                            let model_a = &task_results[i].model;
-                            let model_b = &task_results[j].model;
-                            judges.set_message(format!(
-                                "task {}  judge  {model_a} vs {model_b}",
-                                task.id
-                            ));
-                            let judgment = judge_pair(
-                                &provider,
-                                judge_model.clone(),
-                                task,
-                                task_results[i],
-                                task_results[j],
-                            )
-                            .await?;
+                    judges.set_message(format!("task {}  judge", task.id));
+                    let judged = judge_pairs(
+                        &provider,
+                        judge_model.clone(),
+                        task,
+                        &task_results,
+                        |judgment| {
                             judges.println(format!(
-                                "judge  {}  {model_a} vs {model_b}  {}ms",
-                                task.id, judgment.duration_ms
+                                "judge  {}  {} vs {}  {}ms",
+                                judgment.task_id,
+                                judgment.model_a,
+                                judgment.model_b,
+                                judgment.duration_ms
                             ));
-                            judgments.push(judgment);
                             judges.inc(1);
-                        }
-                    }
+                        },
+                    )
+                    .await?;
+                    judgments.extend(judged);
                 }
                 judges.finish_and_clear();
             }

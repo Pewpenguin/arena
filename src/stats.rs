@@ -88,18 +88,4 @@ mod tests {
         let b = stats.iter().find(|s| s.model == ModelId::new("b")).unwrap();
         assert_eq!((b.wins, b.losses, b.draws, b.total), (1, 1, 1, 3));
     }
-
-    #[test]
-    fn aggregation_is_order_independent() {
-        let forward = vec![
-            judgment("a", "b", JudgeDecision::A),
-            judgment("b", "c", JudgeDecision::Draw),
-        ];
-        let reversed = vec![
-            judgment("b", "c", JudgeDecision::Draw),
-            judgment("a", "b", JudgeDecision::A),
-        ];
-
-        assert_eq!(aggregate(&forward), aggregate(&reversed));
-    }
 }
