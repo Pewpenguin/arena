@@ -206,11 +206,8 @@ where
 
     let semaphore = Arc::new(Semaphore::new(PROVIDER_CONCURRENCY));
     let mut set = JoinSet::new();
-    let mut pair_started = Vec::with_capacity(pair_count);
 
     for (index, (i, j)) in pair_indices.into_iter().enumerate() {
-        pair_started.push(Instant::now());
-
         for (orientation, (result_a, result_b)) in [
             (0u8, (results[i].clone(), results[j].clone())),
             (1u8, (results[j].clone(), results[i].clone())),
@@ -224,9 +221,11 @@ where
                     .acquire()
                     .await
                     .expect("provider semaphore is not closed");
+                let started = Instant::now();
                 (
                     index,
                     orientation,
+                    started,
                     judge_pair(&provider, judge_model, &task, &result_a, &result_b).await,
                 )
             });
@@ -238,19 +237,19 @@ where
     let mut ordered = vec![None; pair_count];
 
     while let Some(joined) = set.join_next().await {
-        let (index, orientation, result) = joined.expect("pairwise judging panicked");
+        let (index, orientation, started, result) = joined.expect("pairwise judging panicked");
         let judgment = result?;
         on_complete(&judgment);
 
         match orientation {
-            0 => original[index] = Some(judgment),
-            _ => swapped[index] = Some(judgment),
+            0 => original[index] = Some((started, judgment)),
+            _ => swapped[index] = Some((started, judgment)),
         }
 
         if original[index].is_some() && swapped[index].is_some() {
-            let orig = original[index].take().expect("original judgment");
-            let swap = swapped[index].take().expect("swapped judgment");
-            let duration_ms = pair_started[index].elapsed().as_millis() as u64;
+            let (orig_started, orig) = original[index].take().expect("original judgment");
+            let (swap_started, swap) = swapped[index].take().expect("swapped judgment");
+            let duration_ms = orig_started.min(swap_started).elapsed().as_millis() as u64;
             ordered[index] = Some(resolve_judgments(orig, swap, duration_ms));
         }
     }
@@ -264,11 +263,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use tokio::sync::Notify;
 
-    use crate::provider::CompletionResponse;
+    use crate::provider::{CompletionResponse, PROVIDER_CONCURRENCY};
 
     #[test]
     fn parses_winner_a() {
@@ -521,5 +522,77 @@ mod tests {
         assert_eq!(judgments[1].model_b, ModelId::new("m2"));
         assert_eq!(judgments[2].model_a, ModelId::new("m1"));
         assert_eq!(judgments[2].model_b, ModelId::new("m2"));
+    }
+
+    #[derive(Clone)]
+    struct HoldFirstWave {
+        entered: Arc<AtomicUsize>,
+        released: Arc<Mutex<bool>>,
+        notify: Arc<Notify>,
+    }
+
+    impl ModelProvider for HoldFirstWave {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            let n = self.entered.fetch_add(1, Ordering::SeqCst);
+            if n < PROVIDER_CONCURRENCY {
+                loop {
+                    let notified = self.notify.notified();
+                    if *self.released.lock().expect("released") {
+                        break;
+                    }
+                    notified.await;
+                }
+            }
+
+            Ok(CompletionResponse {
+                text: r#"{"winner":"a","reason":"ok"}"#.into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn pair_duration_excludes_provider_semaphore_wait() {
+        let entered = Arc::new(AtomicUsize::new(0));
+        let released = Arc::new(Mutex::new(false));
+        let notify = Arc::new(Notify::new());
+        let provider = HoldFirstWave {
+            entered: entered.clone(),
+            released: released.clone(),
+            notify: notify.clone(),
+        };
+        let task = Task {
+            id: "t1".into(),
+            prompt: "p".into(),
+            evaluation: None,
+        };
+        let results = vec![
+            evaluated("m0", "m0"),
+            evaluated("m1", "m1"),
+            evaluated("m2", "m2"),
+            evaluated("m3", "m3"),
+        ];
+
+        let (judgments, ()) = tokio::join!(
+            judge_pairs(&provider, ModelId::new("judge"), &task, &results, |_| {}),
+            async {
+                while entered.load(Ordering::SeqCst) < PROVIDER_CONCURRENCY {
+                    tokio::task::yield_now().await;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                *released.lock().expect("released") = true;
+                notify.notify_waiters();
+            }
+        );
+        let judgments = judgments.unwrap();
+        let min = judgments.iter().map(|j| j.duration_ms).min().unwrap();
+        let max = judgments.iter().map(|j| j.duration_ms).max().unwrap();
+
+        assert!(
+            min < max,
+            "queued pair duration {min}ms should exclude the semaphore wait included in occupying duration {max}ms"
+        );
     }
 }

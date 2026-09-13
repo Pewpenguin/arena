@@ -109,6 +109,10 @@ Only the resolved judgment is persisted and used for statistics and Elo.
 - `statistics` — per-model wins, losses, draws, and judge agreement
 - `ratings` — Elo ratings calculated from resolved judgments
 
+`results[].duration_ms` is the duration of that candidate's provider request after it has a permit.
+
+`judgments[].duration_ms` is the wall-clock time from when the first of a pair's two judge orientations begins work after acquiring a provider permit until both orientations have completed. It excludes time the pair spends queued behind other provider calls, and it is not the sum of the two orientation request times.
+
 Results retain task-file and CLI model order. Statistics and ratings are ordered by model ID.
 
 ## Limitations
