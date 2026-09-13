@@ -1,9 +1,13 @@
+use std::time::Duration;
+
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use super::{CompletionRequest, CompletionResponse, ModelProvider, ProviderError};
 
 const CHAT_COMPLETIONS_URL: &str = "https://api.deepinfra.com/v1/openai/chat/completions";
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct DeepInfraProvider {
@@ -14,7 +18,11 @@ pub struct DeepInfraProvider {
 impl DeepInfraProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .connect_timeout(CONNECT_TIMEOUT)
+                .build()
+                .expect("failed to create HTTP client"),
             api_key: api_key.into(),
         }
     }
