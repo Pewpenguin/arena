@@ -10,7 +10,7 @@ use arena::error::Result;
 use arena::evaluate::evaluate_result;
 use arena::execute::execute_models;
 use arena::judge::judge_pairs;
-use arena::persist::{self, Output};
+use arena::persist::{self, Output, RunMetadata};
 use arena::provider::{CompletionRequest, DeepInfraProvider, ModelId, ModelProvider};
 use arena::stats;
 use arena::task;
@@ -31,14 +31,16 @@ async fn main() -> Result<()> {
             println!("{}", response.text);
         }
         Command::Exec {
-            tasks,
+            tasks: tasks_path,
             models,
             output,
             judge,
         } => {
+            let started_at = persist::utc_timestamp();
             let provider = DeepInfraProvider::from_env()?;
-            let tasks = task::load(tasks)?;
+            let tasks = task::load(&tasks_path)?;
             let models: Vec<_> = models.into_iter().map(ModelId::new).collect();
+            let judge = judge.map(ModelId::new);
 
             let mut results = Vec::new();
             let candidates = progress_bar((tasks.len() * models.len()) as u64);
@@ -61,8 +63,7 @@ async fn main() -> Result<()> {
             let comparisons = compare_all(&results);
 
             let mut judgments = Vec::new();
-            if let Some(judge_model) = judge {
-                let judge_model = ModelId::new(judge_model);
+            if let Some(judge_model) = &judge {
                 let pair_total = pair_count(tasks.len(), models.len());
                 let judges = progress_bar(pair_total);
                 for task in &tasks {
@@ -98,6 +99,7 @@ async fn main() -> Result<()> {
             let statistics = stats::aggregate(&judgments);
             let ratings = elo::rate(&judgments);
             let output_data = Output {
+                run: RunMetadata::new(models, judge, Some(tasks_path), started_at),
                 results,
                 comparisons,
                 judgments,
