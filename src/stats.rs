@@ -5,13 +5,16 @@ use serde::Serialize;
 use crate::judge::{JudgeDecision, Judgment};
 use crate::provider::ModelId;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ModelStats {
     pub model: ModelId,
     pub wins: u32,
     pub losses: u32,
     pub draws: u32,
     pub total: u32,
+    pub agreement_count: u32,
+    pub disagreement_count: u32,
+    pub agreement_rate: f64,
 }
 
 pub fn aggregate(judgments: &[Judgment]) -> Vec<ModelStats> {
@@ -32,10 +35,24 @@ pub fn aggregate(judgments: &[Judgment]) -> Vec<ModelStats> {
                 entry(&mut stats, &judgment.model_b).draws += 1;
             }
         }
+
+        for model in [&judgment.model_a, &judgment.model_b] {
+            let stat = entry(&mut stats, model);
+            if judgment.agreement {
+                stat.agreement_count += 1;
+            } else {
+                stat.disagreement_count += 1;
+            }
+        }
     }
 
     for stat in stats.values_mut() {
         stat.total = stat.wins + stat.losses + stat.draws;
+        stat.agreement_rate = if stat.total == 0 {
+            0.0
+        } else {
+            stat.agreement_count as f64 / stat.total as f64
+        };
     }
 
     stats.into_values().collect()
@@ -48,6 +65,9 @@ fn entry<'a>(stats: &'a mut BTreeMap<ModelId, ModelStats>, model: &ModelId) -> &
         losses: 0,
         draws: 0,
         total: 0,
+        agreement_count: 0,
+        disagreement_count: 0,
+        agreement_rate: 0.0,
     })
 }
 
@@ -55,7 +75,7 @@ fn entry<'a>(stats: &'a mut BTreeMap<ModelId, ModelStats>, model: &ModelId) -> &
 mod tests {
     use super::*;
 
-    fn judgment(model_a: &str, model_b: &str, winner: JudgeDecision) -> Judgment {
+    fn judgment(model_a: &str, model_b: &str, winner: JudgeDecision, agreement: bool) -> Judgment {
         Judgment {
             task_id: "t1".into(),
             model_a: ModelId::new(model_a),
@@ -64,7 +84,7 @@ mod tests {
             winner,
             reason: String::new(),
             duration_ms: 0,
-            agreement: true,
+            agreement,
         }
     }
 
@@ -76,17 +96,41 @@ mod tests {
     #[test]
     fn counts_wins_losses_and_draws() {
         let judgments = vec![
-            judgment("a", "b", JudgeDecision::A),
-            judgment("a", "b", JudgeDecision::B),
-            judgment("a", "b", JudgeDecision::Draw),
+            judgment("a", "b", JudgeDecision::A, true),
+            judgment("a", "b", JudgeDecision::B, true),
+            judgment("a", "b", JudgeDecision::Draw, true),
         ];
 
         let stats = aggregate(&judgments);
 
         let a = stats.iter().find(|s| s.model == ModelId::new("a")).unwrap();
         assert_eq!((a.wins, a.losses, a.draws, a.total), (1, 1, 1, 3));
+        assert_eq!((a.agreement_count, a.disagreement_count), (3, 0));
+        assert_eq!(a.agreement_rate, 1.0);
 
         let b = stats.iter().find(|s| s.model == ModelId::new("b")).unwrap();
         assert_eq!((b.wins, b.losses, b.draws, b.total), (1, 1, 1, 3));
+        assert_eq!((b.agreement_count, b.disagreement_count), (3, 0));
+        assert_eq!(b.agreement_rate, 1.0);
+    }
+
+    #[test]
+    fn counts_disagreement_without_changing_outcome_tallies() {
+        let judgments = vec![
+            judgment("a", "b", JudgeDecision::A, true),
+            judgment("a", "b", JudgeDecision::Draw, false),
+        ];
+
+        let stats = aggregate(&judgments);
+
+        let a = stats.iter().find(|s| s.model == ModelId::new("a")).unwrap();
+        assert_eq!((a.wins, a.losses, a.draws, a.total), (1, 0, 1, 2));
+        assert_eq!((a.agreement_count, a.disagreement_count), (1, 1));
+        assert_eq!(a.agreement_rate, 0.5);
+
+        let b = stats.iter().find(|s| s.model == ModelId::new("b")).unwrap();
+        assert_eq!((b.wins, b.losses, b.draws, b.total), (0, 1, 1, 2));
+        assert_eq!((b.agreement_count, b.disagreement_count), (1, 1));
+        assert_eq!(b.agreement_rate, 0.5);
     }
 }

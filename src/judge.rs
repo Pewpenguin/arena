@@ -1,11 +1,15 @@
+use std::sync::Arc;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::evaluate::EvaluatedResult;
-use crate::provider::{CompletionRequest, ModelId, ModelProvider, ProviderError};
+use crate::provider::{
+    CompletionRequest, ModelId, ModelProvider, PROVIDER_CONCURRENCY, ProviderError,
+};
 use crate::task::Task;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,6 +204,7 @@ where
         .collect();
     let pair_count = pair_indices.len();
 
+    let semaphore = Arc::new(Semaphore::new(PROVIDER_CONCURRENCY));
     let mut set = JoinSet::new();
     let mut pair_started = Vec::with_capacity(pair_count);
 
@@ -213,7 +218,12 @@ where
             let provider = provider.clone();
             let judge_model = judge_model.clone();
             let task = task.clone();
+            let semaphore = semaphore.clone();
             set.spawn(async move {
+                let _permit = semaphore
+                    .acquire()
+                    .await
+                    .expect("provider semaphore is not closed");
                 (
                     index,
                     orientation,

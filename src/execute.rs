@@ -1,11 +1,14 @@
+use std::sync::Arc;
 use std::time::Instant;
 
 use serde::Serialize;
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::provider::{
-    CompletionRequest, CompletionResponse, ModelId, ModelProvider, ProviderError,
+    CompletionRequest, CompletionResponse, ModelId, ModelProvider, PROVIDER_CONCURRENCY,
+    ProviderError,
 };
 use crate::task::Task;
 
@@ -61,12 +64,20 @@ pub async fn execute_models<P>(
 where
     P: ModelProvider + Clone + Send + 'static,
 {
+    let semaphore = Arc::new(Semaphore::new(PROVIDER_CONCURRENCY));
     let mut set = JoinSet::new();
 
     for (index, model) in models.iter().cloned().enumerate() {
         let provider = provider.clone();
         let task = task.clone();
-        set.spawn(async move { (index, execute(&provider, model, &task).await) });
+        let semaphore = semaphore.clone();
+        set.spawn(async move {
+            let _permit = semaphore
+                .acquire()
+                .await
+                .expect("provider semaphore is not closed");
+            (index, execute(&provider, model, &task).await)
+        });
     }
 
     let mut ordered = vec![None; models.len()];

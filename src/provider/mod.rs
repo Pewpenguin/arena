@@ -7,6 +7,8 @@ use std::fmt;
 use serde::Serialize;
 use thiserror::Error;
 
+pub(crate) const PROVIDER_CONCURRENCY: usize = 8;
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct ModelId(String);
 
