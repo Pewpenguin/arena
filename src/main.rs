@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::time::Duration;
 
 use clap::Parser;
@@ -6,7 +7,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use arena::cli::{Cli, Command};
 use arena::compare::compare_all;
 use arena::elo;
-use arena::error::Result;
+use arena::error::{Error, Result};
 use arena::evaluate::evaluate_result;
 use arena::execute::execute_models;
 use arena::judge::judge_pairs;
@@ -36,10 +37,17 @@ async fn main() -> Result<()> {
             output,
             judge,
         } => {
+            let models: Vec<_> = models.into_iter().map(ModelId::new).collect();
+            let mut seen = HashSet::new();
+            for model in &models {
+                if !seen.insert(model) {
+                    return Err(Error::DuplicateModel(model.clone()));
+                }
+            }
+
             let started_at = persist::utc_timestamp();
             let provider = DeepInfraProvider::from_env()?;
             let tasks = task::load(&tasks_path)?;
-            let models: Vec<_> = models.into_iter().map(ModelId::new).collect();
             let judge = judge.map(ModelId::new);
 
             let mut results = Vec::new();

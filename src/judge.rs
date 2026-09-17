@@ -49,6 +49,17 @@ pub enum JudgeError {
     },
     #[error("invalid judge response JSON: {0}")]
     InvalidJson(String),
+    #[error(
+        "invalid judge response for task {task_id} with models {model_a} vs {model_b} (judge {judge_model}): {source}"
+    )]
+    InvalidResponse {
+        task_id: String,
+        model_a: ModelId,
+        model_b: ModelId,
+        judge_model: ModelId,
+        #[source]
+        source: Box<JudgeError>,
+    },
     #[error("cannot judge results from different tasks")]
     DifferentTasks,
 }
@@ -175,7 +186,14 @@ pub async fn judge_pair(
         })?;
     let duration_ms = started.elapsed().as_millis() as u64;
 
-    let decision = parse_decision(&response.text)?;
+    let decision =
+        parse_decision(&response.text).map_err(|source| JudgeError::InvalidResponse {
+            task_id: task.id.clone(),
+            model_a: result_a.model.clone(),
+            model_b: result_b.model.clone(),
+            judge_model: judge_model.clone(),
+            source: Box::new(source),
+        })?;
 
     Ok(Judgment {
         task_id: result_a.task_id.clone(),
@@ -417,6 +435,61 @@ mod tests {
         assert_eq!(judgments[0].winner, JudgeDecision::Draw);
         assert!(!judgments[0].agreement);
         assert!(judgments[0].reason.contains("position bias disagreement"));
+    }
+
+    #[derive(Clone)]
+    struct InvalidJsonJudge;
+
+    impl ModelProvider for InvalidJsonJudge {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            Ok(CompletionResponse {
+                text: "not a judgment".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_judge_response_identifies_task_and_pair() {
+        let task = Task {
+            id: "t1".into(),
+            prompt: "p".into(),
+            evaluation: None,
+        };
+        let error = judge_pair(
+            &InvalidJsonJudge,
+            ModelId::new("judge"),
+            &task,
+            &evaluated("m0", "left"),
+            &evaluated("m1", "right"),
+        )
+        .await
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("t1"), "{message}");
+        assert!(message.contains("m0"), "{message}");
+        assert!(message.contains("m1"), "{message}");
+        assert!(message.contains("judge"), "{message}");
+
+        match error {
+            JudgeError::InvalidResponse {
+                task_id,
+                model_a,
+                model_b,
+                judge_model,
+                source,
+            } => {
+                assert_eq!(task_id, "t1");
+                assert_eq!(model_a, ModelId::new("m0"));
+                assert_eq!(model_b, ModelId::new("m1"));
+                assert_eq!(judge_model, ModelId::new("judge"));
+                assert!(matches!(*source, JudgeError::InvalidJson(_)));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[derive(Clone)]

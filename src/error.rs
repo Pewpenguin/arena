@@ -3,7 +3,7 @@ use thiserror::Error;
 use crate::execute::ExecutionError;
 use crate::judge::JudgeError;
 use crate::persist::PersistError;
-use crate::provider::ProviderError;
+use crate::provider::{ModelId, ProviderError};
 use crate::task::TaskError;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -20,6 +20,8 @@ pub enum Error {
     Persist(#[from] PersistError),
     #[error(transparent)]
     Judge(#[from] JudgeError),
+    #[error("duplicate model id: {0}")]
+    DuplicateModel(ModelId),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }

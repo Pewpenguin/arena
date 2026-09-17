@@ -54,13 +54,13 @@ Run multiple models against a task file:
       --judge MODEL_JUDGE \
       --output results.json
 
-`--model` can be specified multiple times. `--judge` and `--output` are optional.
+`--model` can be specified multiple times. Model IDs must be unique. `--judge` and `--output` are optional.
 
 Without `--output`, the JSON result is written to stdout. A provider error fails the run.
 
 ## Tasks
 
-Tasks are defined as a JSON array. Task IDs must be unique.
+Tasks are defined as a JSON array. Task IDs must be unique. Unknown fields are rejected.
 
     [
       {

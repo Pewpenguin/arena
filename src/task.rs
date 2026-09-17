@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Task {
     pub id: String,
     pub prompt: String,
@@ -14,7 +15,7 @@ pub struct Task {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", deny_unknown_fields)]
 pub enum TaskEvaluation {
     #[serde(rename = "exact")]
     Exact { expected: String },
@@ -110,6 +111,45 @@ mod tests {
 
         match error {
             TaskError::DuplicateId(id) => assert_eq!(id, "t1"),
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_task_field() {
+        let error = parse(r#"[{"id": "t1", "prompt": "Say hello", "weight": 1}]"#).unwrap_err();
+        match error {
+            TaskError::Parse(error) => {
+                let message = error.to_string();
+                assert!(message.contains("unknown field"), "{message}");
+                assert!(message.contains("weight"), "{message}");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_evaluation_field() {
+        let error = parse(
+            r#"[
+                {
+                    "id": "t1",
+                    "prompt": "p",
+                    "evaluation": {
+                        "type": "exact",
+                        "expected": "Paris",
+                        "ignore_case": true
+                    }
+                }
+            ]"#,
+        )
+        .unwrap_err();
+        match error {
+            TaskError::Parse(error) => {
+                let message = error.to_string();
+                assert!(message.contains("unknown field"), "{message}");
+                assert!(message.contains("ignore_case"), "{message}");
+            }
             other => panic!("unexpected error: {other}"),
         }
     }
