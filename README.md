@@ -4,7 +4,7 @@ Model-vs-model evaluation for LLMs.
 
 Arena runs the same tasks against multiple models, supports exact-match evaluation, and can compare model outputs using an LLM judge.
 
-The core uses a `ModelProvider` trait. DeepInfra is the currently implemented provider.
+The core uses a `ModelProvider` trait. Arena uses an OpenAI-compatible API endpoint.
 
 ## Features
 
@@ -23,19 +23,19 @@ The core uses a `ModelProvider` trait. DeepInfra is the currently implemented pr
 
 Requires Rust and Cargo.
 
-Set a DeepInfra API token in `.env`:
+Arena uses an OpenAI-compatible API endpoint. Set the API key in `.env`:
 
     cp .env.example .env
 
 Then set:
 
-    DEEPINFRA_TOKEN=your_token
+    ARENA_API_KEY=your_api_key
+
+`ARENA_BASE_URL` is optional and defaults to `https://api.openai.com/v1`. Set `ARENA_BASE_URL` to any service exposing the OpenAI-compatible API subset Arena requires. Use that service's API key through `ARENA_API_KEY`.
 
 Build the project:
 
     cargo build
-
-Model IDs are DeepInfra model names.
 
 ## Usage
 
@@ -122,7 +122,6 @@ Results retain task-file and CLI model order. Statistics and ratings are ordered
 - Running both response orders can reveal orientation disagreement, but does not establish that a judge is unbiased.
 - An orientation disagreement is treated as a draw for statistics and Elo.
 - Elo depends on the order in which judgments are processed.
-- DeepInfra is the only implemented provider.
 - Exact-score comparisons are not used by the Elo calculation.
 
 ## Development

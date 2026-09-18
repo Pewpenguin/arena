@@ -1,0 +1,9 @@
+{
+  "id": "t1",
+  "prompt": "test",
+  "evaluation": {
+    "type": "exact",
+    "expected": "test",
+    "bogus_field": true
+  }
+}

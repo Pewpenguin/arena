@@ -12,7 +12,7 @@ use arena::evaluate::evaluate_result;
 use arena::execute::execute_models;
 use arena::judge::judge_pairs;
 use arena::persist::{self, Output, RunMetadata};
-use arena::provider::{CompletionRequest, DeepInfraProvider, ModelId, ModelProvider};
+use arena::provider::{CompletionRequest, ModelId, ModelProvider, OpenAICompatibleProvider};
 use arena::stats;
 use arena::task;
 
@@ -22,7 +22,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Run { model, prompt } => {
-            let provider = DeepInfraProvider::from_env()?;
+            let provider = OpenAICompatibleProvider::from_env()?;
             let response = provider
                 .complete(CompletionRequest {
                     model: ModelId::new(model),
@@ -46,7 +46,7 @@ async fn main() -> Result<()> {
             }
 
             let started_at = persist::utc_timestamp();
-            let provider = DeepInfraProvider::from_env()?;
+            let provider = OpenAICompatibleProvider::from_env()?;
             let tasks = task::load(&tasks_path)?;
             let judge = judge.map(ModelId::new);
 

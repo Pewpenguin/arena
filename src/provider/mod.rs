@@ -1,6 +1,6 @@
-mod deepinfra;
+mod openai_compatible;
 
-pub use deepinfra::DeepInfraProvider;
+pub use openai_compatible::OpenAICompatibleProvider;
 
 use std::fmt;
 
