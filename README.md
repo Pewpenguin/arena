@@ -15,7 +15,7 @@ The core uses a `ModelProvider` trait. Arena uses an OpenAI-compatible API endpo
 - Pairwise LLM judging with both response orders
 - Agreement tracking for position-sensitive judgments
 - Win/loss/draw statistics
-- Bradley–Terry ratings
+- Bradley–Terry ratings with task-clustered bootstrap uncertainty
 - Request duration and run provenance
 - JSON output
 
@@ -54,7 +54,7 @@ Run multiple models against a task file:
       --judge MODEL_JUDGE \
       --output results.json
 
-`--model` can be specified multiple times. Model IDs must be unique. `--judge` and `--output` are optional.
+`--model` can be specified multiple times. Model IDs must be unique. `--judge` and `--output` are optional. `--seed` sets the bootstrap RNG seed and defaults to `0`.
 
 Without `--output`, the JSON result is written to stdout. A provider error fails the run.
 
@@ -102,12 +102,14 @@ Both orientation winners are persisted, mapped back to the original model pair. 
 
 `arena exec` produces one JSON object with these fields:
 
-- `run` — version, models, judge, task path, and start time
+- `run` — version, models, judge, task path, start time, and bootstrap seed/replicate counts when uncertainty was computed
 - `results` — model responses, evaluations, and durations
 - `comparisons` — pairwise comparisons from exact scores
 - `judgments` — resolved LLM-judge results and both orientation winners
 - `statistics` — per-model wins, losses, draws, and judge agreement
-- `ratings` — Bradley–Terry ratings from resolved judgments, on a 400-point scale centered at 1500
+- `ratings` — full-data Bradley–Terry point estimates from resolved judgments, on a 400-point scale centered at 1500, with optional 95% percentile bounds
+
+Ratings are the full-data Bradley–Terry estimates. Uncertainty uses a task-clustered percentile bootstrap: each unique task is resampled as a unit, carrying all of that task's resolved pairwise judgments. The two judge orientations are not independent observations and are not resampled. The default is 1,000 replicates, a seed of `0`, and 95% percentile bounds (`rating_lower`, `rating_upper`). Bounds are omitted when there are fewer than two distinct tasks, when the original ratings are unavailable, or when any bootstrap replicate cannot produce finite ratings. In those cases the point estimates remain. The intervals describe task-sampling variability only; they do not capture judge bias, residual position bias, task-selection effects, or a different task distribution. The 1500 center is a convention on this relative scale.
 
 `results[].duration_ms` is the duration of that candidate's provider request after it has a permit.
 
@@ -122,6 +124,7 @@ Results retain task-file and CLI model order. Statistics and ratings are ordered
 - Running both response orders can reveal orientation disagreement, but does not establish that a judge is unbiased.
 - An orientation disagreement is treated as a draw for statistics and ratings.
 - Exact-score comparisons are not used by the Bradley–Terry calculation.
+- Bootstrap intervals are not a test of pairwise rating differences.
 
 ## Development
 

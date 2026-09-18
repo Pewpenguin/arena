@@ -4,6 +4,7 @@ use std::time::Duration;
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 
+use arena::bootstrap;
 use arena::cli::{Cli, Command};
 use arena::compare::compare_all;
 use arena::error::{Error, Result};
@@ -12,7 +13,6 @@ use arena::execute::execute_models;
 use arena::judge::judge_pairs;
 use arena::persist::{self, Output, RunMetadata};
 use arena::provider::{CompletionRequest, ModelId, ModelProvider, OpenAICompatibleProvider};
-use arena::rating;
 use arena::stats;
 use arena::task;
 
@@ -36,6 +36,7 @@ async fn main() -> Result<()> {
             models,
             output,
             judge,
+            seed,
         } => {
             let models: Vec<_> = models.into_iter().map(ModelId::new).collect();
             let mut seen = HashSet::new();
@@ -105,9 +106,13 @@ async fn main() -> Result<()> {
             }
 
             let statistics = stats::aggregate(&judgments);
-            let ratings = rating::rate(&judgments);
+            let (ratings, bootstrap) = bootstrap::rate_with_uncertainty(&judgments, seed);
+            let mut run = RunMetadata::new(models, judge, Some(tasks_path), started_at);
+            if let Some(meta) = bootstrap {
+                run = run.with_bootstrap(meta.seed, meta.replicates, meta.valid);
+            }
             let output_data = Output {
-                run: RunMetadata::new(models, judge, Some(tasks_path), started_at),
+                run,
                 results,
                 comparisons,
                 judgments,

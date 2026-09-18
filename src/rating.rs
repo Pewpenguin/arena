@@ -14,6 +14,10 @@ const TOLERANCE: f64 = 1e-12;
 pub struct ModelRating {
     pub model: ModelId,
     pub rating: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rating_lower: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rating_upper: Option<f64>,
 }
 
 pub fn rate(judgments: &[Judgment]) -> Vec<ModelRating> {
@@ -63,6 +67,8 @@ pub fn rate(judgments: &[Judgment]) -> Vec<ModelRating> {
         .map(|(model, index)| ModelRating {
             model,
             rating: ratings[index],
+            rating_lower: None,
+            rating_upper: None,
         })
         .collect()
 }

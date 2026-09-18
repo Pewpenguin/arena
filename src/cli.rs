@@ -26,5 +26,7 @@ pub enum Command {
         output: Option<PathBuf>,
         #[arg(long)]
         judge: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
     },
 }
