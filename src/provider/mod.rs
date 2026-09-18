@@ -4,12 +4,12 @@ pub use openai_compatible::OpenAICompatibleProvider;
 
 use std::fmt;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub(crate) const PROVIDER_CONCURRENCY: usize = 8;
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ModelId(String);
 
 impl ModelId {

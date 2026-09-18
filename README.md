@@ -15,7 +15,7 @@ The core uses a `ModelProvider` trait. Arena uses an OpenAI-compatible API endpo
 - Pairwise LLM judging with both response orders
 - Agreement tracking for position-sensitive judgments
 - Win/loss/draw statistics
-- Elo ratings
+- Bradley–Terry ratings
 - Request duration and run provenance
 - JSON output
 
@@ -96,7 +96,7 @@ If both orientations agree, the judgment is kept with `agreement: true`.
 
 If they disagree, Arena resolves the pair as a draw with `agreement: false`.
 
-Only the resolved judgment is persisted and used for statistics and Elo.
+Both orientation winners are persisted, mapped back to the original model pair. Statistics and Bradley–Terry ratings use only the resolved winner. The two orientations are retained for position-bias diagnostics and are not counted as independent ranking observations.
 
 ## Output
 
@@ -105,9 +105,9 @@ Only the resolved judgment is persisted and used for statistics and Elo.
 - `run` — version, models, judge, task path, and start time
 - `results` — model responses, evaluations, and durations
 - `comparisons` — pairwise comparisons from exact scores
-- `judgments` — resolved LLM-judge results
+- `judgments` — resolved LLM-judge results and both orientation winners
 - `statistics` — per-model wins, losses, draws, and judge agreement
-- `ratings` — Elo ratings calculated from resolved judgments
+- `ratings` — Bradley–Terry ratings from resolved judgments, on a 400-point scale centered at 1500
 
 `results[].duration_ms` is the duration of that candidate's provider request after it has a permit.
 
@@ -120,9 +120,8 @@ Results retain task-file and CLI model order. Statistics and ratings are ordered
 - LLM judgments are not ground truth.
 - The judge can also be one of the candidate models.
 - Running both response orders can reveal orientation disagreement, but does not establish that a judge is unbiased.
-- An orientation disagreement is treated as a draw for statistics and Elo.
-- Elo depends on the order in which judgments are processed.
-- Exact-score comparisons are not used by the Elo calculation.
+- An orientation disagreement is treated as a draw for statistics and ratings.
+- Exact-score comparisons are not used by the Bradley–Terry calculation.
 
 ## Development
 

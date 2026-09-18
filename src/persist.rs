@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::compare::Comparison;
-use crate::elo::ModelRating;
 use crate::evaluate::EvaluatedResult;
 use crate::judge::Judgment;
 use crate::provider::ModelId;
+use crate::rating::ModelRating;
 use crate::stats::ModelStats;
 
 #[derive(Debug, Serialize)]

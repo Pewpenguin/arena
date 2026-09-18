@@ -1,11 +1,11 @@
 pub mod cli;
 pub mod compare;
-pub mod elo;
 pub mod error;
 pub mod evaluate;
 pub mod execute;
 pub mod judge;
 pub mod persist;
 pub mod provider;
+pub mod rating;
 pub mod stats;
 pub mod task;

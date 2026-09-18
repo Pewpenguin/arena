@@ -20,7 +20,7 @@ pub enum JudgeDecision {
     Draw,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Judgment {
     pub task_id: String,
     pub model_a: ModelId,
@@ -30,6 +30,12 @@ pub struct Judgment {
     pub reason: String,
     pub duration_ms: u64,
     pub agreement: bool,
+    /// Original presentation `(model_a, model_b)`, in that identity frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orientation_ab: Option<JudgeDecision>,
+    /// Swapped presentation `(model_b, model_a)`, mapped back to the `(model_a, model_b)` frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orientation_ba: Option<JudgeDecision>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +162,8 @@ fn resolve_judgments(original: Judgment, swapped: Judgment, duration_ms: u64) ->
         reason,
         duration_ms,
         agreement,
+        orientation_ab: Some(original.winner),
+        orientation_ba: Some(map_swapped_winner(swapped.winner)),
     }
 }
 
@@ -204,6 +212,8 @@ pub async fn judge_pair(
         reason: decision.reason,
         duration_ms,
         agreement: true,
+        orientation_ab: None,
+        orientation_ba: None,
     })
 }
 
@@ -434,6 +444,8 @@ mod tests {
         assert_eq!(judgments[0].model_b, ModelId::new("m1"));
         assert_eq!(judgments[0].winner, JudgeDecision::Draw);
         assert!(!judgments[0].agreement);
+        assert_eq!(judgments[0].orientation_ab, Some(JudgeDecision::A));
+        assert_eq!(judgments[0].orientation_ba, Some(JudgeDecision::B));
         assert!(judgments[0].reason.contains("position bias disagreement"));
     }
 
@@ -530,6 +542,8 @@ mod tests {
         assert_eq!(judgments.len(), 1);
         assert_eq!(judgments[0].winner, JudgeDecision::A);
         assert!(judgments[0].agreement);
+        assert_eq!(judgments[0].orientation_ab, Some(JudgeDecision::A));
+        assert_eq!(judgments[0].orientation_ba, Some(JudgeDecision::A));
         assert_eq!(judgments[0].reason, "prefers better");
     }
 

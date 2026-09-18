@@ -6,13 +6,13 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use arena::cli::{Cli, Command};
 use arena::compare::compare_all;
-use arena::elo;
 use arena::error::{Error, Result};
 use arena::evaluate::evaluate_result;
 use arena::execute::execute_models;
 use arena::judge::judge_pairs;
 use arena::persist::{self, Output, RunMetadata};
 use arena::provider::{CompletionRequest, ModelId, ModelProvider, OpenAICompatibleProvider};
+use arena::rating;
 use arena::stats;
 use arena::task;
 
@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
             }
 
             let statistics = stats::aggregate(&judgments);
-            let ratings = elo::rate(&judgments);
+            let ratings = rating::rate(&judgments);
             let output_data = Output {
                 run: RunMetadata::new(models, judge, Some(tasks_path), started_at),
                 results,

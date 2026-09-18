@@ -85,6 +85,8 @@ mod tests {
             reason: String::new(),
             duration_ms: 0,
             agreement,
+            orientation_ab: None,
+            orientation_ba: None,
         }
     }
 
