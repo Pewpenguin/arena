@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -11,6 +11,9 @@ use crate::provider::{
     CompletionRequest, ModelId, ModelProvider, PROVIDER_CONCURRENCY, ProviderError,
 };
 use crate::task::Task;
+
+const JUDGE_ATTEMPTS: u32 = 3;
+const ERROR_TEXT_LIMIT: usize = 240;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -36,6 +39,61 @@ pub struct Judgment {
     /// Swapped presentation `(model_b, model_a)`, mapped back to the `(model_a, model_b)` frame.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orientation_ba: Option<JudgeDecision>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JudgePairsOutcome {
+    pub judgments: Vec<Judgment>,
+    pub failures: Vec<JudgmentFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct JudgmentFailure {
+    pub task_id: String,
+    pub model_a: ModelId,
+    pub model_b: ModelId,
+    pub judge_model: ModelId,
+    pub orientations: Vec<OrientationFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OrientationFailure {
+    pub orientation: JudgeOrientation,
+    pub kind: JudgmentFailureKind,
+    pub error: String,
+    pub attempts: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JudgeOrientation {
+    Ab,
+    Ba,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgmentFailureKind {
+    Provider,
+    InvalidJson,
+}
+
+impl JudgeOrientation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ab => "ab",
+            Self::Ba => "ba",
+        }
+    }
+}
+
+impl JudgmentFailureKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+            Self::InvalidJson => "invalid_json",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,13 +275,98 @@ pub async fn judge_pair(
     })
 }
 
+fn is_retryable(error: &JudgeError) -> bool {
+    matches!(
+        error,
+        JudgeError::Provider { .. } | JudgeError::InvalidResponse { .. }
+    )
+}
+
+fn retry_backoff(failed_attempts: u32) -> Option<Duration> {
+    let secs = match failed_attempts {
+        1 => 1,
+        2 => 2,
+        _ => return None,
+    };
+    Some(if cfg!(test) {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(secs)
+    })
+}
+
+fn failure_kind(error: &JudgeError) -> JudgmentFailureKind {
+    match error {
+        JudgeError::Provider { .. } => JudgmentFailureKind::Provider,
+        _ => JudgmentFailureKind::InvalidJson,
+    }
+}
+
+fn failure_text(error: &JudgeError) -> String {
+    let text = match error {
+        JudgeError::Provider { source, .. } => source.to_string(),
+        JudgeError::InvalidResponse { source, .. } => source.to_string(),
+        other => other.to_string(),
+    };
+    bound_error_text(&text)
+}
+
+fn bound_error_text(text: &str) -> String {
+    let mut chars = text.chars();
+    let truncated: String = chars.by_ref().take(ERROR_TEXT_LIMIT).collect();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+fn orientation_failure(
+    orientation: JudgeOrientation,
+    attempts: u32,
+    error: &JudgeError,
+) -> OrientationFailure {
+    OrientationFailure {
+        orientation,
+        kind: failure_kind(error),
+        error: failure_text(error),
+        attempts,
+    }
+}
+
+async fn judge_orientation_with_retry(
+    provider: &impl ModelProvider,
+    judge_model: ModelId,
+    task: &Task,
+    result_a: &EvaluatedResult,
+    result_b: &EvaluatedResult,
+) -> (u32, Result<Judgment, JudgeError>) {
+    let started = Instant::now();
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match judge_pair(provider, judge_model.clone(), task, result_a, result_b).await {
+            Ok(mut judgment) => {
+                judgment.duration_ms = started.elapsed().as_millis() as u64;
+                return (attempts, Ok(judgment));
+            }
+            Err(error) if attempts < JUDGE_ATTEMPTS && is_retryable(&error) => {
+                if let Some(delay) = retry_backoff(attempts) {
+                    tokio::time::sleep(delay).await;
+                }
+            }
+            Err(error) => return (attempts, Err(error)),
+        }
+    }
+}
+
 pub async fn judge_pairs<P>(
     provider: &P,
     judge_model: ModelId,
     task: &Task,
     results: &[EvaluatedResult],
     mut on_complete: impl FnMut(&Judgment),
-) -> Result<Vec<Judgment>, JudgeError>
+) -> Result<JudgePairsOutcome, JudgeError>
 where
     P: ModelProvider + Clone + Send + 'static,
 {
@@ -231,6 +374,10 @@ where
         .flat_map(|i| ((i + 1)..results.len()).map(move |j| (i, j)))
         .collect();
     let pair_count = pair_indices.len();
+    let pair_models: Vec<(ModelId, ModelId)> = pair_indices
+        .iter()
+        .map(|&(i, j)| (results[i].model.clone(), results[j].model.clone()))
+        .collect();
 
     let semaphore = Arc::new(Semaphore::new(PROVIDER_CONCURRENCY));
     let mut set = JoinSet::new();
@@ -250,42 +397,83 @@ where
                     .await
                     .expect("provider semaphore is not closed");
                 let started = Instant::now();
-                (
-                    index,
-                    orientation,
-                    started,
-                    judge_pair(&provider, judge_model, &task, &result_a, &result_b).await,
+                let (attempts, result) = judge_orientation_with_retry(
+                    &provider,
+                    judge_model,
+                    &task,
+                    &result_a,
+                    &result_b,
                 )
+                .await;
+                (index, orientation, started, attempts, result)
             });
         }
     }
 
-    let mut original = vec![None; pair_count];
-    let mut swapped = vec![None; pair_count];
+    let mut original = (0..pair_count).map(|_| None).collect::<Vec<_>>();
+    let mut swapped = (0..pair_count).map(|_| None).collect::<Vec<_>>();
     let mut ordered = vec![None; pair_count];
+    let mut failures = vec![None; pair_count];
 
     while let Some(joined) = set.join_next().await {
-        let (index, orientation, started, result) = joined.expect("pairwise judging panicked");
-        let judgment = result?;
-        on_complete(&judgment);
-
-        match orientation {
-            0 => original[index] = Some((started, judgment)),
-            _ => swapped[index] = Some((started, judgment)),
+        let (index, orientation, started, attempts, result) =
+            joined.expect("pairwise judging panicked");
+        match result {
+            Err(JudgeError::DifferentTasks) => return Err(JudgeError::DifferentTasks),
+            Ok(judgment) => {
+                on_complete(&judgment);
+                match orientation {
+                    0 => original[index] = Some(Ok((started, judgment))),
+                    _ => swapped[index] = Some(Ok((started, judgment))),
+                }
+            }
+            Err(error) => match orientation {
+                0 => original[index] = Some(Err((attempts, error))),
+                _ => swapped[index] = Some(Err((attempts, error))),
+            },
         }
 
         if original[index].is_some() && swapped[index].is_some() {
-            let (orig_started, orig) = original[index].take().expect("original judgment");
-            let (swap_started, swap) = swapped[index].take().expect("swapped judgment");
-            let duration_ms = orig_started.min(swap_started).elapsed().as_millis() as u64;
-            ordered[index] = Some(resolve_judgments(orig, swap, duration_ms));
+            let orig = original[index].take().expect("original orientation");
+            let swap = swapped[index].take().expect("swapped orientation");
+            match (orig, swap) {
+                (Ok((orig_started, orig)), Ok((swap_started, swap))) => {
+                    let duration_ms = orig_started.min(swap_started).elapsed().as_millis() as u64;
+                    ordered[index] = Some(resolve_judgments(orig, swap, duration_ms));
+                }
+                (orig, swap) => {
+                    let mut orientations = Vec::new();
+                    if let Err((attempts, error)) = orig {
+                        orientations.push(orientation_failure(
+                            JudgeOrientation::Ab,
+                            attempts,
+                            &error,
+                        ));
+                    }
+                    if let Err((attempts, error)) = swap {
+                        orientations.push(orientation_failure(
+                            JudgeOrientation::Ba,
+                            attempts,
+                            &error,
+                        ));
+                    }
+                    let (model_a, model_b) = pair_models[index].clone();
+                    failures[index] = Some(JudgmentFailure {
+                        task_id: task.id.clone(),
+                        model_a,
+                        model_b,
+                        judge_model: judge_model.clone(),
+                        orientations,
+                    });
+                }
+            }
         }
     }
 
-    Ok(ordered
-        .into_iter()
-        .map(|result| result.expect("missing judgment"))
-        .collect())
+    Ok(JudgePairsOutcome {
+        judgments: ordered.into_iter().flatten().collect(),
+        failures: failures.into_iter().flatten().collect(),
+    })
 }
 
 #[cfg(test)]
@@ -373,6 +561,21 @@ mod tests {
     }
 
     #[test]
+    fn rejects_truncated_think_block_without_judgment_json() {
+        let error = parse_decision(
+            "<think> ... \"Rust's ownership system ensures memory safety without a garbage collector by tracking who 'owns' each piece of data,",
+        )
+        .unwrap_err();
+        match error {
+            JudgeError::InvalidJson(message) => {
+                assert!(message.contains("no valid judgment JSON found"));
+                assert!(message.contains("<think>"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
     fn resolves_agreement_and_disagreement() {
         assert_eq!(
             resolve_winners(JudgeDecision::A, JudgeDecision::B),
@@ -429,7 +632,7 @@ mod tests {
         };
         let results = vec![evaluated("m0", "left"), evaluated("m1", "right")];
 
-        let judgments = judge_pairs(
+        let outcome = judge_pairs(
             &AlwaysPositionA,
             ModelId::new("judge"),
             &task,
@@ -438,7 +641,9 @@ mod tests {
         )
         .await
         .unwrap();
+        let judgments = outcome.judgments;
 
+        assert!(outcome.failures.is_empty());
         assert_eq!(judgments.len(), 1);
         assert_eq!(judgments[0].model_a, ModelId::new("m0"));
         assert_eq!(judgments[0].model_b, ModelId::new("m1"));
@@ -529,7 +734,7 @@ mod tests {
         };
         let results = vec![evaluated("m0", "better"), evaluated("m1", "worse")];
 
-        let judgments = judge_pairs(
+        let outcome = judge_pairs(
             &PrefersBetterText,
             ModelId::new("judge"),
             &task,
@@ -538,7 +743,9 @@ mod tests {
         )
         .await
         .unwrap();
+        let judgments = outcome.judgments;
 
+        assert!(outcome.failures.is_empty());
         assert_eq!(judgments.len(), 1);
         assert_eq!(judgments[0].winner, JudgeDecision::A);
         assert!(judgments[0].agreement);
@@ -598,10 +805,12 @@ mod tests {
             evaluated("m2", "fast"),
         ];
 
-        let judgments = judge_pairs(&provider, ModelId::new("judge"), &task, &results, |_| {})
+        let outcome = judge_pairs(&provider, ModelId::new("judge"), &task, &results, |_| {})
             .await
             .unwrap();
+        let judgments = outcome.judgments;
 
+        assert!(outcome.failures.is_empty());
         assert_eq!(judgments.len(), 3);
         assert_eq!(judgments[0].model_a, ModelId::new("m0"));
         assert_eq!(judgments[0].model_b, ModelId::new("m1"));
@@ -662,7 +871,7 @@ mod tests {
             evaluated("m3", "m3"),
         ];
 
-        let (judgments, ()) = tokio::join!(
+        let (outcome, ()) = tokio::join!(
             judge_pairs(&provider, ModelId::new("judge"), &task, &results, |_| {}),
             async {
                 while entered.load(Ordering::SeqCst) < PROVIDER_CONCURRENCY {
@@ -673,13 +882,297 @@ mod tests {
                 notify.notify_waiters();
             }
         );
-        let judgments = judgments.unwrap();
+        let judgments = outcome.unwrap().judgments;
         let min = judgments.iter().map(|j| j.duration_ms).min().unwrap();
         let max = judgments.iter().map(|j| j.duration_ms).max().unwrap();
 
         assert!(
             min < max,
             "queued pair duration {min}ms should exclude the semaphore wait included in occupying duration {max}ms"
+        );
+    }
+
+    #[derive(Clone)]
+    struct FailThenSucceed {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ModelProvider for FailThenSucceed {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok(CompletionResponse {
+                    text: "<think>truncated".into(),
+                });
+            }
+            Ok(CompletionResponse {
+                text: r#"{"winner":"a","reason":"ok"}"#.into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn orientation_failure_then_retry_resolves_normally() {
+        let provider = FailThenSucceed {
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let task = Task {
+            id: "t1".into(),
+            prompt: "p".into(),
+            evaluation: None,
+        };
+        let results = vec![evaluated("m0", "left"), evaluated("m1", "right")];
+
+        let outcome = judge_pairs(&provider, ModelId::new("judge"), &task, &results, |_| {})
+            .await
+            .unwrap();
+
+        assert!(outcome.failures.is_empty());
+        assert_eq!(outcome.judgments.len(), 1);
+        assert_eq!(outcome.judgments[0].winner, JudgeDecision::Draw);
+        assert!(!outcome.judgments[0].agreement);
+        assert!(provider.calls.load(Ordering::SeqCst) >= 3);
+    }
+
+    #[derive(Clone)]
+    struct AlwaysInvalidJson {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ModelProvider for AlwaysInvalidJson {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(CompletionResponse {
+                text: "not a judgment".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_count_is_bounded_at_three_attempts() {
+        let provider = AlwaysInvalidJson {
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let task = Task {
+            id: "t1".into(),
+            prompt: "p".into(),
+            evaluation: None,
+        };
+        let results = vec![evaluated("m0", "left"), evaluated("m1", "right")];
+
+        let outcome = judge_pairs(&provider, ModelId::new("judge"), &task, &results, |_| {})
+            .await
+            .unwrap();
+
+        assert!(outcome.judgments.is_empty());
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].orientations.len(), 2);
+        assert!(
+            outcome.failures[0]
+                .orientations
+                .iter()
+                .all(|failure| failure.attempts == JUDGE_ATTEMPTS)
+        );
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            (JUDGE_ATTEMPTS * 2) as usize
+        );
+    }
+
+    #[tokio::test]
+    async fn both_orientations_failing_records_one_pair_failure() {
+        let provider = AlwaysInvalidJson {
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let task = Task {
+            id: "t1".into(),
+            prompt: "p".into(),
+            evaluation: None,
+        };
+        let results = vec![evaluated("m0", "left"), evaluated("m1", "right")];
+
+        let outcome = judge_pairs(&provider, ModelId::new("judge"), &task, &results, |_| {})
+            .await
+            .unwrap();
+
+        assert!(outcome.judgments.is_empty());
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].task_id, "t1");
+        assert_eq!(outcome.failures[0].model_a, ModelId::new("m0"));
+        assert_eq!(outcome.failures[0].model_b, ModelId::new("m1"));
+        assert_eq!(
+            outcome.failures[0]
+                .orientations
+                .iter()
+                .map(|failure| failure.orientation)
+                .collect::<Vec<_>>(),
+            vec![JudgeOrientation::Ab, JudgeOrientation::Ba]
+        );
+        assert!(
+            outcome.failures[0]
+                .orientations
+                .iter()
+                .all(|failure| failure.kind == JudgmentFailureKind::InvalidJson)
+        );
+    }
+
+    #[derive(Clone)]
+    struct FailSwappedOrientation;
+
+    impl ModelProvider for FailSwappedOrientation {
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            let a_is_m1 = request.prompt.contains("Response A:\nm1\n");
+            if a_is_m1 {
+                return Ok(CompletionResponse {
+                    text: "truncated <think>".into(),
+                });
+            }
+            Ok(CompletionResponse {
+                text: r#"{"winner":"a","reason":"ok"}"#.into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn one_failed_orientation_omits_the_pair_and_is_not_a_draw() {
+        let task = Task {
+            id: "t1".into(),
+            prompt: "p".into(),
+            evaluation: None,
+        };
+        let results = vec![evaluated("m0", "m0"), evaluated("m1", "m1")];
+
+        let outcome = judge_pairs(
+            &FailSwappedOrientation,
+            ModelId::new("judge"),
+            &task,
+            &results,
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.judgments.is_empty());
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(
+            outcome.failures[0].orientations.len(),
+            1,
+            "the surviving orientation must not become a judgment or a draw"
+        );
+        assert_eq!(
+            outcome.failures[0].orientations[0].orientation,
+            JudgeOrientation::Ba
+        );
+        assert_eq!(
+            outcome.failures[0].orientations[0].kind,
+            JudgmentFailureKind::InvalidJson
+        );
+    }
+
+    #[derive(Clone)]
+    struct FailOnlyFirstPair;
+
+    impl ModelProvider for FailOnlyFirstPair {
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            let involves_m0 = request.prompt.contains("\nm0\n");
+            let involves_m1 = request.prompt.contains("\nm1\n");
+            if involves_m0 && involves_m1 {
+                return Ok(CompletionResponse {
+                    text: "not json".into(),
+                });
+            }
+            Ok(CompletionResponse {
+                text: r#"{"winner":"a","reason":"ok"}"#.into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_pair_does_not_abort_unrelated_pairs_or_drop_their_ratings() {
+        let task = Task {
+            id: "t1".into(),
+            prompt: "p".into(),
+            evaluation: None,
+        };
+        let results = vec![
+            evaluated("m0", "m0"),
+            evaluated("m1", "m1"),
+            evaluated("m2", "m2"),
+        ];
+
+        let outcome = judge_pairs(
+            &FailOnlyFirstPair,
+            ModelId::new("judge"),
+            &task,
+            &results,
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].model_a, ModelId::new("m0"));
+        assert_eq!(outcome.failures[0].model_b, ModelId::new("m1"));
+        assert_eq!(outcome.judgments.len(), 2);
+        assert_eq!(outcome.judgments[0].model_a, ModelId::new("m0"));
+        assert_eq!(outcome.judgments[0].model_b, ModelId::new("m2"));
+        assert_eq!(outcome.judgments[1].model_a, ModelId::new("m1"));
+        assert_eq!(outcome.judgments[1].model_b, ModelId::new("m2"));
+
+        let statistics = crate::stats::aggregate(&outcome.judgments);
+        assert_eq!(statistics.len(), 3);
+        assert!(statistics.iter().all(|stat| stat.total > 0));
+
+        let ratings = crate::rating::rate(&outcome.judgments);
+        assert_eq!(ratings.len(), 3);
+        assert!(ratings.iter().any(|rating| rating.rating.is_some()));
+    }
+
+    #[tokio::test]
+    async fn different_tasks_are_not_retried() {
+        let provider = AlwaysInvalidJson {
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let task = Task {
+            id: "t1".into(),
+            prompt: "p".into(),
+            evaluation: None,
+        };
+        let mut other = evaluated("m1", "right");
+        other.task_id = "t2".into();
+
+        let error = judge_orientation_with_retry(
+            &provider,
+            ModelId::new("judge"),
+            &task,
+            &evaluated("m0", "left"),
+            &other,
+        )
+        .await
+        .1
+        .unwrap_err();
+
+        assert!(matches!(error, JudgeError::DifferentTasks));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn incomplete_judgments_error_is_non_zero_status() {
+        let error = crate::error::Error::IncompleteJudgments(2);
+        assert_eq!(
+            error.to_string(),
+            "incomplete run: 2 judgment pair(s) failed"
         );
     }
 }

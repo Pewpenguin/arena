@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::compare::Comparison;
 use crate::evaluate::EvaluatedResult;
-use crate::judge::Judgment;
+use crate::judge::{Judgment, JudgmentFailure};
 use crate::provider::ModelId;
 use crate::rating::ModelRating;
 use crate::stats::ModelStats;
@@ -68,6 +68,8 @@ pub struct Output {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub judgments: Vec<Judgment>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub judgment_failures: Vec<JudgmentFailure>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub statistics: Vec<ModelStats>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ratings: Vec<ModelRating>,
@@ -90,6 +92,7 @@ pub fn write(path: impl AsRef<Path>, output: &Output) -> Result<(), PersistError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::judge::{JudgeOrientation, JudgmentFailureKind, OrientationFailure};
 
     #[test]
     fn run_metadata_serializes_provenance_and_preserves_output_collections() {
@@ -131,6 +134,7 @@ mod tests {
             results: vec![],
             comparisons: vec![],
             judgments: vec![],
+            judgment_failures: vec![],
             statistics: vec![],
             ratings: vec![],
         };
@@ -139,6 +143,7 @@ mod tests {
         assert_eq!(value["results"], serde_json::json!([]));
         assert_eq!(value["comparisons"], serde_json::json!([]));
         assert!(value.get("judgments").is_none());
+        assert!(value.get("judgment_failures").is_none());
         assert!(value.get("statistics").is_none());
         assert!(value.get("ratings").is_none());
     }
@@ -191,5 +196,69 @@ mod tests {
         assert_eq!(value["rating"], 1500.0);
         assert!(value.get("rating_lower").is_none());
         assert!(value.get("rating_upper").is_none());
+    }
+
+    #[test]
+    fn judgment_failures_serialize_and_are_omitted_when_empty() {
+        let failure = JudgmentFailure {
+            task_id: "t1".into(),
+            model_a: ModelId::new("a"),
+            model_b: ModelId::new("b"),
+            judge_model: ModelId::new("judge"),
+            orientations: vec![
+                OrientationFailure {
+                    orientation: JudgeOrientation::Ab,
+                    kind: JudgmentFailureKind::InvalidJson,
+                    error: "no valid judgment JSON found".into(),
+                    attempts: 3,
+                },
+                OrientationFailure {
+                    orientation: JudgeOrientation::Ba,
+                    kind: JudgmentFailureKind::Provider,
+                    error: "HTTP 500: upstream".into(),
+                    attempts: 3,
+                },
+            ],
+        };
+        assert_eq!(
+            serde_json::to_value(&failure).unwrap(),
+            serde_json::json!({
+                "task_id": "t1",
+                "model_a": "a",
+                "model_b": "b",
+                "judge_model": "judge",
+                "orientations": [
+                    {
+                        "orientation": "ab",
+                        "kind": "invalid_json",
+                        "error": "no valid judgment JSON found",
+                        "attempts": 3
+                    },
+                    {
+                        "orientation": "ba",
+                        "kind": "provider",
+                        "error": "HTTP 500: upstream",
+                        "attempts": 3
+                    }
+                ]
+            })
+        );
+
+        let output = Output {
+            run: RunMetadata::new(
+                vec![ModelId::new("a")],
+                None,
+                None,
+                "2026-01-02T03:04:05Z".into(),
+            ),
+            results: vec![],
+            comparisons: vec![],
+            judgments: vec![],
+            judgment_failures: vec![],
+            statistics: vec![],
+            ratings: vec![],
+        };
+        let value = serde_json::to_value(&output).unwrap();
+        assert!(value.get("judgment_failures").is_none());
     }
 }

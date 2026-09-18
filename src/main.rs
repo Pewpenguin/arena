@@ -72,6 +72,7 @@ async fn main() -> Result<()> {
             let comparisons = compare_all(&results);
 
             let mut judgments = Vec::new();
+            let mut judgment_failures = Vec::new();
             if let Some(judge_model) = &judge {
                 let pair_total = pair_count(tasks.len(), models.len());
                 let judges = progress_bar(pair_total);
@@ -83,7 +84,7 @@ async fn main() -> Result<()> {
                         .collect();
 
                     judges.set_message(format!("task {}  judge", task.id));
-                    let judged = judge_pairs(
+                    let outcome = judge_pairs(
                         &provider,
                         judge_model.clone(),
                         task,
@@ -100,7 +101,23 @@ async fn main() -> Result<()> {
                         },
                     )
                     .await?;
-                    judgments.extend(judged);
+                    for failure in &outcome.failures {
+                        let detail = failure
+                            .orientations
+                            .iter()
+                            .map(|item| {
+                                format!("{} {}", item.orientation.as_str(), item.kind.as_str())
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        judges.println(format!(
+                            "judge  {}  {} vs {}  failed  {}",
+                            failure.task_id, failure.model_a, failure.model_b, detail
+                        ));
+                        judges.inc(failure.orientations.len() as u64);
+                    }
+                    judgments.extend(outcome.judgments);
+                    judgment_failures.extend(outcome.failures);
                 }
                 judges.finish_and_clear();
             }
@@ -111,11 +128,13 @@ async fn main() -> Result<()> {
             if let Some(meta) = bootstrap {
                 run = run.with_bootstrap(meta.seed, meta.replicates, meta.valid);
             }
+            let failed_pairs = judgment_failures.len();
             let output_data = Output {
                 run,
                 results,
                 comparisons,
                 judgments,
+                judgment_failures,
                 statistics,
                 ratings,
             };
@@ -124,6 +143,10 @@ async fn main() -> Result<()> {
                 persist::write(path, &output_data)?;
             } else {
                 println!("{}", serde_json::to_string_pretty(&output_data)?);
+            }
+
+            if failed_pairs > 0 {
+                return Err(Error::IncompleteJudgments(failed_pairs));
             }
         }
     }

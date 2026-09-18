@@ -22,6 +22,8 @@ pub enum Error {
     Judge(#[from] JudgeError),
     #[error("duplicate model id: {0}")]
     DuplicateModel(ModelId),
+    #[error("incomplete run: {0} judgment pair(s) failed")]
+    IncompleteJudgments(usize),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }

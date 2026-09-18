@@ -56,7 +56,7 @@ Run multiple models against a task file:
 
 `--model` can be specified multiple times. Model IDs must be unique. `--judge` and `--output` are optional. `--seed` sets the bootstrap RNG seed and defaults to `0`.
 
-Without `--output`, the JSON result is written to stdout. A provider error fails the run.
+Without `--output`, the JSON result is written to stdout. A candidate provider error fails the run. A permanently failed judge pair is saved in the output and the process then exits non-zero.
 
 ## Tasks
 
@@ -98,6 +98,8 @@ If they disagree, Arena resolves the pair as a draw with `agreement: false`.
 
 Both orientation winners are persisted, mapped back to the original model pair. Statistics and Bradley–Terry ratings use only the resolved winner. The two orientations are retained for position-bias diagnostics and are not counted as independent ranking observations.
 
+Each orientation is tried up to three times (a 1s backoff, then 2s) for provider errors and malformed/truncated JSON. The parser stays strict: a retry repeats the same judge request rather than repairing invalid output. Both orientations must succeed to produce a resolved judgment. A permanently failed pair is omitted from `judgments` (it is not a draw) and recorded in `judgment_failures`. The run still writes its output, then exits non-zero. Missing judgments can disconnect or separate the comparison graph, and the gaps need not be random, so ratings from an incomplete run should not be read as if every pair had been observed.
+
 ## Output
 
 `arena exec` produces one JSON object with these fields:
@@ -106,6 +108,7 @@ Both orientation winners are persisted, mapped back to the original model pair. 
 - `results` — model responses, evaluations, and durations
 - `comparisons` — pairwise comparisons from exact scores
 - `judgments` — resolved LLM-judge results and both orientation winners
+- `judgment_failures` — pairwise judge attempts that never produced both orientations
 - `statistics` — per-model wins, losses, draws, and judge agreement
 - `ratings` — full-data Bradley–Terry point estimates from resolved judgments, on a 400-point scale centered at 1500, with optional 95% percentile bounds
 
@@ -123,6 +126,7 @@ Results retain task-file and CLI model order. Statistics and ratings are ordered
 - The judge can also be one of the candidate models.
 - Running both response orders can reveal orientation disagreement, but does not establish that a judge is unbiased.
 - An orientation disagreement is treated as a draw for statistics and ratings.
+- A missing orientation is omitted, not treated as a draw.
 - Exact-score comparisons are not used by the Bradley–Terry calculation.
 - Bootstrap intervals are not a test of pairwise rating differences.
 
