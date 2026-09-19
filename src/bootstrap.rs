@@ -4,6 +4,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use crate::judge::Judgment;
+use crate::provider::ModelId;
 use crate::rating::{self, ModelRating};
 
 pub const BOOTSTRAP_REPLICATES: u32 = 1_000;
@@ -14,17 +15,23 @@ const UPPER_P: f64 = 0.975;
 pub struct BootstrapMeta {
     pub seed: u64,
     pub replicates: u32,
-    pub valid: u32,
+    pub valid: Option<u32>,
 }
 
 pub fn rate_with_uncertainty(
     judgments: &[Judgment],
+    models: &[ModelId],
     seed: u64,
-) -> (Vec<ModelRating>, Option<BootstrapMeta>) {
-    let mut ratings = rating::rate(judgments);
+) -> (Vec<ModelRating>, BootstrapMeta) {
+    let mut ratings = rating::rate(judgments, models);
+    let configured = BootstrapMeta {
+        seed,
+        replicates: BOOTSTRAP_REPLICATES,
+        valid: None,
+    };
     let clusters = group_by_task(judgments);
     if clusters.len() < 2 || ratings.is_empty() || ratings.iter().any(|r| r.rating.is_none()) {
-        return (ratings, None);
+        return (ratings, configured);
     }
 
     let mut rng = StdRng::seed_from_u64(seed);
@@ -36,7 +43,7 @@ pub fn rate_with_uncertainty(
             .map(|_| rng.gen_range(0..n_clusters))
             .collect();
         let sampled = build_replicate(&clusters, &draws);
-        if let Some(values) = finite_for_all(&ratings, &rating::rate(&sampled)) {
+        if let Some(values) = finite_for_all(&ratings, &rating::rate(&sampled, models)) {
             valid_samples.push(values);
         }
     }
@@ -48,11 +55,11 @@ pub fn rate_with_uncertainty(
 
     (
         ratings,
-        Some(BootstrapMeta {
+        BootstrapMeta {
             seed,
             replicates: BOOTSTRAP_REPLICATES,
-            valid,
-        }),
+            valid: Some(valid),
+        },
     )
 }
 
@@ -214,19 +221,21 @@ mod tests {
         );
 
         assert_eq!(
-            rate_with_uncertainty(&judgments, 0),
-            rate_with_uncertainty(&oriented, 0)
+            rate_with_uncertainty(&judgments, &[], 0),
+            rate_with_uncertainty(&oriented, &[], 0)
         );
     }
 
     #[test]
     fn one_task_keeps_point_ratings_without_bounds() {
         let judgments = draws("t1");
-        let (ratings, meta) = rate_with_uncertainty(&judgments, 0);
-        assert_eq!(rating::rate(&judgments), ratings);
+        let (ratings, meta) = rate_with_uncertainty(&judgments, &[], 0);
+        assert_eq!(rating::rate(&judgments, &[]), ratings);
         assert_eq!(rating_of(&ratings, "a"), Some(1500.0));
         assert!(all_bounds_absent(&ratings));
-        assert_eq!(meta, None);
+        assert_eq!(meta.seed, 0);
+        assert_eq!(meta.replicates, BOOTSTRAP_REPLICATES);
+        assert_eq!(meta.valid, None);
     }
 
     #[test]
@@ -235,25 +244,27 @@ mod tests {
             judgment("t1", "a", "b", JudgeDecision::A),
             judgment("t2", "c", "d", JudgeDecision::A),
         ];
-        let (ratings, meta) = rate_with_uncertainty(&judgments, 0);
-        assert_eq!(rating::rate(&judgments), ratings);
+        let (ratings, meta) = rate_with_uncertainty(&judgments, &[], 0);
+        assert_eq!(rating::rate(&judgments, &[]), ratings);
         assert!(ratings.iter().all(|r| r.rating.is_none()));
         assert!(all_bounds_absent(&ratings));
-        assert_eq!(meta, None);
+        assert_eq!(meta.seed, 0);
+        assert_eq!(meta.replicates, BOOTSTRAP_REPLICATES);
+        assert_eq!(meta.valid, None);
     }
 
     #[test]
     fn invalid_replicate_omits_all_bounds_and_keeps_point_ratings() {
         let mut judgments = cycle("t1");
         judgments.extend(hierarchy("t2"));
-        let point = rating::rate(&judgments);
+        let point = rating::rate(&judgments, &[]);
         assert!(point.iter().all(|r| r.rating.is_some()));
 
-        let (ratings, meta) = rate_with_uncertainty(&judgments, 0);
-        let meta = meta.expect("bootstrap should run");
+        let (ratings, meta) = rate_with_uncertainty(&judgments, &[], 0);
         assert_eq!(meta.seed, 0);
         assert_eq!(meta.replicates, BOOTSTRAP_REPLICATES);
-        assert!(meta.valid < BOOTSTRAP_REPLICATES);
+        let valid = meta.valid.expect("bootstrap should run");
+        assert!(valid < BOOTSTRAP_REPLICATES);
         assert_eq!(
             ratings
                 .iter()
@@ -271,13 +282,13 @@ mod tests {
     fn same_seed_is_deterministic() {
         let mut judgments = cycle("t1");
         judgments.extend(draws("t2"));
-        let first = rate_with_uncertainty(&judgments, 0);
-        let second = rate_with_uncertainty(&judgments, 0);
+        let first = rate_with_uncertainty(&judgments, &[], 0);
+        let second = rate_with_uncertainty(&judgments, &[], 0);
         assert_eq!(first, second);
-        let meta = first.1.expect("bootstrap should run");
+        let meta = first.1;
         assert_eq!(meta.seed, 0);
         assert_eq!(meta.replicates, BOOTSTRAP_REPLICATES);
-        assert_eq!(meta.valid, BOOTSTRAP_REPLICATES);
+        assert_eq!(meta.valid, Some(BOOTSTRAP_REPLICATES));
         assert!(
             first
                 .0

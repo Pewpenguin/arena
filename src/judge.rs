@@ -1100,11 +1100,11 @@ mod tests {
         assert_eq!(outcome.judgments[1].model_a, ModelId::new("m1"));
         assert_eq!(outcome.judgments[1].model_b, ModelId::new("m2"));
 
-        let statistics = crate::stats::aggregate(&outcome.judgments);
+        let statistics = crate::stats::aggregate(&outcome.judgments, &[]);
         assert_eq!(statistics.len(), 3);
         assert!(statistics.iter().all(|stat| stat.total > 0));
 
-        let ratings = crate::rating::rate(&outcome.judgments);
+        let ratings = crate::rating::rate(&outcome.judgments, &[]);
         assert_eq!(ratings.len(), 3);
         assert!(ratings.iter().any(|rating| rating.rating.is_some()));
     }

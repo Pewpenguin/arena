@@ -122,8 +122,13 @@ async fn main() -> Result<()> {
                 judges.finish_and_clear();
             }
 
-            let statistics = stats::aggregate(&judgments);
-            let (ratings, bootstrap) = bootstrap::rate_with_uncertainty(&judgments, seed);
+            let (statistics, ratings, bootstrap_meta) = if judge.is_some() {
+                let statistics = stats::aggregate(&judgments, &models);
+                let (ratings, meta) = bootstrap::rate_with_uncertainty(&judgments, &models, seed);
+                (statistics, ratings, Some(meta))
+            } else {
+                (Vec::new(), Vec::new(), None)
+            };
             let mut run = RunMetadata::new(
                 models,
                 judge,
@@ -131,7 +136,7 @@ async fn main() -> Result<()> {
                 started_at,
                 provider.base_url(),
             );
-            if let Some(meta) = bootstrap {
+            if let Some(meta) = bootstrap_meta {
                 run = run.with_bootstrap(meta.seed, meta.replicates, meta.valid);
             }
             let failed_pairs = judgment_failures.len();

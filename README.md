@@ -104,7 +104,7 @@ Each orientation is tried up to three times (a 1s backoff, then 2s) for provider
 
 `arena exec` produces one JSON object with these fields:
 
-- `run` — version, models, judge, task path, resolved provider `base_url`, start time, and bootstrap seed/replicate counts when uncertainty was computed
+- `run` — version, models, judge, task path, resolved provider `base_url`, start time, and, when a judge is used, `bootstrap_seed` and `bootstrap_replicates`. `bootstrap_valid` is present only when the bootstrap resampling loop actually runs
 - `tasks` — the loaded task definitions (id, prompt, optional exact evaluation)
 - `results` — model responses, evaluations, and durations
 - `comparisons` — pairwise comparisons from exact scores
@@ -113,15 +113,15 @@ Each orientation is tried up to three times (a 1s backoff, then 2s) for provider
 - `statistics` — per-model wins, losses, draws, and judge agreement
 - `ratings` — full-data Bradley–Terry point estimates from resolved judgments, on a 400-point scale centered at 1500, with optional 95% percentile bounds
 
-Ratings are the full-data Bradley–Terry estimates. Uncertainty uses a task-clustered percentile bootstrap: each unique task is resampled as a unit, carrying all of that task's resolved pairwise judgments. The two judge orientations are not independent observations and are not resampled. The default is 1,000 replicates, a seed of `0`, and 95% percentile bounds (`rating_lower`, `rating_upper`). Bounds are omitted when there are fewer than two distinct tasks, when the original ratings are unavailable, or when any bootstrap replicate cannot produce finite ratings. In those cases the point estimates remain. The intervals describe task-sampling variability only; they do not capture judge bias, residual position bias, task-selection effects, or a different task distribution. The 1500 center is a convention on this relative scale.
+Ratings are the full-data Bradley–Terry estimates. Uncertainty uses a task-clustered percentile bootstrap: each unique task is resampled as a unit, carrying all of that task's resolved pairwise judgments. The two judge orientations are not independent observations and are not resampled. The default is 1,000 replicates, a seed of `0`, and 95% percentile bounds (`rating_lower`, `rating_upper`). Bounds are omitted when there are fewer than two distinct tasks, when the original ratings are unavailable, or when any bootstrap replicate cannot produce finite ratings. In those cases the point estimates remain, and a judge run still records `bootstrap_seed` and `bootstrap_replicates` even though bounds are absent. `bootstrap_valid` is omitted unless the resampling loop ran. The intervals describe task-sampling variability only; they do not capture judge bias, residual position bias, task-selection effects, or a different task distribution. The 1500 center is a convention on this relative scale.
 
-`results[].duration_ms` is the duration of that candidate's provider request after it has a permit.
+`results[].duration_ms` is the total candidate execution duration after it acquires a provider permit, including retries and retry backoff.
 
 `judgments[].duration_ms` is the wall-clock time from when the first of a pair's two judge orientations begins work after acquiring a provider permit until both orientations have completed. It excludes time the pair spends queued behind other provider calls, and it is not the sum of the two orientation request times.
 
 Results retain task-file and CLI model order. Statistics and ratings are ordered by model ID.
 
-The saved run is an audit of one execution: models, judge, task file path, the loaded tasks, and the provider base URL. It does not store API keys. Candidate and judge completions are not deterministic; `--seed` only reproduces bootstrap intervals from the persisted judgments.
+The saved run is an audit of one execution: models, judge, task file path, the loaded tasks, and the provider base URL. It does not store API keys. Candidate and judge completions are not deterministic; `--seed` only controls the bootstrap RNG and does not make model completions deterministic. When intervals were produced, the same seed reproduces them from the persisted judgments.
 
 ## Limitations
 

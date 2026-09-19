@@ -17,8 +17,11 @@ pub struct ModelStats {
     pub agreement_rate: f64,
 }
 
-pub fn aggregate(judgments: &[Judgment]) -> Vec<ModelStats> {
+pub fn aggregate(judgments: &[Judgment], models: &[ModelId]) -> Vec<ModelStats> {
     let mut stats: BTreeMap<ModelId, ModelStats> = BTreeMap::new();
+    for model in models {
+        entry(&mut stats, model);
+    }
 
     for judgment in judgments {
         match judgment.winner {
@@ -92,7 +95,39 @@ mod tests {
 
     #[test]
     fn empty_judgments_produce_no_stats() {
-        assert!(aggregate(&[]).is_empty());
+        assert!(aggregate(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn requested_models_are_present_without_inferring_outcomes() {
+        let stats = aggregate(&[], &[ModelId::new("a")]);
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].model, ModelId::new("a"));
+        assert_eq!(
+            (
+                stats[0].wins,
+                stats[0].losses,
+                stats[0].draws,
+                stats[0].total
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(
+            (stats[0].agreement_count, stats[0].disagreement_count),
+            (0, 0)
+        );
+        assert_eq!(stats[0].agreement_rate, 0.0);
+
+        let stats = aggregate(
+            &[judgment("a", "b", JudgeDecision::A, true)],
+            &[ModelId::new("a"), ModelId::new("b"), ModelId::new("c")],
+        );
+        assert_eq!(stats.len(), 3);
+        let a = stats.iter().find(|s| s.model == ModelId::new("a")).unwrap();
+        assert_eq!(a.wins, 1);
+        let c = stats.iter().find(|s| s.model == ModelId::new("c")).unwrap();
+        assert_eq!((c.wins, c.losses, c.draws, c.total), (0, 0, 0, 0));
+        assert_eq!(c.agreement_rate, 0.0);
     }
 
     #[test]
@@ -103,7 +138,7 @@ mod tests {
             judgment("a", "b", JudgeDecision::Draw, true),
         ];
 
-        let stats = aggregate(&judgments);
+        let stats = aggregate(&judgments, &[]);
 
         let a = stats.iter().find(|s| s.model == ModelId::new("a")).unwrap();
         assert_eq!((a.wins, a.losses, a.draws, a.total), (1, 1, 1, 3));
@@ -123,7 +158,7 @@ mod tests {
             judgment("a", "b", JudgeDecision::Draw, false),
         ];
 
-        let stats = aggregate(&judgments);
+        let stats = aggregate(&judgments, &[]);
 
         let a = stats.iter().find(|s| s.model == ModelId::new("a")).unwrap();
         assert_eq!((a.wins, a.losses, a.draws, a.total), (1, 0, 1, 2));

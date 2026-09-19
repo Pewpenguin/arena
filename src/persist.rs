@@ -52,10 +52,10 @@ impl RunMetadata {
         }
     }
 
-    pub fn with_bootstrap(mut self, seed: u64, replicates: u32, valid: u32) -> Self {
+    pub fn with_bootstrap(mut self, seed: u64, replicates: u32, valid: Option<u32>) -> Self {
         self.bootstrap_seed = Some(seed);
         self.bootstrap_replicates = Some(replicates);
-        self.bootstrap_valid = Some(valid);
+        self.bootstrap_valid = valid;
         self
     }
 }
@@ -98,6 +98,7 @@ pub fn write(path: impl AsRef<Path>, output: &Output) -> Result<(), PersistError
 mod tests {
     use super::*;
     use crate::judge::{JudgeOrientation, JudgmentFailureKind, OrientationFailure};
+    use crate::rating::UnavailableReason;
     use crate::task::{Task, TaskEvaluation};
 
     fn run_meta(
@@ -199,7 +200,27 @@ mod tests {
 
     #[test]
     fn bootstrap_metadata_and_rating_bounds_serialize_only_when_present() {
-        let run = run_meta(vec![ModelId::new("a")], None, None).with_bootstrap(0, 1000, 1000);
+        let configured =
+            run_meta(vec![ModelId::new("a")], None, None).with_bootstrap(0, 1000, None);
+        assert_eq!(
+            serde_json::to_value(&configured).unwrap(),
+            serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "models": ["a"],
+                "base_url": "https://example.test/v1",
+                "started_at": "2026-01-02T03:04:05Z",
+                "bootstrap_seed": 0,
+                "bootstrap_replicates": 1000,
+            })
+        );
+        assert!(
+            serde_json::to_value(&configured)
+                .unwrap()
+                .get("bootstrap_valid")
+                .is_none()
+        );
+
+        let run = run_meta(vec![ModelId::new("a")], None, None).with_bootstrap(0, 1000, Some(1000));
         assert_eq!(
             serde_json::to_value(&run).unwrap(),
             serde_json::json!({
@@ -218,6 +239,7 @@ mod tests {
             rating: Some(1500.0),
             rating_lower: Some(1400.0),
             rating_upper: Some(1600.0),
+            unavailable: None,
         };
         assert_eq!(
             serde_json::to_value(&with_bounds).unwrap(),
@@ -234,12 +256,40 @@ mod tests {
             rating: Some(1500.0),
             rating_lower: None,
             rating_upper: None,
+            unavailable: None,
         };
         let value = serde_json::to_value(&without_bounds).unwrap();
         assert_eq!(value["model"], "a");
         assert_eq!(value["rating"], 1500.0);
         assert!(value.get("rating_lower").is_none());
         assert!(value.get("rating_upper").is_none());
+        assert!(value.get("unavailable").is_none());
+
+        for reason in [
+            UnavailableReason::NoComparisons,
+            UnavailableReason::Disconnected,
+            UnavailableReason::Separated,
+            UnavailableReason::Nonfinite,
+        ] {
+            let value = serde_json::to_value(&ModelRating {
+                model: ModelId::new("a"),
+                rating: None,
+                rating_lower: None,
+                rating_upper: None,
+                unavailable: Some(reason),
+            })
+            .unwrap();
+            assert_eq!(value["rating"], serde_json::Value::Null);
+            assert_eq!(
+                value["unavailable"],
+                match reason {
+                    UnavailableReason::NoComparisons => "no_comparisons",
+                    UnavailableReason::Disconnected => "disconnected",
+                    UnavailableReason::Separated => "separated",
+                    UnavailableReason::Nonfinite => "nonfinite",
+                }
+            );
+        }
     }
 
     #[test]
