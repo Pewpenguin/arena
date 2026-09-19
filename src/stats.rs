@@ -90,6 +90,8 @@ mod tests {
             agreement,
             orientation_ab: None,
             orientation_ba: None,
+            reason_ab: None,
+            reason_ba: None,
         }
     }
 

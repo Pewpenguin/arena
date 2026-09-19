@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -10,9 +10,9 @@ use crate::evaluate::EvaluatedResult;
 use crate::provider::{
     CompletionRequest, ModelId, ModelProvider, PROVIDER_CONCURRENCY, ProviderError,
 };
+use crate::retry;
 use crate::task::Task;
 
-const JUDGE_ATTEMPTS: u32 = 3;
 const ERROR_TEXT_LIMIT: usize = 240;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +39,10 @@ pub struct Judgment {
     /// Swapped presentation `(model_b, model_a)`, mapped back to the `(model_a, model_b)` frame.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orientation_ba: Option<JudgeDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_ab: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_ba: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,13 +206,12 @@ fn resolve_winners(original: JudgeDecision, swapped: JudgeDecision) -> (JudgeDec
 
 fn resolve_judgments(original: Judgment, swapped: Judgment, duration_ms: u64) -> Judgment {
     let (winner, agreement) = resolve_winners(original.winner.clone(), swapped.winner.clone());
+    let reason_ab = original.reason;
+    let reason_ba = swapped.reason;
     let reason = if agreement {
-        original.reason
+        reason_ab.clone()
     } else {
-        format!(
-            "position bias disagreement (original: {}; swapped: {})",
-            original.reason, swapped.reason
-        )
+        format!("position bias disagreement (original: {reason_ab}; swapped: {reason_ba})")
     };
 
     Judgment {
@@ -222,6 +225,8 @@ fn resolve_judgments(original: Judgment, swapped: Judgment, duration_ms: u64) ->
         agreement,
         orientation_ab: Some(original.winner),
         orientation_ba: Some(map_swapped_winner(swapped.winner)),
+        reason_ab: Some(reason_ab),
+        reason_ba: Some(reason_ba),
     }
 }
 
@@ -272,27 +277,16 @@ pub async fn judge_pair(
         agreement: true,
         orientation_ab: None,
         orientation_ba: None,
+        reason_ab: None,
+        reason_ba: None,
     })
 }
 
-fn is_retryable(error: &JudgeError) -> bool {
+fn is_retryable_judge(error: &JudgeError) -> bool {
     matches!(
         error,
         JudgeError::Provider { .. } | JudgeError::InvalidResponse { .. }
     )
-}
-
-fn retry_backoff(failed_attempts: u32) -> Option<Duration> {
-    let secs = match failed_attempts {
-        1 => 1,
-        2 => 2,
-        _ => return None,
-    };
-    Some(if cfg!(test) {
-        Duration::ZERO
-    } else {
-        Duration::from_secs(secs)
-    })
 }
 
 fn failure_kind(error: &JudgeError) -> JudgmentFailureKind {
@@ -342,21 +336,17 @@ async fn judge_orientation_with_retry(
     result_b: &EvaluatedResult,
 ) -> (u32, Result<Judgment, JudgeError>) {
     let started = Instant::now();
-    let mut attempts = 0;
-    loop {
-        attempts += 1;
-        match judge_pair(provider, judge_model.clone(), task, result_a, result_b).await {
-            Ok(mut judgment) => {
-                judgment.duration_ms = started.elapsed().as_millis() as u64;
-                return (attempts, Ok(judgment));
-            }
-            Err(error) if attempts < JUDGE_ATTEMPTS && is_retryable(&error) => {
-                if let Some(delay) = retry_backoff(attempts) {
-                    tokio::time::sleep(delay).await;
-                }
-            }
-            Err(error) => return (attempts, Err(error)),
+    let (attempts, result) = retry::with_retries(
+        || judge_pair(provider, judge_model.clone(), task, result_a, result_b),
+        is_retryable_judge,
+    )
+    .await;
+    match result {
+        Ok(mut judgment) => {
+            judgment.duration_ms = started.elapsed().as_millis() as u64;
+            (attempts, Ok(judgment))
         }
+        Err(error) => (attempts, Err(error)),
     }
 }
 
@@ -651,6 +641,8 @@ mod tests {
         assert!(!judgments[0].agreement);
         assert_eq!(judgments[0].orientation_ab, Some(JudgeDecision::A));
         assert_eq!(judgments[0].orientation_ba, Some(JudgeDecision::B));
+        assert_eq!(judgments[0].reason_ab.as_deref(), Some("position a"));
+        assert_eq!(judgments[0].reason_ba.as_deref(), Some("position a"));
         assert!(judgments[0].reason.contains("position bias disagreement"));
     }
 
@@ -751,6 +743,8 @@ mod tests {
         assert!(judgments[0].agreement);
         assert_eq!(judgments[0].orientation_ab, Some(JudgeDecision::A));
         assert_eq!(judgments[0].orientation_ba, Some(JudgeDecision::A));
+        assert_eq!(judgments[0].reason_ab.as_deref(), Some("prefers better"));
+        assert_eq!(judgments[0].reason_ba.as_deref(), Some("prefers better"));
         assert_eq!(judgments[0].reason, "prefers better");
     }
 
@@ -983,11 +977,12 @@ mod tests {
             vec![JudgeOrientation::Ab, JudgeOrientation::Ba]
         );
         assert!(outcome.failures[0].orientations.iter().all(|failure| {
-            failure.attempts == JUDGE_ATTEMPTS && failure.kind == JudgmentFailureKind::InvalidJson
+            failure.attempts == crate::retry::ATTEMPTS
+                && failure.kind == JudgmentFailureKind::InvalidJson
         }));
         assert_eq!(
             provider.calls.load(Ordering::SeqCst),
-            (JUDGE_ATTEMPTS * 2) as usize
+            (crate::retry::ATTEMPTS * 2) as usize
         );
     }
 

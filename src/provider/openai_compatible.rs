@@ -4,13 +4,14 @@ use std::time::Duration;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::{CompletionRequest, CompletionResponse, ModelProvider, ProviderError};
+use super::{
+    CONNECT_TIMEOUT, CompletionRequest, CompletionResponse, ModelProvider, ProviderError,
+    REQUEST_TIMEOUT,
+};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const API_KEY_ENV: &str = "ARENA_API_KEY";
 const BASE_URL_ENV: &str = "ARENA_BASE_URL";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct OpenAICompatibleProvider {

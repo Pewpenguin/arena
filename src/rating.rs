@@ -280,6 +280,8 @@ mod tests {
             agreement: true,
             orientation_ab: None,
             orientation_ba: None,
+            reason_ab: None,
+            reason_ba: None,
         }
     }
 
@@ -402,11 +404,15 @@ mod tests {
             agreement: true,
             orientation_ab: Some(JudgeDecision::A),
             orientation_ba: Some(JudgeDecision::A),
+            reason_ab: Some("A is better".into()),
+            reason_ba: Some("A is better".into()),
         };
 
         let value = serde_json::to_value(&judgment).unwrap();
         assert_eq!(value["orientation_ab"], "a");
         assert_eq!(value["orientation_ba"], "a");
+        assert_eq!(value["reason_ab"], "A is better");
+        assert_eq!(value["reason_ba"], "A is better");
         assert_eq!(serde_json::from_value::<Judgment>(value).unwrap(), judgment);
     }
 
@@ -428,6 +434,8 @@ mod tests {
 
         assert_eq!(judgment.orientation_ab, None);
         assert_eq!(judgment.orientation_ba, None);
+        assert_eq!(judgment.reason_ab, None);
+        assert_eq!(judgment.reason_ba, None);
         assert_eq!(judgment.winner, JudgeDecision::A);
 
         let ratings = rate(&[judgment], &[]);

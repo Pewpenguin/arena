@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde::Serialize;
 use thiserror::Error;
@@ -10,9 +10,8 @@ use crate::provider::{
     CompletionRequest, CompletionResponse, ModelId, ModelProvider, PROVIDER_CONCURRENCY,
     ProviderError,
 };
+use crate::retry;
 use crate::task::Task;
-
-const CANDIDATE_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExecutionResult {
@@ -31,26 +30,6 @@ pub struct ExecutionError {
     pub source: ProviderError,
 }
 
-fn is_retryable(error: &ProviderError) -> bool {
-    matches!(
-        error,
-        ProviderError::RequestFailed(_) | ProviderError::InvalidResponse(_)
-    )
-}
-
-fn retry_backoff(failed_attempts: u32) -> Option<Duration> {
-    let secs = match failed_attempts {
-        1 => 1,
-        2 => 2,
-        _ => return None,
-    };
-    Some(if cfg!(test) {
-        Duration::ZERO
-    } else {
-        Duration::from_secs(secs)
-    })
-}
-
 pub async fn execute(
     provider: &impl ModelProvider,
     model: ModelId,
@@ -61,31 +40,24 @@ pub async fn execute(
         prompt: task.prompt.clone(),
     };
     let started = Instant::now();
-    let mut attempts = 0;
-    loop {
-        attempts += 1;
-        match provider.complete(request.clone()).await {
-            Ok(response) => {
-                return Ok(ExecutionResult {
-                    task_id: task.id.clone(),
-                    model,
-                    response,
-                    duration_ms: started.elapsed().as_millis() as u64,
-                });
-            }
-            Err(source) if attempts < CANDIDATE_ATTEMPTS && is_retryable(&source) => {
-                if let Some(delay) = retry_backoff(attempts) {
-                    tokio::time::sleep(delay).await;
-                }
-            }
-            Err(source) => {
-                return Err(ExecutionError {
-                    task_id: task.id.clone(),
-                    model,
-                    source,
-                });
-            }
-        }
+    let result = retry::with_retries(
+        || provider.complete(request.clone()),
+        retry::is_retryable_provider,
+    )
+    .await
+    .1;
+    match result {
+        Ok(response) => Ok(ExecutionResult {
+            task_id: task.id.clone(),
+            model,
+            response,
+            duration_ms: started.elapsed().as_millis() as u64,
+        }),
+        Err(source) => Err(ExecutionError {
+            task_id: task.id.clone(),
+            model,
+            source,
+        }),
     }
 }
 
@@ -251,7 +223,7 @@ mod tests {
 
         assert_eq!(
             provider.calls.load(Ordering::SeqCst),
-            CANDIDATE_ATTEMPTS as usize
+            crate::retry::ATTEMPTS as usize
         );
         assert_eq!(error.task_id, "t1");
         assert_eq!(error.model, ModelId::new("m1"));

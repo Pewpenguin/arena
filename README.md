@@ -96,7 +96,7 @@ If both orientations agree, the judgment is kept with `agreement: true`.
 
 If they disagree, Arena resolves the pair as a draw with `agreement: false`.
 
-Both orientation winners are persisted, mapped back to the original model pair. Statistics and Bradley–Terry ratings use only the resolved winner. The two orientations are retained for position-bias diagnostics and are not counted as independent ranking observations.
+Both orientation winners and reasons are persisted, mapped back to the original model pair. Statistics and Bradley–Terry ratings use only the resolved winner. The two orientations are retained for position-bias diagnostics and are not counted as independent ranking observations.
 
 Each orientation is tried up to three times (a 1s backoff, then 2s) for provider errors and malformed/truncated JSON. The parser stays strict: a retry repeats the same judge request rather than repairing invalid output. Both orientations must succeed to produce a resolved judgment. A permanently failed pair is omitted from `judgments` (it is not a draw) and recorded in `judgment_failures`. The run still writes its output, then exits non-zero. Missing judgments can disconnect or separate the comparison graph, and the gaps need not be random, so ratings from an incomplete run should not be read as if every pair had been observed.
 
@@ -104,11 +104,11 @@ Each orientation is tried up to three times (a 1s backoff, then 2s) for provider
 
 `arena exec` produces one JSON object with these fields:
 
-- `run` — version, models, judge, task path, resolved provider `base_url`, start time, and, when a judge is used, `bootstrap_seed` and `bootstrap_replicates`. `bootstrap_valid` is present only when the bootstrap resampling loop actually runs
+- `run` — version, models, judge, task path, resolved provider `base_url`, start time, provider concurrency, request/connect timeouts, candidate/judge attempt counts, and, when a judge is used, `bootstrap_seed` and `bootstrap_replicates`. `bootstrap_valid` is present only when the bootstrap resampling loop actually runs
 - `tasks` — the loaded task definitions (id, prompt, optional exact evaluation)
 - `results` — model responses, evaluations, and durations
 - `comparisons` — pairwise comparisons from exact scores
-- `judgments` — resolved LLM-judge results and both orientation winners
+- `judgments` — resolved LLM-judge results, both orientation winners, and both orientation reasons
 - `judgment_failures` — pairwise judge attempts that never produced both orientations
 - `statistics` — per-model wins, losses, draws, and judge agreement
 - `ratings` — full-data Bradley–Terry point estimates from resolved judgments, on a 400-point scale centered at 1500, with optional 95% percentile bounds
@@ -121,7 +121,7 @@ Ratings are the full-data Bradley–Terry estimates. Uncertainty uses a task-clu
 
 Results retain task-file and CLI model order. Statistics and ratings are ordered by model ID.
 
-The saved run is an audit of one execution: models, judge, task file path, the loaded tasks, and the provider base URL. It does not store API keys. Candidate and judge completions are not deterministic; `--seed` only controls the bootstrap RNG and does not make model completions deterministic. When intervals were produced, the same seed reproduces them from the persisted judgments.
+The saved run is an audit of one execution: models, judge, task file path, the loaded tasks, the provider base URL, and Arena-controlled concurrency, timeout, and retry-attempt settings. It does not store API keys. Candidate and judge completions are not deterministic; `--seed` only controls the bootstrap RNG and does not make model completions deterministic. When intervals were produced, the same seed reproduces them from the persisted judgments.
 
 ## Limitations
 

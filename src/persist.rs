@@ -23,6 +23,11 @@ pub struct RunMetadata {
     tasks: Option<PathBuf>,
     base_url: String,
     started_at: String,
+    provider_concurrency: usize,
+    request_timeout_secs: u64,
+    connect_timeout_secs: u64,
+    candidate_attempts: u32,
+    judge_attempts: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     bootstrap_seed: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -46,6 +51,11 @@ impl RunMetadata {
             tasks,
             base_url: base_url.into(),
             started_at,
+            provider_concurrency: crate::provider::PROVIDER_CONCURRENCY,
+            request_timeout_secs: crate::provider::REQUEST_TIMEOUT.as_secs(),
+            connect_timeout_secs: crate::provider::CONNECT_TIMEOUT.as_secs(),
+            candidate_attempts: crate::retry::ATTEMPTS,
+            judge_attempts: crate::retry::ATTEMPTS,
             bootstrap_seed: None,
             bootstrap_replicates: None,
             bootstrap_valid: None,
@@ -88,9 +98,12 @@ pub enum PersistError {
     Serialize(#[from] serde_json::Error),
 }
 
+pub fn to_pretty_json(output: &Output) -> Result<String, PersistError> {
+    Ok(serde_json::to_string_pretty(output)?)
+}
+
 pub fn write(path: impl AsRef<Path>, output: &Output) -> Result<(), PersistError> {
-    let contents = serde_json::to_string_pretty(output)?;
-    fs::write(path, contents)?;
+    fs::write(path, to_pretty_json(output)?)?;
     Ok(())
 }
 
@@ -132,6 +145,11 @@ mod tests {
                 "tasks": "tasks.json",
                 "base_url": "https://example.test/v1",
                 "started_at": "2026-01-02T03:04:05Z",
+                "provider_concurrency": 8,
+                "request_timeout_secs": 120,
+                "connect_timeout_secs": 10,
+                "candidate_attempts": 3,
+                "judge_attempts": 3,
             })
         );
         assert!(value.get("api_key").is_none());
@@ -145,6 +163,11 @@ mod tests {
         assert!(value.get("judge").is_none());
         assert!(value.get("tasks").is_none());
         assert_eq!(value["started_at"], "2026-01-02T03:04:05Z");
+        assert_eq!(value["provider_concurrency"], 8);
+        assert_eq!(value["request_timeout_secs"], 120);
+        assert_eq!(value["connect_timeout_secs"], 10);
+        assert_eq!(value["candidate_attempts"], 3);
+        assert_eq!(value["judge_attempts"], 3);
         assert!(value.get("bootstrap_seed").is_none());
         assert!(value.get("bootstrap_replicates").is_none());
         assert!(value.get("bootstrap_valid").is_none());
@@ -209,6 +232,11 @@ mod tests {
                 "models": ["a"],
                 "base_url": "https://example.test/v1",
                 "started_at": "2026-01-02T03:04:05Z",
+                "provider_concurrency": 8,
+                "request_timeout_secs": 120,
+                "connect_timeout_secs": 10,
+                "candidate_attempts": 3,
+                "judge_attempts": 3,
                 "bootstrap_seed": 0,
                 "bootstrap_replicates": 1000,
             })
@@ -228,6 +256,11 @@ mod tests {
                 "models": ["a"],
                 "base_url": "https://example.test/v1",
                 "started_at": "2026-01-02T03:04:05Z",
+                "provider_concurrency": 8,
+                "request_timeout_secs": 120,
+                "connect_timeout_secs": 10,
+                "candidate_attempts": 3,
+                "judge_attempts": 3,
                 "bootstrap_seed": 0,
                 "bootstrap_replicates": 1000,
                 "bootstrap_valid": 1000,

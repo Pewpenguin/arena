@@ -134,6 +134,8 @@ mod tests {
             agreement: true,
             orientation_ab: None,
             orientation_ba: None,
+            reason_ab: None,
+            reason_ba: None,
         }
     }
 
