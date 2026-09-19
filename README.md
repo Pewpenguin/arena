@@ -100,7 +100,9 @@ Both orientation winners, reasons, and raw judge completions are persisted, mapp
 
 Each orientation is tried up to three times (a 1s backoff, then 2s) for provider errors and malformed/truncated JSON. The parser stays strict: the entire judge completion must be one JSON object in the required schema. Surrounding text, extra objects, or JSON copied from a candidate reply are rejected rather than scanned for a last match. A retry repeats the same judge request rather than repairing invalid output. Candidate replies are isolated in `<response_a>` / `<response_b>` tags in the judge prompt; `<` in that quoted text is escaped so it cannot close the fence.
 
-Judge requests set `temperature` to `0`. That is persisted as `run.judge_decoding` and applies only to judge calls, not candidate generation. Temperature 0 asks the provider for deterministic decoding; it does not guarantee identical completions across providers or models.
+Judge requests set `temperature` to `0`. That is persisted as `run.judge_decoding.temperature` and applies only to judge calls, not candidate generation. Temperature 0 asks the provider for deterministic decoding; it does not guarantee identical completions across providers or models.
+
+Candidate and judge requests set `max_tokens` to `4096`. That value is the requested output budget, not a guarantee that prompt tokens plus output tokens fit every provider's context window. It is persisted as `run.candidate_max_tokens` and, when a judge is used, `run.judge_decoding.max_tokens`.
 
 Both orientations must succeed to produce a resolved judgment. A permanently failed pair is omitted from `judgments` (it is not a draw) and recorded in `judgment_failures`. The run still writes its output, then exits non-zero.
 
@@ -114,7 +116,7 @@ Coverage is counted in unordered pairs, not orientations. `expected_pairs` is th
 
 `arena exec` produces one JSON object with these fields:
 
-- `run` — version, models, judge, task path, resolved provider `base_url`, start time, provider concurrency, request/connect timeouts, and candidate/judge attempt counts. Judge-only fields below are omitted when `--judge` is not used.
+- `run` — version, models, judge, task path, resolved provider `base_url`, start time, provider concurrency, request/connect timeouts, candidate/judge attempt counts, and `candidate_max_tokens`. Judge-only fields below are omitted when `--judge` is not used.
 - `tasks` — the loaded task definitions (id, prompt, optional exact evaluation)
 - `results` — model responses, evaluations, and durations
 - `comparisons` — pairwise comparisons from exact scores
@@ -129,7 +131,7 @@ Judge-run `run` fields:
 
 - `expected_pairs`, `resolved_pairs`, `failed_pairs` — unordered-pair coverage. `complete` is true only when `resolved_pairs == expected_pairs` and `failed_pairs == 0`.
 - `orientation_agreement` — pair-level orientation agreement: `resolved_pairs`, `orientation_agreeing_pairs`, `orientation_disagreeing_pairs`, `agreement_rate`. Each unordered resolved pair is counted once. `agreement_rate` is agreeing / resolved, or `0.0` when `resolved_pairs` is 0. This is not a measure of position bias.
-- `judge_decoding` — judge request decoding (temperature 0)
+- `judge_decoding` — judge request decoding (`temperature` 0 and `max_tokens` 4096)
 - `bootstrap_seed`, `bootstrap_replicates`, `bootstrap_clusters`, `bootstrap_ran` — bootstrap request and whether resampling ran
 - `bootstrap_valid` — finite replicate count; present only when the resampling loop ran
 - `bootstrap_unavailable` — why interval bounds were not produced (`too_few_tasks`, `original_unrated`, or `invalid_replicates`)
@@ -142,7 +144,7 @@ The process still exits non-zero on incomplete judging; the JSON is the record o
 
 Results retain task-file and CLI model order. Statistics and ratings are ordered by model ID.
 
-The saved run is an audit of one execution: models, judge, task file path, the loaded tasks, the provider base URL, Arena-controlled concurrency, timeout, and retry-attempt settings, and, when a judge is used, pairwise coverage, pair-level orientation agreement, the judge decoding configuration, rating availability, and bootstrap metadata. It does not store API keys. Candidate completions use the provider default decoding and are not deterministic. Judge calls request `temperature` 0, but providers and models may still vary. `--seed` only controls the bootstrap RNG and does not make model completions deterministic. When intervals were produced, the same seed reproduces them from the persisted judgments. Raw judge completions are kept so a later audit can see what was parsed.
+The saved run is an audit of one execution: models, judge, task file path, the loaded tasks, the provider base URL, Arena-controlled concurrency, timeout, retry-attempt, and output-token settings, and, when a judge is used, pairwise coverage, pair-level orientation agreement, the judge decoding configuration, rating availability, and bootstrap metadata. It does not store API keys. Candidate completions omit temperature so the provider default applies; they are not deterministic. Judge calls request `temperature` 0, but providers and models may still vary. `--seed` only controls the bootstrap RNG and does not make model completions deterministic. When intervals were produced, the same seed reproduces them from the persisted judgments. Raw judge completions are kept so a later audit can see what was parsed. `max_tokens` bounds the requested completion length only.
 
 ## Ratings
 
@@ -173,6 +175,7 @@ The interval is task-sampling variability of this observed-judgment estimator. I
 - Ratings from an incomplete comparison graph, or with `unavailable` set, are not a complete ranking.
 - Bootstrap intervals measure task-sampling variability of the observed-pair estimator only. They do not account for judge noise, position effects, or task-selection bias, and they are not a test of pairwise rating differences.
 - Judge `temperature` 0 does not guarantee identical outputs across providers or models.
+- `max_tokens` bounds the requested output length. It does not guarantee that input plus output fit a given model's context window.
 
 ## Development
 

@@ -17,12 +17,14 @@ use crate::task::Task;
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct JudgeDecoding {
     pub temperature: f64,
+    pub max_tokens: u32,
 }
 
 impl JudgeDecoding {
     pub fn arena_default() -> Self {
         Self {
             temperature: crate::judge::JUDGE_TEMPERATURE,
+            max_tokens: crate::provider::DEFAULT_MAX_TOKENS,
         }
     }
 }
@@ -42,6 +44,7 @@ pub struct RunMetadata {
     connect_timeout_secs: u64,
     candidate_attempts: u32,
     judge_attempts: u32,
+    candidate_max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     complete: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -88,6 +91,7 @@ impl RunMetadata {
             connect_timeout_secs: crate::provider::CONNECT_TIMEOUT.as_secs(),
             candidate_attempts: crate::retry::ATTEMPTS,
             judge_attempts: crate::retry::ATTEMPTS,
+            candidate_max_tokens: crate::provider::DEFAULT_MAX_TOKENS,
             complete: None,
             expected_pairs: None,
             resolved_pairs: None,
@@ -218,6 +222,7 @@ mod tests {
                 "connect_timeout_secs": 10,
                 "candidate_attempts": 3,
                 "judge_attempts": 3,
+                "candidate_max_tokens": 4096,
             })
         );
         assert!(value.get("api_key").is_none());
@@ -236,6 +241,7 @@ mod tests {
         assert_eq!(value["connect_timeout_secs"], 10);
         assert_eq!(value["candidate_attempts"], 3);
         assert_eq!(value["judge_attempts"], 3);
+        assert_eq!(value["candidate_max_tokens"], 4096);
         assert!(value.get("bootstrap_seed").is_none());
         assert!(value.get("bootstrap_replicates").is_none());
         assert!(value.get("bootstrap_valid").is_none());
@@ -321,6 +327,7 @@ mod tests {
                 "connect_timeout_secs": 10,
                 "candidate_attempts": 3,
                 "judge_attempts": 3,
+                "candidate_max_tokens": 4096,
                 "bootstrap_seed": 0,
                 "bootstrap_replicates": 1000,
                 "bootstrap_clusters": 1,
@@ -355,6 +362,7 @@ mod tests {
                 "connect_timeout_secs": 10,
                 "candidate_attempts": 3,
                 "judge_attempts": 3,
+                "candidate_max_tokens": 4096,
                 "bootstrap_seed": 0,
                 "bootstrap_replicates": 1000,
                 "bootstrap_valid": 1000,
@@ -455,8 +463,9 @@ mod tests {
         );
         assert_eq!(
             value["judge_decoding"],
-            serde_json::json!({ "temperature": 0.0 })
+            serde_json::json!({ "temperature": 0.0, "max_tokens": 4096 })
         );
+        assert_eq!(value["candidate_max_tokens"], 4096);
 
         let complete = run_meta(vec![ModelId::new("a"), ModelId::new("b")], None, None)
             .with_judge_coverage(3, 3, 0);

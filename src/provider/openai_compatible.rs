@@ -81,6 +81,7 @@ impl ModelProvider for OpenAICompatibleProvider {
                 content: request.prompt,
             }],
             temperature: request.temperature,
+            max_tokens: request.max_tokens,
         };
 
         let response = self
@@ -129,6 +130,8 @@ struct ChatCompletionRequest {
     messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -174,6 +177,7 @@ mod tests {
             model: ModelId::new("test-model"),
             prompt: "hello".into(),
             temperature: None,
+            max_tokens: None,
         }
     }
 
@@ -357,6 +361,27 @@ mod tests {
                 "model": "test-model",
                 "messages": [{"role": "user", "content": "hello"}],
                 "temperature": 0.0
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_sends_max_tokens_when_set() {
+        let mock = start_mock(200, "OK", r#"{"choices":[{"message":{"content":"ok"}}]}"#).await;
+        let provider = OpenAICompatibleProvider::new("test-key", mock.base_url.as_str());
+        let mut request = sample_request();
+        request.max_tokens = Some(crate::provider::DEFAULT_MAX_TOKENS);
+
+        let _response = provider.complete(request).await.expect("completion");
+        let raw = mock.request.await.expect("captured request");
+        mock.handle.abort();
+
+        assert_eq!(
+            request_body(&raw),
+            serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 4096
             })
         );
     }

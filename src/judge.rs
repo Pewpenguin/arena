@@ -8,7 +8,8 @@ use tokio::task::JoinSet;
 
 use crate::evaluate::EvaluatedResult;
 use crate::provider::{
-    CompletionRequest, ModelId, ModelProvider, PROVIDER_CONCURRENCY, ProviderError,
+    CompletionRequest, DEFAULT_MAX_TOKENS, ModelId, ModelProvider, PROVIDER_CONCURRENCY,
+    ProviderError,
 };
 use crate::retry;
 use crate::task::Task;
@@ -255,6 +256,7 @@ pub async fn judge_pair(
         model: judge_model.clone(),
         prompt,
         temperature: Some(JUDGE_TEMPERATURE),
+        max_tokens: Some(DEFAULT_MAX_TOKENS),
     };
     let started = Instant::now();
     let response = provider
@@ -697,6 +699,7 @@ mod tests {
     #[derive(Clone)]
     struct RecordJudgeRequest {
         temperatures: Arc<Mutex<Vec<Option<f64>>>>,
+        max_tokens: Arc<Mutex<Vec<Option<u32>>>>,
     }
 
     impl ModelProvider for RecordJudgeRequest {
@@ -708,6 +711,10 @@ mod tests {
                 .lock()
                 .expect("temperatures")
                 .push(request.temperature);
+            self.max_tokens
+                .lock()
+                .expect("max_tokens")
+                .push(request.max_tokens);
             let a_is_left = request.prompt.contains("<response_a>\nleft\n</response_a>");
             let reason = if a_is_left { "ab" } else { "ba" };
             Ok(CompletionResponse {
@@ -719,8 +726,10 @@ mod tests {
     #[tokio::test]
     async fn judge_requests_use_temperature_zero_and_keep_orientation_raw() {
         let temperatures = Arc::new(Mutex::new(Vec::new()));
+        let max_tokens = Arc::new(Mutex::new(Vec::new()));
         let provider = RecordJudgeRequest {
             temperatures: temperatures.clone(),
+            max_tokens: max_tokens.clone(),
         };
         let task = Task {
             id: "t1".into(),
@@ -742,6 +751,11 @@ mod tests {
                 Some(value) => assert_eq!(value.to_bits(), JUDGE_TEMPERATURE.to_bits()),
                 None => panic!("judge request omitted temperature"),
             }
+        }
+        let tokens = max_tokens.lock().expect("max_tokens").clone();
+        assert_eq!(tokens.len(), 2);
+        for budget in &tokens {
+            assert_eq!(*budget, Some(DEFAULT_MAX_TOKENS));
         }
         assert_eq!(
             outcome.judgments[0].raw_ab.as_deref(),

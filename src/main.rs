@@ -6,7 +6,9 @@ use indicatif::{ProgressBar, ProgressStyle};
 use arena::cli::{Cli, Command};
 use arena::error::Result;
 use arena::exec::{self, ExecConfig};
-use arena::provider::{CompletionRequest, ModelId, ModelProvider, OpenAICompatibleProvider};
+use arena::provider::{
+    CompletionRequest, DEFAULT_MAX_TOKENS, ModelId, ModelProvider, OpenAICompatibleProvider,
+};
 use arena::task;
 
 #[tokio::main]
@@ -21,6 +23,7 @@ async fn main() -> Result<()> {
                     model: ModelId::new(model),
                     prompt,
                     temperature: None,
+                    max_tokens: Some(DEFAULT_MAX_TOKENS),
                 })
                 .await?;
             println!("{}", response.text);

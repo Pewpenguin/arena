@@ -7,8 +7,8 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::provider::{
-    CompletionRequest, CompletionResponse, ModelId, ModelProvider, PROVIDER_CONCURRENCY,
-    ProviderError,
+    CompletionRequest, CompletionResponse, DEFAULT_MAX_TOKENS, ModelId, ModelProvider,
+    PROVIDER_CONCURRENCY, ProviderError,
 };
 use crate::retry;
 use crate::task::Task;
@@ -39,6 +39,7 @@ pub async fn execute(
         model: model.clone(),
         prompt: task.prompt.clone(),
         temperature: None,
+        max_tokens: Some(DEFAULT_MAX_TOKENS),
     };
     let started = Instant::now();
     let result = retry::with_retries(
@@ -196,6 +197,44 @@ mod tests {
         assert_eq!(results[0].task_id, "t1");
         assert_eq!(results[0].model, ModelId::new("m1"));
         assert_eq!(results[0].response.text, "recovered");
+    }
+
+    #[derive(Clone)]
+    struct RecordRequest {
+        requests: Arc<Mutex<Vec<CompletionRequest>>>,
+    }
+
+    impl ModelProvider for RecordRequest {
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            self.requests
+                .lock()
+                .expect("requests")
+                .push(request.clone());
+            Ok(CompletionResponse {
+                text: request.model.to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn candidate_requests_omit_temperature_and_use_default_max_tokens() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = RecordRequest {
+            requests: requests.clone(),
+        };
+
+        execute(&provider, ModelId::new("m0"), &sample_task())
+            .await
+            .unwrap();
+
+        let captured = requests.lock().expect("requests");
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].temperature, None);
+        assert_eq!(captured[0].max_tokens, Some(DEFAULT_MAX_TOKENS));
+        assert_eq!(DEFAULT_MAX_TOKENS, 4096);
     }
 
     #[derive(Clone)]

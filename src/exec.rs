@@ -369,8 +369,9 @@ mod tests {
         assert_eq!(value["statistics"].as_array().unwrap().len(), 2);
         assert_eq!(
             value["run"]["judge_decoding"],
-            serde_json::json!({ "temperature": 0.0 })
+            serde_json::json!({ "temperature": 0.0, "max_tokens": 4096 })
         );
+        assert_eq!(value["run"]["candidate_max_tokens"], 4096);
         assert_eq!(value["run"]["bootstrap_ran"], false);
         assert_eq!(value["run"]["bootstrap_unavailable"], "original_unrated");
         let _ = std::fs::remove_file(&path);
@@ -404,8 +405,9 @@ mod tests {
         assert!(parsed["run"].get("bootstrap_valid").is_none());
         assert_eq!(
             parsed["run"]["judge_decoding"],
-            serde_json::json!({ "temperature": 0.0 })
+            serde_json::json!({ "temperature": 0.0, "max_tokens": 4096 })
         );
+        assert_eq!(parsed["run"]["candidate_max_tokens"], 4096);
         assert_eq!(
             parsed["run"]["orientation_agreement"],
             serde_json::json!({
@@ -444,6 +446,7 @@ mod tests {
         assert!(parsed["run"].get("failed_pairs").is_none());
         assert!(parsed["run"].get("orientation_agreement").is_none());
         assert!(parsed["run"].get("judge_decoding").is_none());
+        assert_eq!(parsed["run"]["candidate_max_tokens"], 4096);
         assert!(parsed["run"].get("bootstrap_seed").is_none());
         assert!(parsed["run"].get("bootstrap_clusters").is_none());
         assert!(parsed["run"].get("bootstrap_ran").is_none());
