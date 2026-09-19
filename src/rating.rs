@@ -55,7 +55,7 @@ pub fn rate(judgments: &[Judgment]) -> Vec<ModelRating> {
     let comparable_groups: Vec<_> = members.values().filter(|group| group.len() >= 2).collect();
     if comparable_groups.len() == 1 {
         let group = comparable_groups[0];
-        if let Some(fitted) = fit_component(group, &models, judgments) {
+        if let Some(fitted) = fit_component(group, &models, judgments, MAX_ITERS) {
             for (index, rating) in group.iter().zip(fitted) {
                 ratings[*index] = Some(rating);
             }
@@ -81,10 +81,51 @@ fn find(parent: &mut [usize], mut x: usize) -> usize {
     x
 }
 
+fn add_directed_edge(adj: &mut [Vec<usize>], from: usize, to: usize) {
+    if from != to && !adj[from].contains(&to) {
+        adj[from].push(to);
+    }
+}
+
+fn reachable_count(adj: &[Vec<usize>], start: usize) -> usize {
+    let mut seen = vec![false; adj.len()];
+    let mut stack = vec![start];
+    seen[start] = true;
+    let mut count = 0;
+    while let Some(i) = stack.pop() {
+        count += 1;
+        for &j in &adj[i] {
+            if !seen[j] {
+                seen[j] = true;
+                stack.push(j);
+            }
+        }
+    }
+    count
+}
+
+fn strongly_connected(adj: &[Vec<usize>]) -> bool {
+    let m = adj.len();
+    if m <= 1 {
+        return true;
+    }
+    if reachable_count(adj, 0) != m {
+        return false;
+    }
+    let mut transpose = vec![vec![]; m];
+    for (from, edges) in adj.iter().enumerate() {
+        for &to in edges {
+            transpose[to].push(from);
+        }
+    }
+    reachable_count(&transpose, 0) == m
+}
+
 fn fit_component(
     group: &[usize],
     models: &BTreeMap<ModelId, usize>,
     judgments: &[Judgment],
+    max_iters: u32,
 ) -> Option<Vec<f64>> {
     let local: BTreeMap<usize, usize> = group
         .iter()
@@ -94,6 +135,7 @@ fn fit_component(
     let m = group.len();
     let mut wins = vec![0.0; m];
     let mut games = vec![vec![0u32; m]; m];
+    let mut adj = vec![vec![]; m];
 
     for judgment in judgments {
         let Some(&a) = models.get(&judgment.model_a).and_then(|i| local.get(i)) else {
@@ -106,8 +148,14 @@ fn fit_component(
         games[a][b] += 1;
         games[b][a] += 1;
         match judgment.winner {
-            JudgeDecision::A => wins[a] += 1.0,
-            JudgeDecision::B => wins[b] += 1.0,
+            JudgeDecision::A => {
+                wins[a] += 1.0;
+                add_directed_edge(&mut adj, a, b);
+            }
+            JudgeDecision::B => {
+                wins[b] += 1.0;
+                add_directed_edge(&mut adj, b, a);
+            }
             JudgeDecision::Draw => {
                 wins[a] += 0.5;
                 wins[b] += 0.5;
@@ -115,8 +163,15 @@ fn fit_component(
         }
     }
 
+    // An all-draw component has no strict-win edges. That empty digraph is not
+    // strongly connected, but the half-win MLE exists and is equal strengths.
+    if adj.iter().any(|edges| !edges.is_empty()) && !strongly_connected(&adj) {
+        return None;
+    }
+
     let mut strength = vec![1.0; m];
-    for _ in 0..MAX_ITERS {
+    let mut converged = false;
+    for _ in 0..max_iters {
         let mut next = vec![0.0; m];
         let mut delta = 0.0_f64;
         for i in 0..m {
@@ -138,8 +193,12 @@ fn fit_component(
         }
         strength = next;
         if delta < TOLERANCE {
+            converged = true;
             break;
         }
+    }
+    if !converged {
+        return None;
     }
 
     if strength
@@ -191,11 +250,37 @@ mod tests {
             .and_then(|r| r.rating)
     }
 
+    fn all_ratings_none(ratings: &[ModelRating], models: &[&str]) {
+        for model in models {
+            assert_eq!(rating(ratings, model), None, "{model}");
+        }
+    }
+
+    fn component_of(judgments: &[Judgment]) -> (BTreeMap<ModelId, usize>, Vec<usize>) {
+        let mut models: BTreeMap<ModelId, usize> = BTreeMap::new();
+        for judgment in judgments {
+            models.insert(judgment.model_a.clone(), 0);
+            models.insert(judgment.model_b.clone(), 0);
+        }
+        for (index, slot) in models.values_mut().enumerate() {
+            *slot = index;
+        }
+        let group: Vec<usize> = (0..models.len()).collect();
+        (models, group)
+    }
+
     #[test]
-    fn single_a_win_ranks_a_above_b() {
-        let ratings = rate(&[judgment("a", "b", JudgeDecision::A)]);
-        assert_eq!(rating(&ratings, "a"), None);
-        assert_eq!(rating(&ratings, "b"), None);
+    fn two_player_strict_win_has_no_finite_ratings() {
+        for judgments in [
+            vec![judgment("a", "b", JudgeDecision::A)],
+            vec![
+                judgment("a", "b", JudgeDecision::A),
+                judgment("a", "b", JudgeDecision::A),
+            ],
+        ] {
+            let ratings = rate(&judgments);
+            all_ratings_none(&ratings, &["a", "b"]);
+        }
     }
 
     #[test]
@@ -287,42 +372,56 @@ mod tests {
         assert_eq!(judgment.winner, JudgeDecision::A);
 
         let ratings = rate(&[judgment]);
-        assert_eq!(rating(&ratings, "a"), None);
-        assert_eq!(rating(&ratings, "b"), None);
+        all_ratings_none(&ratings, &["a", "b"]);
     }
 
     #[test]
-    fn separated_component_has_no_finite_ratings() {
-        let ratings = rate(&[
+    fn three_model_complete_separation_has_no_finite_ratings() {
+        let with_draw = rate(&[
             judgment("a", "b", JudgeDecision::A),
-            judgment("a", "b", JudgeDecision::A),
+            judgment("a", "c", JudgeDecision::A),
+            judgment("b", "c", JudgeDecision::Draw),
         ]);
-        assert_eq!(rating(&ratings, "a"), None);
-        assert_eq!(rating(&ratings, "b"), None);
-    }
+        all_ratings_none(&with_draw, &["a", "b", "c"]);
 
-    #[test]
-    fn disconnected_models_do_not_share_a_rating_scale() {
-        let ratings = rate(&[
+        let with_split = rate(&[
             judgment("a", "b", JudgeDecision::A),
-            judgment("c", "d", JudgeDecision::A),
+            judgment("a", "c", JudgeDecision::A),
+            judgment("b", "c", JudgeDecision::A),
+            judgment("b", "c", JudgeDecision::B),
         ]);
-        assert_eq!(rating(&ratings, "a"), None);
-        assert_eq!(rating(&ratings, "b"), None);
-        assert_eq!(rating(&ratings, "c"), None);
-        assert_eq!(rating(&ratings, "d"), None);
+        all_ratings_none(&with_split, &["a", "b", "c"]);
     }
 
     #[test]
     fn disconnected_draw_pairs_do_not_share_a_rating_scale() {
+        let connected = rate(&[judgment("a", "b", JudgeDecision::Draw)]);
+        assert_eq!(rating(&connected, "a"), Some(CENTER));
+        assert_eq!(rating(&connected, "b"), Some(CENTER));
+
         let ratings = rate(&[
             judgment("a", "b", JudgeDecision::Draw),
             judgment("c", "d", JudgeDecision::Draw),
         ]);
         assert_eq!(ratings.len(), 4);
-        assert_eq!(rating(&ratings, "a"), None);
-        assert_eq!(rating(&ratings, "b"), None);
-        assert_eq!(rating(&ratings, "c"), None);
-        assert_eq!(rating(&ratings, "d"), None);
+        all_ratings_none(&ratings, &["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn iteration_limit_without_convergence_returns_no_finite_ratings() {
+        let judgments = [
+            judgment("a", "b", JudgeDecision::A),
+            judgment("a", "b", JudgeDecision::A),
+            judgment("b", "c", JudgeDecision::A),
+            judgment("c", "a", JudgeDecision::A),
+        ];
+        assert!(
+            rate(&judgments).iter().all(|model| model.rating.is_some()),
+            "identified cycle should fit with the default iteration limit"
+        );
+
+        let (models, group) = component_of(&judgments);
+        assert!(fit_component(&group, &models, &judgments, MAX_ITERS).is_some());
+        assert_eq!(fit_component(&group, &models, &judgments, 1), None);
     }
 }
