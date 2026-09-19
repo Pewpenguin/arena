@@ -20,6 +20,7 @@ async fn main() -> Result<()> {
                 .complete(CompletionRequest {
                     model: ModelId::new(model),
                     prompt,
+                    temperature: None,
                 })
                 .await?;
             println!("{}", response.text);
@@ -32,10 +33,11 @@ async fn main() -> Result<()> {
             seed,
         } => {
             let models = exec::unique_models(models)?;
+            let judge = judge.map(ModelId::new);
+            exec::validate_judge(&models, judge.as_ref())?;
             let started_at = arena::persist::utc_timestamp();
             let provider = OpenAICompatibleProvider::from_env()?;
             let tasks = task::load(&tasks_path)?;
-            let judge = judge.map(ModelId::new);
 
             let candidate_total = (tasks.len() * models.len()) as u64;
             let candidates = progress_bar(candidate_total);

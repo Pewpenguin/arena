@@ -16,7 +16,8 @@ pub enum UnavailableReason {
     NoComparisons,
     Disconnected,
     Separated,
-    Nonfinite,
+    Nonconvergence,
+    NonfiniteResult,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -34,7 +35,8 @@ pub struct ModelRating {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FitError {
     Separated,
-    Nonfinite,
+    Nonconvergence,
+    NonfiniteResult,
 }
 
 pub fn rate(judgments: &[Judgment], models: &[ModelId]) -> Vec<ModelRating> {
@@ -93,9 +95,14 @@ pub fn rate(judgments: &[Judgment], models: &[ModelId]) -> Vec<ModelRating> {
                     unavailable[index] = Some(UnavailableReason::Separated);
                 }
             }
-            Err(FitError::Nonfinite) => {
+            Err(FitError::Nonconvergence) => {
                 for &index in *group {
-                    unavailable[index] = Some(UnavailableReason::Nonfinite);
+                    unavailable[index] = Some(UnavailableReason::Nonconvergence);
+                }
+            }
+            Err(FitError::NonfiniteResult) => {
+                for &index in *group {
+                    unavailable[index] = Some(UnavailableReason::NonfiniteResult);
                 }
             }
         }
@@ -175,7 +182,7 @@ fn fit_component(
     let m = group.len();
     let mut wins = vec![0.0; m];
     let mut games = vec![vec![0u32; m]; m];
-    let mut adj = vec![vec![]; m];
+    let mut win_mass = vec![vec![0.0; m]; m];
 
     for judgment in judgments {
         let Some(&a) = models.get(&judgment.model_a).and_then(|i| local.get(i)) else {
@@ -190,22 +197,31 @@ fn fit_component(
         match judgment.winner {
             JudgeDecision::A => {
                 wins[a] += 1.0;
-                add_directed_edge(&mut adj, a, b);
+                win_mass[a][b] += 1.0;
             }
             JudgeDecision::B => {
                 wins[b] += 1.0;
-                add_directed_edge(&mut adj, b, a);
+                win_mass[b][a] += 1.0;
             }
             JudgeDecision::Draw => {
                 wins[a] += 0.5;
                 wins[b] += 0.5;
+                win_mass[a][b] += 0.5;
+                win_mass[b][a] += 0.5;
             }
         }
     }
 
-    // An all-draw component has no strict-win edges. That empty digraph is not
-    // strongly connected, but the half-win MLE exists and is equal strengths.
-    if adj.iter().any(|edges| !edges.is_empty()) && !strongly_connected(&adj) {
+    let mut adj = vec![vec![]; m];
+    for (i, row) in win_mass.iter().enumerate() {
+        for (j, mass) in row.iter().enumerate() {
+            if *mass > 0.0 {
+                add_directed_edge(&mut adj, i, j);
+            }
+        }
+    }
+
+    if !strongly_connected(&adj) {
         return Err(FitError::Separated);
     }
 
@@ -238,19 +254,19 @@ fn fit_component(
         }
     }
     if !converged {
-        return Err(FitError::Nonfinite);
+        return Err(FitError::Nonconvergence);
     }
 
     if strength
         .iter()
         .any(|value| !value.is_finite() || *value <= 0.0)
     {
-        return Err(FitError::Nonfinite);
+        return Err(FitError::NonfiniteResult);
     }
 
     let logs: Vec<f64> = strength.iter().map(|value| value.ln()).collect();
     if logs.iter().any(|value| !value.is_finite()) {
-        return Err(FitError::Nonfinite);
+        return Err(FitError::NonfiniteResult);
     }
     let mean = logs.iter().sum::<f64>() / m as f64;
     let scale = SCALE / std::f64::consts::LN_10;
@@ -259,7 +275,7 @@ fn fit_component(
         .map(|value| CENTER + scale * (value - mean))
         .collect();
     if ratings.iter().any(|value| !value.is_finite()) {
-        return Err(FitError::Nonfinite);
+        return Err(FitError::NonfiniteResult);
     }
     Ok(ratings)
 }
@@ -282,6 +298,9 @@ mod tests {
             orientation_ba: None,
             reason_ab: None,
             reason_ba: None,
+            raw_ab: None,
+            raw_ba: None,
+            raw: None,
         }
     }
 
@@ -354,7 +373,7 @@ mod tests {
         let first = rate(
             &[
                 judgment("a", "b", JudgeDecision::A),
-                judgment("b", "c", JudgeDecision::B),
+                judgment("b", "c", JudgeDecision::A),
                 judgment("a", "c", JudgeDecision::Draw),
             ],
             &[],
@@ -362,12 +381,13 @@ mod tests {
         let second = rate(
             &[
                 judgment("a", "c", JudgeDecision::Draw),
-                judgment("b", "c", JudgeDecision::B),
+                judgment("b", "c", JudgeDecision::A),
                 judgment("a", "b", JudgeDecision::A),
             ],
             &[],
         );
         assert_eq!(first, second);
+        assert!(first.iter().all(|r| r.unavailable.is_none()));
     }
 
     #[test]
@@ -406,6 +426,9 @@ mod tests {
             orientation_ba: Some(JudgeDecision::A),
             reason_ab: Some("A is better".into()),
             reason_ba: Some("A is better".into()),
+            raw_ab: Some(r#"{"winner":"a","reason":"A is better"}"#.into()),
+            raw_ba: Some(r#"{"winner":"a","reason":"A is better"}"#.into()),
+            raw: None,
         };
 
         let value = serde_json::to_value(&judgment).unwrap();
@@ -413,6 +436,9 @@ mod tests {
         assert_eq!(value["orientation_ba"], "a");
         assert_eq!(value["reason_ab"], "A is better");
         assert_eq!(value["reason_ba"], "A is better");
+        assert_eq!(value["raw_ab"], r#"{"winner":"a","reason":"A is better"}"#);
+        assert_eq!(value["raw_ba"], r#"{"winner":"a","reason":"A is better"}"#);
+        assert!(value.get("raw").is_none());
         assert_eq!(serde_json::from_value::<Judgment>(value).unwrap(), judgment);
     }
 
@@ -436,10 +462,29 @@ mod tests {
         assert_eq!(judgment.orientation_ba, None);
         assert_eq!(judgment.reason_ab, None);
         assert_eq!(judgment.reason_ba, None);
+        assert_eq!(judgment.raw_ab, None);
+        assert_eq!(judgment.raw_ba, None);
+        assert_eq!(judgment.raw, None);
         assert_eq!(judgment.winner, JudgeDecision::A);
 
         let ratings = rate(&[judgment], &[]);
         all_unavailable(&ratings, &["a", "b"], UnavailableReason::Separated);
+    }
+
+    #[test]
+    fn draw_with_cycle_is_not_separated() {
+        let ratings = rate(
+            &[
+                judgment("a", "b", JudgeDecision::Draw),
+                judgment("b", "c", JudgeDecision::A),
+                judgment("c", "a", JudgeDecision::A),
+            ],
+            &[],
+        );
+        assert!(ratings.iter().all(|r| r.unavailable.is_none()));
+        assert!(ratings.iter().all(|r| r.rating.is_some()));
+        assert!(rating(&ratings, "b").unwrap() > rating(&ratings, "a").unwrap());
+        assert!(rating(&ratings, "c").unwrap() > rating(&ratings, "a").unwrap());
     }
 
     #[test]
@@ -526,7 +571,7 @@ mod tests {
         assert!(fit_component(&group, &models, &judgments, MAX_ITERS).is_ok());
         assert_eq!(
             fit_component(&group, &models, &judgments, 1),
-            Err(FitError::Nonfinite)
+            Err(FitError::Nonconvergence)
         );
     }
 }

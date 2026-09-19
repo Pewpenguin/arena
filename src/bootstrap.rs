@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use serde::Serialize;
 
 use crate::judge::Judgment;
 use crate::provider::ModelId;
@@ -11,11 +12,22 @@ pub const BOOTSTRAP_REPLICATES: u32 = 1_000;
 const LOWER_P: f64 = 0.025;
 const UPPER_P: f64 = 0.975;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BootstrapUnavailable {
+    TooFewTasks,
+    OriginalUnrated,
+    InvalidReplicates,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapMeta {
     pub seed: u64,
     pub replicates: u32,
     pub valid: Option<u32>,
+    pub clusters: u32,
+    pub ran: bool,
+    pub unavailable: Option<BootstrapUnavailable>,
 }
 
 pub fn rate_with_uncertainty(
@@ -24,14 +36,22 @@ pub fn rate_with_uncertainty(
     seed: u64,
 ) -> (Vec<ModelRating>, BootstrapMeta) {
     let mut ratings = rating::rate(judgments, models);
-    let configured = BootstrapMeta {
+    let clusters = group_by_task(judgments);
+    let mut meta = BootstrapMeta {
         seed,
         replicates: BOOTSTRAP_REPLICATES,
         valid: None,
+        clusters: clusters.len() as u32,
+        ran: false,
+        unavailable: None,
     };
-    let clusters = group_by_task(judgments);
-    if clusters.len() < 2 || ratings.is_empty() || ratings.iter().any(|r| r.rating.is_none()) {
-        return (ratings, configured);
+    if ratings.is_empty() || ratings.iter().any(|r| r.rating.is_none()) {
+        meta.unavailable = Some(BootstrapUnavailable::OriginalUnrated);
+        return (ratings, meta);
+    }
+    if clusters.len() < 2 {
+        meta.unavailable = Some(BootstrapUnavailable::TooFewTasks);
+        return (ratings, meta);
     }
 
     let mut rng = StdRng::seed_from_u64(seed);
@@ -49,18 +69,15 @@ pub fn rate_with_uncertainty(
     }
 
     let valid = valid_samples.len() as u32;
+    meta.ran = true;
+    meta.valid = Some(valid);
     if valid == BOOTSTRAP_REPLICATES {
         assign_bounds(&mut ratings, &valid_samples);
+    } else {
+        meta.unavailable = Some(BootstrapUnavailable::InvalidReplicates);
     }
 
-    (
-        ratings,
-        BootstrapMeta {
-            seed,
-            replicates: BOOTSTRAP_REPLICATES,
-            valid: Some(valid),
-        },
-    )
+    (ratings, meta)
 }
 
 fn group_by_task(judgments: &[Judgment]) -> Vec<Vec<Judgment>> {
@@ -136,6 +153,9 @@ mod tests {
             orientation_ba: None,
             reason_ab: None,
             reason_ba: None,
+            raw_ab: None,
+            raw_ba: None,
+            raw: None,
         }
     }
 
@@ -237,7 +257,10 @@ mod tests {
         assert!(all_bounds_absent(&ratings));
         assert_eq!(meta.seed, 0);
         assert_eq!(meta.replicates, BOOTSTRAP_REPLICATES);
+        assert_eq!(meta.clusters, 1);
+        assert!(!meta.ran);
         assert_eq!(meta.valid, None);
+        assert_eq!(meta.unavailable, Some(BootstrapUnavailable::TooFewTasks));
     }
 
     #[test]
@@ -252,7 +275,13 @@ mod tests {
         assert!(all_bounds_absent(&ratings));
         assert_eq!(meta.seed, 0);
         assert_eq!(meta.replicates, BOOTSTRAP_REPLICATES);
+        assert_eq!(meta.clusters, 2);
+        assert!(!meta.ran);
         assert_eq!(meta.valid, None);
+        assert_eq!(
+            meta.unavailable,
+            Some(BootstrapUnavailable::OriginalUnrated)
+        );
     }
 
     #[test]
@@ -265,8 +294,14 @@ mod tests {
         let (ratings, meta) = rate_with_uncertainty(&judgments, &[], 0);
         assert_eq!(meta.seed, 0);
         assert_eq!(meta.replicates, BOOTSTRAP_REPLICATES);
+        assert_eq!(meta.clusters, 2);
+        assert!(meta.ran);
         let valid = meta.valid.expect("bootstrap should run");
         assert!(valid < BOOTSTRAP_REPLICATES);
+        assert_eq!(
+            meta.unavailable,
+            Some(BootstrapUnavailable::InvalidReplicates)
+        );
         assert_eq!(
             ratings
                 .iter()
@@ -290,10 +325,30 @@ mod tests {
         let meta = first.1;
         assert_eq!(meta.seed, 0);
         assert_eq!(meta.replicates, BOOTSTRAP_REPLICATES);
+        assert_eq!(meta.clusters, 2);
+        assert!(meta.ran);
         assert_eq!(meta.valid, Some(BOOTSTRAP_REPLICATES));
+        assert_eq!(meta.unavailable, None);
         assert!(
             first
                 .0
+                .iter()
+                .all(|r| r.rating_lower.is_some() && r.rating_upper.is_some())
+        );
+    }
+
+    #[test]
+    fn bootstrap_cluster_count_uses_distinct_judgment_task_ids() {
+        let mut judgments = draws("t1");
+        judgments.extend(draws("t4"));
+        judgments.extend(draws("t9"));
+        let (ratings, meta) = rate_with_uncertainty(&judgments, &[], 0);
+        assert_eq!(meta.clusters, 3);
+        assert!(meta.ran);
+        assert_eq!(meta.valid, Some(BOOTSTRAP_REPLICATES));
+        assert_eq!(meta.unavailable, None);
+        assert!(
+            ratings
                 .iter()
                 .all(|r| r.rating_lower.is_some() && r.rating_upper.is_some())
         );

@@ -92,6 +92,9 @@ mod tests {
             orientation_ba: None,
             reason_ab: None,
             reason_ba: None,
+            raw_ab: None,
+            raw_ba: None,
+            raw: None,
         }
     }
 

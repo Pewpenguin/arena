@@ -33,6 +33,20 @@ pub fn unique_models(ids: Vec<String>) -> Result<Vec<ModelId>> {
     Ok(models)
 }
 
+pub fn validate_judge(models: &[ModelId], judge: Option<&ModelId>) -> Result<()> {
+    if let Some(judge) = judge
+        && models.iter().any(|model| model == judge)
+    {
+        return Err(Error::JudgeIsCandidate(judge.clone()));
+    }
+    Ok(())
+}
+
+pub fn expected_pairs(task_count: usize, model_count: usize) -> usize {
+    let pairs_per_task = model_count.saturating_sub(1).saturating_mul(model_count) / 2;
+    task_count.saturating_mul(pairs_per_task)
+}
+
 pub async fn collect_exec<P>(
     provider: &P,
     config: &ExecConfig,
@@ -43,6 +57,7 @@ pub async fn collect_exec<P>(
 where
     P: ModelProvider + Clone + Send + 'static,
 {
+    validate_judge(&config.models, config.judge.as_ref())?;
     let mut results = Vec::new();
     for task in &config.tasks {
         let executed = execute_models(provider, task, &config.models, &mut on_candidate).await?;
@@ -95,7 +110,16 @@ where
         config.base_url.clone(),
     );
     if let Some(meta) = bootstrap_meta {
-        run = run.with_bootstrap(meta.seed, meta.replicates, meta.valid);
+        run = run.with_bootstrap(&meta);
+    }
+    if config.judge.is_some() {
+        run = run
+            .with_judge_coverage(
+                expected_pairs(config.tasks.len(), config.models.len()),
+                judgments.len(),
+                judgment_failures.len(),
+            )
+            .with_judge_decoding(persist::JudgeDecoding::arena_default());
     }
 
     let failed_pairs = judgment_failures.len();
@@ -245,6 +269,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn judge_matching_a_candidate_is_rejected_before_execution() {
+        let path = temp_path("judge-is-candidate");
+        let _ = std::fs::remove_file(&path);
+        let provider = FailCandidates {
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let error = run_exec(
+            &provider,
+            &config(&["model-a", "model-b"], Some("model-a")),
+            Some(&path),
+        )
+        .await
+        .unwrap_err();
+
+        match error {
+            Error::JudgeIsCandidate(id) => assert_eq!(id, ModelId::new("model-a")),
+            other => panic!("unexpected error: {other}"),
+        }
+        assert!(!path.exists(), "rejected judge must not write output");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
     async fn candidate_failure_does_not_write_output() {
         let path = temp_path("candidate-fail");
         let _ = std::fs::remove_file(&path);
@@ -284,6 +333,14 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&contents).unwrap();
         assert_eq!(value["judgment_failures"].as_array().unwrap().len(), 1);
         assert!(value.get("judgments").is_none());
+        assert_eq!(value["run"]["complete"], false);
+        assert_eq!(value["run"]["expected_pairs"], 1);
+        assert_eq!(value["run"]["resolved_pairs"], 0);
+        assert_eq!(value["run"]["failed_pairs"], 1);
+        assert_eq!(
+            value["run"]["judge_decoding"],
+            serde_json::json!({ "temperature": 0.0 })
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -304,6 +361,22 @@ mod tests {
         assert!(written.contains("\"m0\""));
         assert!(written.contains("\"bootstrap_seed\""));
         assert!(!written.contains("api_key"));
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["run"]["complete"], true);
+        assert_eq!(parsed["run"]["expected_pairs"], 1);
+        assert_eq!(parsed["run"]["resolved_pairs"], 1);
+        assert_eq!(parsed["run"]["failed_pairs"], 0);
+        assert_eq!(parsed["run"]["bootstrap_clusters"], 1);
+        assert_eq!(parsed["run"]["bootstrap_ran"], false);
+        assert_eq!(parsed["run"]["bootstrap_unavailable"], "too_few_tasks");
+        assert!(parsed["run"].get("bootstrap_valid").is_none());
+        assert_eq!(
+            parsed["run"]["judge_decoding"],
+            serde_json::json!({ "temperature": 0.0 })
+        );
+        assert_eq!(parsed["judgments"].as_array().unwrap().len(), 1);
+        assert!(parsed["judgments"][0].get("raw_ab").is_some());
+        assert!(parsed["judgments"][0].get("raw_ba").is_some());
         let _ = std::fs::remove_file(&path);
     }
 
@@ -318,6 +391,49 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["results"].as_array().unwrap().len(), 1);
         assert!(parsed.get("judgments").is_none());
+        assert!(parsed["run"].get("complete").is_none());
+        assert!(parsed["run"].get("expected_pairs").is_none());
+        assert!(parsed["run"].get("resolved_pairs").is_none());
+        assert!(parsed["run"].get("failed_pairs").is_none());
+        assert!(parsed["run"].get("judge_decoding").is_none());
+        assert!(parsed["run"].get("bootstrap_seed").is_none());
+        assert!(parsed["run"].get("bootstrap_clusters").is_none());
+        assert!(parsed["run"].get("bootstrap_ran").is_none());
+        assert!(parsed["run"].get("bootstrap_unavailable").is_none());
         assert!(json.starts_with('{'));
+    }
+
+    #[tokio::test]
+    async fn judge_coverage_counts_unordered_pairs_across_tasks() {
+        let cfg = ExecConfig {
+            tasks: vec![
+                sample_task(),
+                Task {
+                    id: "t2".into(),
+                    prompt: "q".into(),
+                    evaluation: None,
+                },
+            ],
+            models: ["m0", "m1", "m2"].into_iter().map(ModelId::new).collect(),
+            judge: Some(ModelId::new("judge")),
+            seed: 0,
+            tasks_path: Some(PathBuf::from("tasks.json")),
+            started_at: "2026-01-02T03:04:05Z".into(),
+            base_url: "https://example.test/v1".into(),
+        };
+
+        let (output, failed_pairs) = collect_exec(&OkProvider, &cfg, |_| {}, |_| {}, |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(expected_pairs(2, 3), 6);
+        assert_eq!(failed_pairs, 0);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&persist::to_pretty_json(&output).unwrap()).unwrap();
+        assert_eq!(parsed["run"]["complete"], true);
+        assert_eq!(parsed["run"]["expected_pairs"], 6);
+        assert_eq!(parsed["run"]["resolved_pairs"], 6);
+        assert_eq!(parsed["run"]["failed_pairs"], 0);
+        assert_eq!(parsed["judgments"].as_array().unwrap().len(), 6);
     }
 }

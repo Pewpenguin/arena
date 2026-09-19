@@ -80,6 +80,7 @@ impl ModelProvider for OpenAICompatibleProvider {
                 role: "user",
                 content: request.prompt,
             }],
+            temperature: request.temperature,
         };
 
         let response = self
@@ -126,6 +127,8 @@ fn chat_completions_url(base_url: &str) -> String {
 struct ChatCompletionRequest {
     model: String,
     messages: Vec<ChatMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -170,6 +173,7 @@ mod tests {
         CompletionRequest {
             model: ModelId::new("test-model"),
             prompt: "hello".into(),
+            temperature: None,
         }
     }
 
@@ -334,6 +338,27 @@ mod tests {
             })
         );
         assert_eq!(response.text, "<think>reason</think>hello");
+    }
+
+    #[tokio::test]
+    async fn complete_sends_temperature_when_set() {
+        let mock = start_mock(200, "OK", r#"{"choices":[{"message":{"content":"ok"}}]}"#).await;
+        let provider = OpenAICompatibleProvider::new("test-key", mock.base_url.as_str());
+        let mut request = sample_request();
+        request.temperature = Some(0.0);
+
+        let _response = provider.complete(request).await.expect("completion");
+        let raw = mock.request.await.expect("captured request");
+        mock.handle.abort();
+
+        assert_eq!(
+            request_body(&raw),
+            serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "temperature": 0.0
+            })
+        );
     }
 
     #[tokio::test]

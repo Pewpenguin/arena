@@ -38,6 +38,7 @@ pub async fn execute(
     let request = CompletionRequest {
         model: model.clone(),
         prompt: task.prompt.clone(),
+        temperature: None,
     };
     let started = Instant::now();
     let result = retry::with_retries(

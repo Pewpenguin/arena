@@ -26,10 +26,12 @@ impl fmt::Display for ModelId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CompletionRequest {
     pub model: ModelId,
     pub prompt: String,
+    /// Sampling temperature. `None` omits the field so the provider default applies.
+    pub temperature: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
