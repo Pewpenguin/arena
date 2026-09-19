@@ -56,7 +56,7 @@ Run multiple models against a task file:
 
 `--model` can be specified multiple times. Model IDs must be unique. `--judge` and `--output` are optional. `--seed` sets the bootstrap RNG seed and defaults to `0`.
 
-Without `--output`, the JSON result is written to stdout. A candidate provider error fails the run. A permanently failed judge pair is saved in the output and the process then exits non-zero.
+Without `--output`, the JSON result is written to stdout. Each candidate provider request is tried up to three times (a 1s backoff, then 2s) for provider errors and invalid provider responses. An exhausted candidate failure still aborts the run without producing output. A permanently failed judge pair is saved in the output and the process then exits non-zero.
 
 ## Tasks
 
