@@ -199,13 +199,6 @@ mod tests {
     }
 
     #[test]
-    fn single_b_win_ranks_b_above_a() {
-        let ratings = rate(&[judgment("a", "b", JudgeDecision::B)]);
-        assert_eq!(rating(&ratings, "a"), None);
-        assert_eq!(rating(&ratings, "b"), None);
-    }
-
-    #[test]
     fn all_draws_produce_equal_ratings() {
         let ratings = rate(&[
             judgment("a", "b", JudgeDecision::Draw),
@@ -314,6 +307,19 @@ mod tests {
             judgment("a", "b", JudgeDecision::A),
             judgment("c", "d", JudgeDecision::A),
         ]);
+        assert_eq!(rating(&ratings, "a"), None);
+        assert_eq!(rating(&ratings, "b"), None);
+        assert_eq!(rating(&ratings, "c"), None);
+        assert_eq!(rating(&ratings, "d"), None);
+    }
+
+    #[test]
+    fn disconnected_draw_pairs_do_not_share_a_rating_scale() {
+        let ratings = rate(&[
+            judgment("a", "b", JudgeDecision::Draw),
+            judgment("c", "d", JudgeDecision::Draw),
+        ]);
+        assert_eq!(ratings.len(), 4);
         assert_eq!(rating(&ratings, "a"), None);
         assert_eq!(rating(&ratings, "b"), None);
         assert_eq!(rating(&ratings, "c"), None);

@@ -99,4 +99,45 @@ mod tests {
 
         assert!(compare(&a, &b).is_none());
     }
+
+    #[test]
+    fn compare_all_emits_same_task_pairs_in_result_order() {
+        let results = vec![
+            evaluated("t1", "model-a", Some(1.0)),
+            evaluated("t1", "model-b", Some(0.0)),
+            evaluated("t1", "model-c", Some(0.0)),
+            evaluated("t2", "model-a", Some(1.0)),
+            evaluated("t2", "model-b", Some(0.0)),
+        ];
+
+        assert_eq!(
+            compare_all(&results),
+            vec![
+                Comparison {
+                    task_id: "t1".into(),
+                    model_a: ModelId::new("model-a"),
+                    model_b: ModelId::new("model-b"),
+                    winner: Some(ModelId::new("model-a")),
+                },
+                Comparison {
+                    task_id: "t1".into(),
+                    model_a: ModelId::new("model-a"),
+                    model_b: ModelId::new("model-c"),
+                    winner: Some(ModelId::new("model-a")),
+                },
+                Comparison {
+                    task_id: "t1".into(),
+                    model_a: ModelId::new("model-b"),
+                    model_b: ModelId::new("model-c"),
+                    winner: None,
+                },
+                Comparison {
+                    task_id: "t2".into(),
+                    model_a: ModelId::new("model-a"),
+                    model_b: ModelId::new("model-b"),
+                    winner: Some(ModelId::new("model-a")),
+                },
+            ]
+        );
+    }
 }

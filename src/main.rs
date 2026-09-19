@@ -124,13 +124,20 @@ async fn main() -> Result<()> {
 
             let statistics = stats::aggregate(&judgments);
             let (ratings, bootstrap) = bootstrap::rate_with_uncertainty(&judgments, seed);
-            let mut run = RunMetadata::new(models, judge, Some(tasks_path), started_at);
+            let mut run = RunMetadata::new(
+                models,
+                judge,
+                Some(tasks_path),
+                started_at,
+                provider.base_url(),
+            );
             if let Some(meta) = bootstrap {
                 run = run.with_bootstrap(meta.seed, meta.replicates, meta.valid);
             }
             let failed_pairs = judgment_failures.len();
             let output_data = Output {
                 run,
+                tasks,
                 results,
                 comparisons,
                 judgments,

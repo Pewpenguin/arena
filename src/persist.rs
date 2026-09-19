@@ -11,6 +11,7 @@ use crate::judge::{Judgment, JudgmentFailure};
 use crate::provider::ModelId;
 use crate::rating::ModelRating;
 use crate::stats::ModelStats;
+use crate::task::Task;
 
 #[derive(Debug, Serialize)]
 pub struct RunMetadata {
@@ -20,6 +21,7 @@ pub struct RunMetadata {
     judge: Option<ModelId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tasks: Option<PathBuf>,
+    base_url: String,
     started_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     bootstrap_seed: Option<u64>,
@@ -35,12 +37,14 @@ impl RunMetadata {
         judge: Option<ModelId>,
         tasks: Option<PathBuf>,
         started_at: String,
+        base_url: impl Into<String>,
     ) -> Self {
         Self {
             version: env!("CARGO_PKG_VERSION"),
             models,
             judge,
             tasks,
+            base_url: base_url.into(),
             started_at,
             bootstrap_seed: None,
             bootstrap_replicates: None,
@@ -63,6 +67,7 @@ pub fn utc_timestamp() -> String {
 #[derive(Debug, Serialize)]
 pub struct Output {
     pub run: RunMetadata,
+    pub tasks: Vec<Task>,
     pub results: Vec<EvaluatedResult>,
     pub comparisons: Vec<Comparison>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -93,35 +98,49 @@ pub fn write(path: impl AsRef<Path>, output: &Output) -> Result<(), PersistError
 mod tests {
     use super::*;
     use crate::judge::{JudgeOrientation, JudgmentFailureKind, OrientationFailure};
+    use crate::task::{Task, TaskEvaluation};
+
+    fn run_meta(
+        models: Vec<ModelId>,
+        judge: Option<ModelId>,
+        tasks: Option<PathBuf>,
+    ) -> RunMetadata {
+        RunMetadata::new(
+            models,
+            judge,
+            tasks,
+            "2026-01-02T03:04:05Z".into(),
+            "https://example.test/v1",
+        )
+    }
 
     #[test]
     fn run_metadata_serializes_provenance_and_preserves_output_collections() {
-        let run = RunMetadata::new(
+        let run = run_meta(
             vec![ModelId::new("a"), ModelId::new("b")],
             Some(ModelId::new("judge")),
             Some(PathBuf::from("tasks.json")),
-            "2026-01-02T03:04:05Z".into(),
         );
+        let value = serde_json::to_value(&run).unwrap();
         assert_eq!(
-            serde_json::to_value(&run).unwrap(),
+            value,
             serde_json::json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 "models": ["a", "b"],
                 "judge": "judge",
                 "tasks": "tasks.json",
+                "base_url": "https://example.test/v1",
                 "started_at": "2026-01-02T03:04:05Z",
             })
         );
+        assert!(value.get("api_key").is_none());
+        assert!(value.get("authorization").is_none());
 
-        let run = RunMetadata::new(
-            vec![ModelId::new("a")],
-            None,
-            None,
-            "2026-01-02T03:04:05Z".into(),
-        );
+        let run = run_meta(vec![ModelId::new("a")], None, None);
         let value = serde_json::to_value(&run).unwrap();
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(value["models"], serde_json::json!(["a"]));
+        assert_eq!(value["base_url"], "https://example.test/v1");
         assert!(value.get("judge").is_none());
         assert!(value.get("tasks").is_none());
         assert_eq!(value["started_at"], "2026-01-02T03:04:05Z");
@@ -130,7 +149,25 @@ mod tests {
         assert!(value.get("bootstrap_valid").is_none());
 
         let output = Output {
-            run,
+            run: run_meta(
+                vec![ModelId::new("a")],
+                None,
+                Some(PathBuf::from("tasks.json")),
+            ),
+            tasks: vec![
+                Task {
+                    id: "t1".into(),
+                    prompt: "Say hello".into(),
+                    evaluation: None,
+                },
+                Task {
+                    id: "t2".into(),
+                    prompt: "Capital?".into(),
+                    evaluation: Some(TaskEvaluation::Exact {
+                        expected: "Paris".into(),
+                    }),
+                },
+            ],
             results: vec![],
             comparisons: vec![],
             judgments: vec![],
@@ -140,6 +177,18 @@ mod tests {
         };
         let value = serde_json::to_value(&output).unwrap();
         assert!(value.get("run").is_some());
+        assert_eq!(value["run"]["tasks"], "tasks.json");
+        assert_eq!(
+            value["tasks"],
+            serde_json::json!([
+                {"id": "t1", "prompt": "Say hello"},
+                {
+                    "id": "t2",
+                    "prompt": "Capital?",
+                    "evaluation": {"type": "exact", "expected": "Paris"}
+                }
+            ])
+        );
         assert_eq!(value["results"], serde_json::json!([]));
         assert_eq!(value["comparisons"], serde_json::json!([]));
         assert!(value.get("judgments").is_none());
@@ -150,18 +199,13 @@ mod tests {
 
     #[test]
     fn bootstrap_metadata_and_rating_bounds_serialize_only_when_present() {
-        let run = RunMetadata::new(
-            vec![ModelId::new("a")],
-            None,
-            None,
-            "2026-01-02T03:04:05Z".into(),
-        )
-        .with_bootstrap(0, 1000, 1000);
+        let run = run_meta(vec![ModelId::new("a")], None, None).with_bootstrap(0, 1000, 1000);
         assert_eq!(
             serde_json::to_value(&run).unwrap(),
             serde_json::json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 "models": ["a"],
+                "base_url": "https://example.test/v1",
                 "started_at": "2026-01-02T03:04:05Z",
                 "bootstrap_seed": 0,
                 "bootstrap_replicates": 1000,
@@ -245,12 +289,8 @@ mod tests {
         );
 
         let output = Output {
-            run: RunMetadata::new(
-                vec![ModelId::new("a")],
-                None,
-                None,
-                "2026-01-02T03:04:05Z".into(),
-            ),
+            run: run_meta(vec![ModelId::new("a")], None, None),
+            tasks: vec![],
             results: vec![],
             comparisons: vec![],
             judgments: vec![],

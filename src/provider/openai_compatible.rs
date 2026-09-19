@@ -62,6 +62,10 @@ impl OpenAICompatibleProvider {
             base_url: base_url.into(),
         }
     }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
 }
 
 impl ModelProvider for OpenAICompatibleProvider {
@@ -295,6 +299,7 @@ mod tests {
         let provider = OpenAICompatibleProvider::new("super-secret-key", "https://example.test/v1");
         let debug = format!("{provider:?}");
         assert!(!debug.contains("super-secret-key"), "{debug}");
+        assert_eq!(provider.base_url(), "https://example.test/v1");
     }
 
     #[tokio::test]

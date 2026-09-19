@@ -104,7 +104,8 @@ Each orientation is tried up to three times (a 1s backoff, then 2s) for provider
 
 `arena exec` produces one JSON object with these fields:
 
-- `run` — version, models, judge, task path, start time, and bootstrap seed/replicate counts when uncertainty was computed
+- `run` — version, models, judge, task path, resolved provider `base_url`, start time, and bootstrap seed/replicate counts when uncertainty was computed
+- `tasks` — the loaded task definitions (id, prompt, optional exact evaluation)
 - `results` — model responses, evaluations, and durations
 - `comparisons` — pairwise comparisons from exact scores
 - `judgments` — resolved LLM-judge results and both orientation winners
@@ -119,6 +120,8 @@ Ratings are the full-data Bradley–Terry estimates. Uncertainty uses a task-clu
 `judgments[].duration_ms` is the wall-clock time from when the first of a pair's two judge orientations begins work after acquiring a provider permit until both orientations have completed. It excludes time the pair spends queued behind other provider calls, and it is not the sum of the two orientation request times.
 
 Results retain task-file and CLI model order. Statistics and ratings are ordered by model ID.
+
+The saved run is an audit of one execution: models, judge, task file path, the loaded tasks, and the provider base URL. It does not store API keys. Candidate and judge completions are not deterministic; `--seed` only reproduces bootstrap intervals from the persisted judgments.
 
 ## Limitations
 

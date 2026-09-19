@@ -488,22 +488,29 @@ mod tests {
     use crate::provider::{CompletionResponse, PROVIDER_CONCURRENCY};
 
     #[test]
-    fn parses_winner_a() {
-        let decision = parse_decision(r#"{"winner":"a","reason":"A is better"}"#).unwrap();
-        assert_eq!(decision.winner, JudgeDecision::A);
-        assert_eq!(decision.reason, "A is better");
-    }
-
-    #[test]
-    fn parses_winner_b() {
-        let decision = parse_decision(r#"{"winner":"b","reason":"B is better"}"#).unwrap();
-        assert_eq!(decision.winner, JudgeDecision::B);
-    }
-
-    #[test]
-    fn parses_draw() {
-        let decision = parse_decision(r#"{"winner":"draw","reason":"equal"}"#).unwrap();
-        assert_eq!(decision.winner, JudgeDecision::Draw);
+    fn parses_winner_values() {
+        let cases = [
+            (
+                r#"{"winner":"a","reason":"A is better"}"#,
+                JudgeDecision::A,
+                "A is better",
+            ),
+            (
+                r#"{"winner":"b","reason":"B is better"}"#,
+                JudgeDecision::B,
+                "B is better",
+            ),
+            (
+                r#"{"winner":"draw","reason":"equal"}"#,
+                JudgeDecision::Draw,
+                "equal",
+            ),
+        ];
+        for (text, winner, reason) in cases {
+            let decision = parse_decision(text).unwrap();
+            assert_eq!(decision.winner, winner, "{text}");
+            assert_eq!(decision.reason, reason, "{text}");
+        }
     }
 
     #[test]
@@ -525,27 +532,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_winner() {
-        let error = parse_decision(r#"{"winner":"c","reason":"no"}"#).unwrap_err();
-        assert!(matches!(error, JudgeError::InvalidJson(_)));
-    }
-
-    #[test]
-    fn rejects_missing_winner() {
-        let error = parse_decision(r#"{"reason":"no winner"}"#).unwrap_err();
-        assert!(matches!(error, JudgeError::InvalidJson(_)));
-    }
-
-    #[test]
-    fn rejects_missing_reason() {
-        let error = parse_decision(r#"{"winner":"a"}"#).unwrap_err();
-        assert!(matches!(error, JudgeError::InvalidJson(_)));
-    }
-
-    #[test]
-    fn rejects_non_string_reason() {
-        let error = parse_decision(r#"{"winner":"a","reason":1}"#).unwrap_err();
-        assert!(matches!(error, JudgeError::InvalidJson(_)));
+    fn rejects_invalid_judgment_schema() {
+        let payloads = [
+            r#"{"winner":"c","reason":"no"}"#,
+            r#"{"reason":"no winner"}"#,
+            r#"{"winner":"a"}"#,
+            r#"{"winner":"a","reason":1}"#,
+        ];
+        for payload in payloads {
+            let error = parse_decision(payload).unwrap_err();
+            assert!(
+                matches!(error, JudgeError::InvalidJson(_)),
+                "{payload}: {error:?}"
+            );
+        }
     }
 
     #[test]
@@ -954,38 +954,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_count_is_bounded_at_three_attempts() {
-        let provider = AlwaysInvalidJson {
-            calls: Arc::new(AtomicUsize::new(0)),
-        };
-        let task = Task {
-            id: "t1".into(),
-            prompt: "p".into(),
-            evaluation: None,
-        };
-        let results = vec![evaluated("m0", "left"), evaluated("m1", "right")];
-
-        let outcome = judge_pairs(&provider, ModelId::new("judge"), &task, &results, |_| {})
-            .await
-            .unwrap();
-
-        assert!(outcome.judgments.is_empty());
-        assert_eq!(outcome.failures.len(), 1);
-        assert_eq!(outcome.failures[0].orientations.len(), 2);
-        assert!(
-            outcome.failures[0]
-                .orientations
-                .iter()
-                .all(|failure| failure.attempts == JUDGE_ATTEMPTS)
-        );
-        assert_eq!(
-            provider.calls.load(Ordering::SeqCst),
-            (JUDGE_ATTEMPTS * 2) as usize
-        );
-    }
-
-    #[tokio::test]
-    async fn both_orientations_failing_records_one_pair_failure() {
+    async fn permanently_failed_orientations_omit_the_pair_after_three_attempts() {
         let provider = AlwaysInvalidJson {
             calls: Arc::new(AtomicUsize::new(0)),
         };
@@ -1013,11 +982,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![JudgeOrientation::Ab, JudgeOrientation::Ba]
         );
-        assert!(
-            outcome.failures[0]
-                .orientations
-                .iter()
-                .all(|failure| failure.kind == JudgmentFailureKind::InvalidJson)
+        assert!(outcome.failures[0].orientations.iter().all(|failure| {
+            failure.attempts == JUDGE_ATTEMPTS && failure.kind == JudgmentFailureKind::InvalidJson
+        }));
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            (JUDGE_ATTEMPTS * 2) as usize
         );
     }
 
@@ -1165,14 +1135,5 @@ mod tests {
 
         assert!(matches!(error, JudgeError::DifferentTasks));
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn incomplete_judgments_error_is_non_zero_status() {
-        let error = crate::error::Error::IncompleteJudgments(2);
-        assert_eq!(
-            error.to_string(),
-            "incomplete run: 2 judgment pair(s) failed"
-        );
     }
 }

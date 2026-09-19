@@ -168,31 +168,25 @@ mod tests {
     }
 
     #[test]
-    fn cluster_multiplicity_repeats_every_judgment_in_a_selected_task() {
+    fn task_cluster_resampling_keeps_judgments_together() {
         let mut judgments = cycle("t1");
         judgments.extend(draws("t2"));
         let clusters = group_by_task(&judgments);
         assert_eq!(clusters.len(), 2);
 
-        let first = &clusters[0];
-        let sampled = build_replicate(&clusters, &[0, 0]);
-        assert_eq!(sampled.len(), first.len() * 2);
-        assert_eq!(&sampled[..first.len()], first.as_slice());
-        assert_eq!(&sampled[first.len()..], first.as_slice());
-        assert!(sampled.iter().all(|j| j.task_id == first[0].task_id));
-    }
-
-    #[test]
-    fn task_integrity_keeps_a_task_cluster_together() {
-        let mut judgments = cycle("t1");
-        judgments.extend(draws("t2"));
-        let clusters = group_by_task(&judgments);
         assert_eq!(build_replicate(&clusters, &[0]), clusters[0]);
         assert_eq!(build_replicate(&clusters, &[1]), clusters[1]);
 
-        let sampled = build_replicate(&clusters, &[0, 1]);
-        assert_eq!(&sampled[..clusters[0].len()], clusters[0].as_slice());
-        assert_eq!(&sampled[clusters[0].len()..], clusters[1].as_slice());
+        let mixed = build_replicate(&clusters, &[0, 1]);
+        assert_eq!(&mixed[..clusters[0].len()], clusters[0].as_slice());
+        assert_eq!(&mixed[clusters[0].len()..], clusters[1].as_slice());
+
+        let first = &clusters[0];
+        let repeated = build_replicate(&clusters, &[0, 0]);
+        assert_eq!(repeated.len(), first.len() * 2);
+        assert_eq!(&repeated[..first.len()], first.as_slice());
+        assert_eq!(&repeated[first.len()..], first.as_slice());
+        assert!(repeated.iter().all(|j| j.task_id == first[0].task_id));
     }
 
     #[test]
