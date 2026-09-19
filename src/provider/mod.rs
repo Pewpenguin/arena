@@ -38,7 +38,7 @@ pub struct CompletionRequest {
     pub max_tokens: Option<u32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompletionResponse {
     pub text: String,
 }

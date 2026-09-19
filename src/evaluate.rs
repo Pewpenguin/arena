@@ -1,19 +1,19 @@
 use crate::execute::ExecutionResult;
 use crate::provider::{CompletionResponse, ModelId};
 use crate::task::{Task, TaskEvaluation};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Evaluation {
     pub score: f64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvaluatedResult {
     pub task_id: String,
     pub model: ModelId,
     pub response: CompletionResponse,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluation: Option<Evaluation>,
     pub duration_ms: u64,
 }

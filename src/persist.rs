@@ -1,5 +1,5 @@
 use chrono::{SecondsFormat, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -14,7 +14,7 @@ use crate::rating::ModelRating;
 use crate::stats::{ModelStats, PairAgreement};
 use crate::task::Task;
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JudgeDecoding {
     pub temperature: f64,
     pub max_tokens: u32,
@@ -29,46 +29,46 @@ impl JudgeDecoding {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RunMetadata {
-    version: &'static str,
-    models: Vec<ModelId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    judge: Option<ModelId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tasks: Option<PathBuf>,
-    base_url: String,
-    started_at: String,
-    provider_concurrency: usize,
-    request_timeout_secs: u64,
-    connect_timeout_secs: u64,
-    candidate_attempts: u32,
-    judge_attempts: u32,
-    candidate_max_tokens: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    complete: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    expected_pairs: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    resolved_pairs: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    failed_pairs: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    orientation_agreement: Option<PairAgreement>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    judge_decoding: Option<JudgeDecoding>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bootstrap_seed: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bootstrap_replicates: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bootstrap_valid: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bootstrap_clusters: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bootstrap_ran: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bootstrap_unavailable: Option<BootstrapUnavailable>,
+    pub(crate) version: String,
+    pub(crate) models: Vec<ModelId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) judge: Option<ModelId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tasks: Option<PathBuf>,
+    pub(crate) base_url: String,
+    pub(crate) started_at: String,
+    pub(crate) provider_concurrency: usize,
+    pub(crate) request_timeout_secs: u64,
+    pub(crate) connect_timeout_secs: u64,
+    pub(crate) candidate_attempts: u32,
+    pub(crate) judge_attempts: u32,
+    pub(crate) candidate_max_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) complete: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) expected_pairs: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) resolved_pairs: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) failed_pairs: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) orientation_agreement: Option<PairAgreement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) judge_decoding: Option<JudgeDecoding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) bootstrap_seed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) bootstrap_replicates: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) bootstrap_valid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) bootstrap_clusters: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) bootstrap_ran: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) bootstrap_unavailable: Option<BootstrapUnavailable>,
 }
 
 impl RunMetadata {
@@ -80,7 +80,7 @@ impl RunMetadata {
         base_url: impl Into<String>,
     ) -> Self {
         Self {
-            version: env!("CARGO_PKG_VERSION"),
+            version: env!("CARGO_PKG_VERSION").to_string(),
             models,
             judge,
             tasks,
@@ -145,19 +145,19 @@ pub fn utc_timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Output {
     pub run: RunMetadata,
     pub tasks: Vec<Task>,
     pub results: Vec<EvaluatedResult>,
     pub comparisons: Vec<Comparison>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judgments: Option<Vec<Judgment>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judgment_failures: Option<Vec<JudgmentFailure>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub statistics: Option<Vec<ModelStats>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ratings: Option<Vec<ModelRating>>,
 }
 
@@ -166,16 +166,23 @@ pub enum PersistError {
     #[error("failed to write results file: {0}")]
     Io(#[from] std::io::Error),
     #[error("failed to serialize results: {0}")]
-    Serialize(#[from] serde_json::Error),
+    Serialize(serde_json::Error),
+    #[error("failed to parse results file: {0}")]
+    Parse(serde_json::Error),
 }
 
 pub fn to_pretty_json(output: &Output) -> Result<String, PersistError> {
-    Ok(serde_json::to_string_pretty(output)?)
+    serde_json::to_string_pretty(output).map_err(PersistError::Serialize)
 }
 
 pub fn write(path: impl AsRef<Path>, output: &Output) -> Result<(), PersistError> {
     fs::write(path, to_pretty_json(output)?)?;
     Ok(())
+}
+
+pub fn read(path: impl AsRef<Path>) -> Result<Output, PersistError> {
+    let contents = fs::read_to_string(path)?;
+    serde_json::from_str(&contents).map_err(PersistError::Parse)
 }
 
 #[cfg(test)]
@@ -302,6 +309,10 @@ mod tests {
         assert!(value.get("judgment_failures").is_none());
         assert!(value.get("statistics").is_none());
         assert!(value.get("ratings").is_none());
+        let parsed: Output = serde_json::from_str(&to_pretty_json(&output).unwrap()).unwrap();
+        assert!(parsed.judgments.is_none());
+        assert_eq!(parsed.tasks.len(), 2);
+        assert_eq!(parsed.run.models, vec![ModelId::new("a")]);
     }
 
     #[test]

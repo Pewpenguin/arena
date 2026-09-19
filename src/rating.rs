@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::judge::{JudgeDecision, Judgment};
 use crate::provider::ModelId;
@@ -10,7 +10,7 @@ const SCALE: f64 = 400.0;
 const MAX_ITERS: u32 = 10_000;
 const TOLERANCE: f64 = 1e-12;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnavailableReason {
     NoComparisons,
@@ -20,15 +20,15 @@ pub enum UnavailableReason {
     NonfiniteResult,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelRating {
     pub model: ModelId,
     pub rating: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rating_lower: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rating_upper: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unavailable: Option<UnavailableReason>,
 }
 

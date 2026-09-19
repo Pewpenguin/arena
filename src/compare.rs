@@ -1,8 +1,8 @@
 use crate::evaluate::EvaluatedResult;
 use crate::provider::ModelId;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Comparison {
     pub task_id: String,
     pub model_a: ModelId,

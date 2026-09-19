@@ -58,6 +58,12 @@ Run multiple models against a task file:
 
 Without `--output`, the JSON result is written to stdout. Each candidate provider request is tried up to three times (a 1s backoff, then 2s) for provider errors and invalid provider responses. An exhausted candidate failure still aborts the run without producing output. A permanently failed judge pair is saved in the output with `run.complete` set to false, and the process then exits non-zero.
 
+Render a persisted experiment JSON file as a self-contained HTML audit report:
+
+    cargo run -- report \
+      --input results.json \
+      --output report.html
+
 ## Tasks
 
 Tasks are defined as a JSON array. Task IDs must be unique. Unknown fields are rejected.
@@ -145,6 +151,12 @@ The process still exits non-zero on incomplete judging; the JSON is the record o
 Results retain task-file and CLI model order. Statistics and ratings are ordered by model ID.
 
 The saved run is an audit of one execution: models, judge, task file path, the loaded tasks, the provider base URL, Arena-controlled concurrency, timeout, retry-attempt, and output-token settings, and, when a judge is used, pairwise coverage, pair-level orientation agreement, the judge decoding configuration, rating availability, and bootstrap metadata. It does not store API keys. Candidate completions omit temperature so the provider default applies; they are not deterministic. Judge calls request `temperature` 0, but providers and models may still vary. `--seed` only controls the bootstrap RNG and does not make model completions deterministic. When intervals were produced, the same seed reproduces them from the persisted judgments. Raw judge completions are kept so a later audit can see what was parsed. `max_tokens` bounds the requested completion length only.
+
+## Reporting
+
+The `report` module derives an experiment/audit view from persisted `Output`. It does not write a second schema, recompute coverage, or fit a new rating. Pairwise judgments remain the primary observations; win/loss totals, Bradley–Terry ratings, and bootstrap intervals are derived statistics on the observed pairs. No-judge runs are reported as no-judge rather than filling in pairwise coverage.
+
+`arena report` turns that view into a self-contained HTML audit document. The page is a compact experiment dashboard: header and coverage first, pairwise judgments as the primary evidence, then collapsed candidate responses, raw judge completions, bootstrap metadata, and run configuration. Ratings are shown as derived statistics. The HTML is generated from `report::Report`, embeds its CSS, and has no external assets, JavaScript, or frontend dependencies. It is an inspectable rendering of one persisted experiment, not the final Arena interface.
 
 ## Ratings
 

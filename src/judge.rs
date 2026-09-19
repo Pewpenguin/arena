@@ -62,7 +62,7 @@ pub struct JudgePairsOutcome {
     pub failures: Vec<JudgmentFailure>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JudgmentFailure {
     pub task_id: String,
     pub model_a: ModelId,
@@ -71,7 +71,7 @@ pub struct JudgmentFailure {
     pub orientations: Vec<OrientationFailure>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrientationFailure {
     pub orientation: JudgeOrientation,
     pub kind: JudgmentFailureKind,
@@ -79,14 +79,14 @@ pub struct OrientationFailure {
     pub attempts: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum JudgeOrientation {
     Ab,
     Ba,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JudgmentFailureKind {
     Provider,

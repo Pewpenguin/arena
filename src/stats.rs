@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::judge::{JudgeDecision, Judgment};
 use crate::provider::ModelId;
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelStats {
     pub model: ModelId,
     pub wins: u32,
@@ -21,7 +21,7 @@ pub struct ModelStats {
     pub agreement_rate: f64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PairAgreement {
     pub resolved_pairs: usize,
     pub orientation_agreeing_pairs: usize,

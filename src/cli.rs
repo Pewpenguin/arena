@@ -29,4 +29,10 @@ pub enum Command {
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
+    Report {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
 }

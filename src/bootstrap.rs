@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::judge::Judgment;
 use crate::provider::ModelId;
@@ -12,7 +12,7 @@ pub const BOOTSTRAP_REPLICATES: u32 = 1_000;
 const LOWER_P: f64 = 0.025;
 const UPPER_P: f64 = 0.975;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BootstrapUnavailable {
     TooFewTasks,

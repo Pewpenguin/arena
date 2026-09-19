@@ -6,9 +6,12 @@ use indicatif::{ProgressBar, ProgressStyle};
 use arena::cli::{Cli, Command};
 use arena::error::Result;
 use arena::exec::{self, ExecConfig};
+use arena::html;
+use arena::persist;
 use arena::provider::{
     CompletionRequest, DEFAULT_MAX_TOKENS, ModelId, ModelProvider, OpenAICompatibleProvider,
 };
+use arena::report;
 use arena::task;
 
 #[tokio::main]
@@ -38,7 +41,7 @@ async fn main() -> Result<()> {
             let models = exec::unique_models(models)?;
             let judge = judge.map(ModelId::new);
             exec::validate_judge(&models, judge.as_ref())?;
-            let started_at = arena::persist::utc_timestamp();
+            let started_at = persist::utc_timestamp();
             let provider = OpenAICompatibleProvider::from_env()?;
             let tasks = task::load(&tasks_path)?;
 
@@ -105,6 +108,12 @@ async fn main() -> Result<()> {
             }
 
             exec::complete_exec(output_data, failed_pairs, output.as_deref())?;
+        }
+        Command::Report { input, output } => {
+            let data = persist::read(&input)?;
+            let report = report::from_output(&data);
+            let html = html::render(&report);
+            std::fs::write(&output, html).map_err(persist::PersistError::from)?;
         }
     }
 
