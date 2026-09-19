@@ -12,9 +12,41 @@ pub struct ModelStats {
     pub losses: u32,
     pub draws: u32,
     pub total: u32,
+    /// Resolved pairs this model appeared in whose orientations agreed.
+    /// One increment per pair, not a second independent observation of that pair.
     pub agreement_count: u32,
     pub disagreement_count: u32,
+    /// Among this model's resolved pairs only. The run-level pair summary is the
+    /// primary orientation-agreement metric.
     pub agreement_rate: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PairAgreement {
+    pub resolved_pairs: usize,
+    pub orientation_agreeing_pairs: usize,
+    pub orientation_disagreeing_pairs: usize,
+    pub agreement_rate: f64,
+}
+
+pub fn pair_agreement(judgments: &[Judgment]) -> PairAgreement {
+    let resolved_pairs = judgments.len();
+    let orientation_agreeing_pairs = judgments
+        .iter()
+        .filter(|judgment| judgment.agreement)
+        .count();
+    let orientation_disagreeing_pairs = resolved_pairs - orientation_agreeing_pairs;
+    let agreement_rate = if resolved_pairs == 0 {
+        0.0
+    } else {
+        orientation_agreeing_pairs as f64 / resolved_pairs as f64
+    };
+    PairAgreement {
+        resolved_pairs,
+        orientation_agreeing_pairs,
+        orientation_disagreeing_pairs,
+        agreement_rate,
+    }
 }
 
 pub fn aggregate(judgments: &[Judgment], models: &[ModelId]) -> Vec<ModelStats> {
@@ -174,5 +206,58 @@ mod tests {
         assert_eq!((b.wins, b.losses, b.draws, b.total), (0, 1, 1, 2));
         assert_eq!((b.agreement_count, b.disagreement_count), (1, 1));
         assert_eq!(b.agreement_rate, 0.5);
+    }
+
+    #[test]
+    fn pair_agreement_all_orientations_agree() {
+        let all_agree = [
+            judgment("a", "b", JudgeDecision::A, true),
+            judgment("a", "c", JudgeDecision::B, true),
+        ];
+        let summary = pair_agreement(&all_agree);
+        assert_eq!(summary.resolved_pairs, 2);
+        assert_eq!(summary.orientation_agreeing_pairs, 2);
+        assert_eq!(summary.orientation_disagreeing_pairs, 0);
+        assert_eq!(summary.agreement_rate, 1.0);
+    }
+
+    #[test]
+    fn pair_agreement_mixed_agreeing_and_disagreeing() {
+        let mixed = [
+            judgment("a", "b", JudgeDecision::A, true),
+            judgment("a", "c", JudgeDecision::Draw, false),
+            judgment("b", "c", JudgeDecision::B, true),
+        ];
+        let summary = pair_agreement(&mixed);
+        assert_eq!(summary.resolved_pairs, 3);
+        assert_eq!(summary.orientation_agreeing_pairs, 2);
+        assert_eq!(summary.orientation_disagreeing_pairs, 1);
+        assert_eq!(summary.agreement_rate, 2.0 / 3.0);
+    }
+
+    #[test]
+    fn pair_agreement_zero_resolved_pairs() {
+        let empty = pair_agreement(&[]);
+        assert_eq!(empty.resolved_pairs, 0);
+        assert_eq!(empty.orientation_agreeing_pairs, 0);
+        assert_eq!(empty.orientation_disagreeing_pairs, 0);
+        assert_eq!(empty.agreement_rate, 0.0);
+    }
+
+    #[test]
+    fn pair_agreement_does_not_double_count_endpoints() {
+        let one = [judgment("a", "b", JudgeDecision::A, true)];
+        let summary = pair_agreement(&one);
+        assert_eq!(summary.resolved_pairs, 1);
+        let stats = aggregate(&one, &[ModelId::new("a"), ModelId::new("b")]);
+        let endpoint_sum: u32 = stats.iter().map(|s| s.agreement_count).sum();
+        assert_eq!(
+            endpoint_sum, 2,
+            "per-model counts attribute the pair to both endpoints"
+        );
+        assert_eq!(
+            summary.orientation_agreeing_pairs, 1,
+            "pair-level summary must not double-count endpoints"
+        );
     }
 }

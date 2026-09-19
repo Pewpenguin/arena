@@ -11,7 +11,7 @@ use crate::evaluate::EvaluatedResult;
 use crate::judge::{Judgment, JudgmentFailure};
 use crate::provider::ModelId;
 use crate::rating::ModelRating;
-use crate::stats::ModelStats;
+use crate::stats::{ModelStats, PairAgreement};
 use crate::task::Task;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -50,6 +50,8 @@ pub struct RunMetadata {
     resolved_pairs: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     failed_pairs: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    orientation_agreement: Option<PairAgreement>,
     #[serde(skip_serializing_if = "Option::is_none")]
     judge_decoding: Option<JudgeDecoding>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -90,6 +92,7 @@ impl RunMetadata {
             expected_pairs: None,
             resolved_pairs: None,
             failed_pairs: None,
+            orientation_agreement: None,
             judge_decoding: None,
             bootstrap_seed: None,
             bootstrap_replicates: None,
@@ -123,6 +126,11 @@ impl RunMetadata {
         self
     }
 
+    pub fn with_orientation_agreement(mut self, agreement: PairAgreement) -> Self {
+        self.orientation_agreement = Some(agreement);
+        self
+    }
+
     pub fn with_judge_decoding(mut self, decoding: JudgeDecoding) -> Self {
         self.judge_decoding = Some(decoding);
         self
@@ -139,14 +147,14 @@ pub struct Output {
     pub tasks: Vec<Task>,
     pub results: Vec<EvaluatedResult>,
     pub comparisons: Vec<Comparison>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub judgments: Vec<Judgment>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub judgment_failures: Vec<JudgmentFailure>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub statistics: Vec<ModelStats>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub ratings: Vec<ModelRating>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub judgments: Option<Vec<Judgment>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub judgment_failures: Option<Vec<JudgmentFailure>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub statistics: Option<Vec<ModelStats>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ratings: Option<Vec<ModelRating>>,
 }
 
 #[derive(Debug, Error)]
@@ -238,6 +246,7 @@ mod tests {
         assert!(value.get("expected_pairs").is_none());
         assert!(value.get("resolved_pairs").is_none());
         assert!(value.get("failed_pairs").is_none());
+        assert!(value.get("orientation_agreement").is_none());
         assert!(value.get("judge_decoding").is_none());
 
         let output = Output {
@@ -262,10 +271,10 @@ mod tests {
             ],
             results: vec![],
             comparisons: vec![],
-            judgments: vec![],
-            judgment_failures: vec![],
-            statistics: vec![],
-            ratings: vec![],
+            judgments: None,
+            judgment_failures: None,
+            statistics: None,
+            ratings: None,
         };
         let value = serde_json::to_value(&output).unwrap();
         assert!(value.get("run").is_some());
@@ -428,12 +437,22 @@ mod tests {
             Some(PathBuf::from("tasks.json")),
         )
         .with_judge_coverage(1, 0, 1)
+        .with_orientation_agreement(crate::stats::pair_agreement(&[]))
         .with_judge_decoding(JudgeDecoding::arena_default());
         let value = serde_json::to_value(&incomplete).unwrap();
         assert_eq!(value["complete"], false);
         assert_eq!(value["expected_pairs"], 1);
         assert_eq!(value["resolved_pairs"], 0);
         assert_eq!(value["failed_pairs"], 1);
+        assert_eq!(
+            value["orientation_agreement"],
+            serde_json::json!({
+                "resolved_pairs": 0,
+                "orientation_agreeing_pairs": 0,
+                "orientation_disagreeing_pairs": 0,
+                "agreement_rate": 0.0
+            })
+        );
         assert_eq!(
             value["judge_decoding"],
             serde_json::json!({ "temperature": 0.0 })
@@ -450,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn judgment_failures_serialize_and_are_omitted_when_empty() {
+    fn judgment_failures_serialize_and_are_omitted_without_a_judge() {
         let failure = JudgmentFailure {
             task_id: "t1".into(),
             model_a: ModelId::new("a"),
@@ -500,12 +519,52 @@ mod tests {
             tasks: vec![],
             results: vec![],
             comparisons: vec![],
-            judgments: vec![],
-            judgment_failures: vec![],
-            statistics: vec![],
-            ratings: vec![],
+            judgments: None,
+            judgment_failures: None,
+            statistics: None,
+            ratings: None,
         };
         let value = serde_json::to_value(&output).unwrap();
+        assert!(value.get("judgments").is_none());
         assert!(value.get("judgment_failures").is_none());
+        assert!(value.get("statistics").is_none());
+        assert!(value.get("ratings").is_none());
+        assert!(value["run"].get("complete").is_none());
+        assert!(value["run"].get("orientation_agreement").is_none());
+    }
+
+    #[test]
+    fn judge_run_empty_collections_serialize_as_empty_arrays() {
+        let run = run_meta(vec![ModelId::new("a")], Some(ModelId::new("judge")), None)
+            .with_judge_coverage(0, 0, 0)
+            .with_orientation_agreement(crate::stats::pair_agreement(&[]));
+        let output = Output {
+            run,
+            tasks: vec![],
+            results: vec![],
+            comparisons: vec![],
+            judgments: Some(vec![]),
+            judgment_failures: Some(vec![]),
+            statistics: Some(vec![]),
+            ratings: Some(vec![]),
+        };
+        let value = serde_json::to_value(&output).unwrap();
+        assert_eq!(value["judgments"], serde_json::json!([]));
+        assert_eq!(value["judgment_failures"], serde_json::json!([]));
+        assert_eq!(value["statistics"], serde_json::json!([]));
+        assert_eq!(value["ratings"], serde_json::json!([]));
+        assert_eq!(value["run"]["complete"], true);
+        assert_eq!(value["run"]["expected_pairs"], 0);
+        assert_eq!(value["run"]["resolved_pairs"], 0);
+        assert_eq!(value["run"]["failed_pairs"], 0);
+        assert_eq!(
+            value["run"]["orientation_agreement"],
+            serde_json::json!({
+                "resolved_pairs": 0,
+                "orientation_agreeing_pairs": 0,
+                "orientation_disagreeing_pairs": 0,
+                "agreement_rate": 0.0
+            })
+        );
     }
 }

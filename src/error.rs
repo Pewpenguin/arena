@@ -26,6 +26,14 @@ pub enum Error {
     JudgeIsCandidate(ModelId),
     #[error("incomplete run: {0} judgment pair(s) failed")]
     IncompleteJudgments(usize),
+    #[error(
+        "inconsistent pair coverage: expected {expected}, resolved {resolved}, failed {failed}"
+    )]
+    InconsistentPairCoverage {
+        expected: usize,
+        resolved: usize,
+        failed: usize,
+    },
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }

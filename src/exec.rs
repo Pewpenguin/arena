@@ -93,15 +93,6 @@ where
         }
     }
 
-    let (statistics, ratings, bootstrap_meta) = if config.judge.is_some() {
-        let statistics = stats::aggregate(&judgments, &config.models);
-        let (ratings, meta) =
-            bootstrap::rate_with_uncertainty(&judgments, &config.models, config.seed);
-        (statistics, ratings, Some(meta))
-    } else {
-        (Vec::new(), Vec::new(), None)
-    };
-
     let mut run = RunMetadata::new(
         config.models.clone(),
         config.judge.clone(),
@@ -109,20 +100,36 @@ where
         config.started_at.clone(),
         config.base_url.clone(),
     );
-    if let Some(meta) = bootstrap_meta {
+    let (judgments, judgment_failures, statistics, ratings) = if config.judge.is_some() {
+        let statistics = stats::aggregate(&judgments, &config.models);
+        let (ratings, meta) =
+            bootstrap::rate_with_uncertainty(&judgments, &config.models, config.seed);
         run = run.with_bootstrap(&meta);
-    }
-    if config.judge.is_some() {
+        let expected = expected_pairs(config.tasks.len(), config.models.len());
+        let resolved = judgments.len();
+        let failed = judgment_failures.len();
+        if expected != resolved + failed {
+            return Err(Error::InconsistentPairCoverage {
+                expected,
+                resolved,
+                failed,
+            });
+        }
         run = run
-            .with_judge_coverage(
-                expected_pairs(config.tasks.len(), config.models.len()),
-                judgments.len(),
-                judgment_failures.len(),
-            )
+            .with_judge_coverage(expected, resolved, failed)
+            .with_orientation_agreement(stats::pair_agreement(&judgments))
             .with_judge_decoding(persist::JudgeDecoding::arena_default());
-    }
+        (
+            Some(judgments),
+            Some(judgment_failures),
+            Some(statistics),
+            Some(ratings),
+        )
+    } else {
+        (None, None, None, None)
+    };
 
-    let failed_pairs = judgment_failures.len();
+    let failed_pairs = judgment_failures.as_ref().map_or(0, Vec::len);
     Ok((
         Output {
             run,
@@ -332,15 +339,40 @@ mod tests {
         let contents = std::fs::read_to_string(&path).expect("output written before error");
         let value: serde_json::Value = serde_json::from_str(&contents).unwrap();
         assert_eq!(value["judgment_failures"].as_array().unwrap().len(), 1);
-        assert!(value.get("judgments").is_none());
+        assert_eq!(value["judgments"].as_array().unwrap().len(), 0);
         assert_eq!(value["run"]["complete"], false);
         assert_eq!(value["run"]["expected_pairs"], 1);
         assert_eq!(value["run"]["resolved_pairs"], 0);
         assert_eq!(value["run"]["failed_pairs"], 1);
         assert_eq!(
+            value["run"]["expected_pairs"].as_u64().unwrap(),
+            value["run"]["resolved_pairs"].as_u64().unwrap()
+                + value["run"]["failed_pairs"].as_u64().unwrap()
+        );
+        assert_eq!(
+            value["run"]["orientation_agreement"],
+            serde_json::json!({
+                "resolved_pairs": 0,
+                "orientation_agreeing_pairs": 0,
+                "orientation_disagreeing_pairs": 0,
+                "agreement_rate": 0.0
+            })
+        );
+        let ratings = value["ratings"].as_array().unwrap();
+        assert_eq!(ratings.len(), 2);
+        assert!(
+            ratings
+                .iter()
+                .all(|rating| rating["rating"].is_null()
+                    && rating["unavailable"] == "no_comparisons")
+        );
+        assert_eq!(value["statistics"].as_array().unwrap().len(), 2);
+        assert_eq!(
             value["run"]["judge_decoding"],
             serde_json::json!({ "temperature": 0.0 })
         );
+        assert_eq!(value["run"]["bootstrap_ran"], false);
+        assert_eq!(value["run"]["bootstrap_unavailable"], "original_unrated");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -374,7 +406,19 @@ mod tests {
             parsed["run"]["judge_decoding"],
             serde_json::json!({ "temperature": 0.0 })
         );
+        assert_eq!(
+            parsed["run"]["orientation_agreement"],
+            serde_json::json!({
+                "resolved_pairs": 1,
+                "orientation_agreeing_pairs": 0,
+                "orientation_disagreeing_pairs": 1,
+                "agreement_rate": 0.0
+            })
+        );
         assert_eq!(parsed["judgments"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["judgment_failures"].as_array().unwrap().len(), 0);
+        assert_eq!(parsed["statistics"].as_array().unwrap().len(), 2);
+        assert_eq!(parsed["ratings"].as_array().unwrap().len(), 2);
         assert!(parsed["judgments"][0].get("raw_ab").is_some());
         assert!(parsed["judgments"][0].get("raw_ba").is_some());
         let _ = std::fs::remove_file(&path);
@@ -391,10 +435,14 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["results"].as_array().unwrap().len(), 1);
         assert!(parsed.get("judgments").is_none());
+        assert!(parsed.get("judgment_failures").is_none());
+        assert!(parsed.get("statistics").is_none());
+        assert!(parsed.get("ratings").is_none());
         assert!(parsed["run"].get("complete").is_none());
         assert!(parsed["run"].get("expected_pairs").is_none());
         assert!(parsed["run"].get("resolved_pairs").is_none());
         assert!(parsed["run"].get("failed_pairs").is_none());
+        assert!(parsed["run"].get("orientation_agreement").is_none());
         assert!(parsed["run"].get("judge_decoding").is_none());
         assert!(parsed["run"].get("bootstrap_seed").is_none());
         assert!(parsed["run"].get("bootstrap_clusters").is_none());
@@ -434,6 +482,165 @@ mod tests {
         assert_eq!(parsed["run"]["expected_pairs"], 6);
         assert_eq!(parsed["run"]["resolved_pairs"], 6);
         assert_eq!(parsed["run"]["failed_pairs"], 0);
+        assert_eq!(
+            parsed["run"]["expected_pairs"].as_u64().unwrap(),
+            parsed["run"]["resolved_pairs"].as_u64().unwrap()
+                + parsed["run"]["failed_pairs"].as_u64().unwrap()
+        );
+        assert_eq!(
+            parsed["run"]["orientation_agreement"],
+            serde_json::json!({
+                "resolved_pairs": 6,
+                "orientation_agreeing_pairs": 0,
+                "orientation_disagreeing_pairs": 6,
+                "agreement_rate": 0.0
+            })
+        );
         assert_eq!(parsed["judgments"].as_array().unwrap().len(), 6);
+        assert_eq!(parsed["judgment_failures"].as_array().unwrap().len(), 0);
+        assert_eq!(parsed["ratings"].as_array().unwrap().len(), 3);
+    }
+
+    #[derive(Clone)]
+    struct PrefersM0;
+
+    impl ModelProvider for PrefersM0 {
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> std::result::Result<CompletionResponse, ProviderError> {
+            if request.model == ModelId::new("judge") {
+                let a_is_m0 = request.prompt.contains("<response_a>\nm0\n</response_a>");
+                let winner = if a_is_m0 { "a" } else { "b" };
+                return Ok(CompletionResponse {
+                    text: format!(r#"{{"winner":"{winner}","reason":"prefers m0"}}"#),
+                });
+            }
+            Ok(CompletionResponse {
+                text: request.model.to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn orientation_agreement_summary_counts_agreeing_pairs_once() {
+        let (output, failed_pairs) = collect_exec(
+            &PrefersM0,
+            &config(&["m0", "m1"], Some("judge")),
+            |_| {},
+            |_| {},
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed_pairs, 0);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&persist::to_pretty_json(&output).unwrap()).unwrap();
+        assert_eq!(parsed["run"]["complete"], true);
+        assert_eq!(
+            parsed["run"]["orientation_agreement"],
+            serde_json::json!({
+                "resolved_pairs": 1,
+                "orientation_agreeing_pairs": 1,
+                "orientation_disagreeing_pairs": 0,
+                "agreement_rate": 1.0
+            })
+        );
+        let stats = parsed["statistics"].as_array().unwrap();
+        let endpoint_agree: u64 = stats
+            .iter()
+            .map(|stat| stat["agreement_count"].as_u64().unwrap())
+            .sum();
+        assert_eq!(endpoint_agree, 2);
+        assert_eq!(
+            parsed["run"]["orientation_agreement"]["orientation_agreeing_pairs"],
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn judge_run_with_zero_expected_pairs_keeps_empty_collections() {
+        let (output, failed_pairs) = collect_exec(
+            &OkProvider,
+            &config(&["m0"], Some("judge")),
+            |_| {},
+            |_| {},
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed_pairs, 0);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&persist::to_pretty_json(&output).unwrap()).unwrap();
+        assert_eq!(parsed["run"]["complete"], true);
+        assert_eq!(parsed["run"]["expected_pairs"], 0);
+        assert_eq!(parsed["run"]["resolved_pairs"], 0);
+        assert_eq!(parsed["run"]["failed_pairs"], 0);
+        assert_eq!(
+            parsed["run"]["orientation_agreement"]["agreement_rate"],
+            0.0
+        );
+        assert_eq!(parsed["judgments"].as_array().unwrap().len(), 0);
+        assert_eq!(parsed["judgment_failures"].as_array().unwrap().len(), 0);
+        assert_eq!(parsed["statistics"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["ratings"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["ratings"][0]["unavailable"], "no_comparisons");
+        assert!(parsed["ratings"][0]["rating"].is_null());
+        assert!(parsed["ratings"][0].get("rating_lower").is_none());
+        assert!(parsed["ratings"][0].get("rating_upper").is_none());
+    }
+
+    #[derive(Clone)]
+    struct FailM0M1Judge;
+
+    impl ModelProvider for FailM0M1Judge {
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> std::result::Result<CompletionResponse, ProviderError> {
+            if request.model == ModelId::new("judge") {
+                let involves_m0 = request.prompt.contains("\nm0\n");
+                let involves_m1 = request.prompt.contains("\nm1\n");
+                if involves_m0 && involves_m1 {
+                    return Ok(CompletionResponse {
+                        text: "not a judgment".into(),
+                    });
+                }
+                return Ok(CompletionResponse {
+                    text: r#"{"winner":"a","reason":"ok"}"#.into(),
+                });
+            }
+            Ok(CompletionResponse {
+                text: request.model.to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_judge_run_keeps_resolved_and_failed_coverage() {
+        let (output, failed_pairs) = collect_exec(
+            &FailM0M1Judge,
+            &config(&["m0", "m1", "m2"], Some("judge")),
+            |_| {},
+            |_| {},
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed_pairs, 1);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&persist::to_pretty_json(&output).unwrap()).unwrap();
+        assert_eq!(parsed["run"]["complete"], false);
+        assert_eq!(parsed["run"]["expected_pairs"], 3);
+        assert_eq!(parsed["run"]["resolved_pairs"], 2);
+        assert_eq!(parsed["run"]["failed_pairs"], 1);
+        assert_eq!(parsed["judgments"].as_array().unwrap().len(), 2);
+        assert_eq!(parsed["judgment_failures"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["ratings"].as_array().unwrap().len(), 3);
+        assert_eq!(parsed["run"]["orientation_agreement"]["resolved_pairs"], 2);
+        assert_eq!(
+            parsed["run"]["orientation_agreement"]["orientation_disagreeing_pairs"],
+            2
+        );
     }
 }

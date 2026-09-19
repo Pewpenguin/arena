@@ -81,7 +81,7 @@ Tasks are defined as a JSON array. Task IDs must be unique. Unknown fields are r
 
 Exact evaluation trims the candidate response and compares it with `expected`. A match scores `1.0`; otherwise it scores `0.0`. The comparison is case-sensitive.
 
-Exact evaluation and LLM judging are separate. Exact scores produce `comparisons`; `--judge` produces `judgments`, `statistics`, and `ratings`.
+Exact evaluation and LLM judging are separate. Exact scores produce `comparisons`. `--judge` always produces `judgments`, `judgment_failures`, `statistics`, `ratings`, and pair-coverage metadata, including when those collections are empty. Those fields are omitted only when `--judge` is not used.
 
 ## Judging
 
@@ -102,22 +102,39 @@ Each orientation is tried up to three times (a 1s backoff, then 2s) for provider
 
 Judge requests set `temperature` to `0`. That is persisted as `run.judge_decoding` and applies only to judge calls, not candidate generation. Temperature 0 asks the provider for deterministic decoding; it does not guarantee identical completions across providers or models.
 
-Both orientations must succeed to produce a resolved judgment. A permanently failed pair is omitted from `judgments` (it is not a draw) and recorded in `judgment_failures`. The run still writes its output, then exits non-zero. `run.complete` is `true` only when every expected unordered model pair across the loaded tasks produced a resolved judgment and `failed_pairs` is 0. Missing judgments can disconnect or separate the comparison graph, and the gaps need not be random. Statistics and ratings from an incomplete run describe only the observed pairs and should not be read as if every pair had been observed.
+Both orientations must succeed to produce a resolved judgment. A permanently failed pair is omitted from `judgments` (it is not a draw) and recorded in `judgment_failures`. The run still writes its output, then exits non-zero.
+
+Coverage is counted in unordered pairs, not orientations. `expected_pairs` is the number of unordered candidate pairs across the loaded tasks. `resolved_pairs` is the number of persisted resolved judgments. `failed_pairs` is the number of permanently failed pairs. For a finished judge run, `resolved_pairs + failed_pairs == expected_pairs`. A mismatch is reported as an error rather than rewritten in the JSON.
+
+`run.complete` is `true` only when `resolved_pairs == expected_pairs` and `failed_pairs` is 0. That includes a complete run with zero expected pairs (for example a single candidate). It is `false` when any expected pair failed, including when every expected pair failed and `judgments` is an empty array. Missing judgments can disconnect or separate the comparison graph, and the gaps need not be random. Statistics and ratings from an incomplete run describe only the observed pairs and should not be read as if every pair had been observed.
+
+`run.orientation_agreement` counts each resolved unordered pair once: `orientation_agreeing_pairs`, `orientation_disagreeing_pairs`, and `agreement_rate` (`orientation_agreeing_pairs / resolved_pairs`, or `0.0` when there are no resolved pairs). That summary is the pair-level agreement metric. Per-model `agreement_count` / `disagreement_count` attribute the same pair to both endpoints; they are not additional independent observations, and they are not a position-bias estimate.
 
 ## Output
 
 `arena exec` produces one JSON object with these fields:
 
-- `run` — version, models, judge, task path, resolved provider `base_url`, start time, provider concurrency, request/connect timeouts, candidate/judge attempt counts, and, when a judge is used, `complete`, `expected_pairs`, `resolved_pairs`, `failed_pairs`, `judge_decoding`, `bootstrap_seed`, `bootstrap_replicates`, `bootstrap_clusters`, and `bootstrap_ran`. `bootstrap_valid` is present only when the resampling loop ran. `bootstrap_unavailable` is present when interval bounds were not produced. Completeness and bootstrap fields are omitted when `--judge` is not used.
+- `run` — version, models, judge, task path, resolved provider `base_url`, start time, provider concurrency, request/connect timeouts, and candidate/judge attempt counts. Judge-only fields below are omitted when `--judge` is not used.
 - `tasks` — the loaded task definitions (id, prompt, optional exact evaluation)
 - `results` — model responses, evaluations, and durations
 - `comparisons` — pairwise comparisons from exact scores
 - `judgments` — resolved LLM-judge results, both orientation winners, both orientation reasons, and both raw judge completions
 - `judgment_failures` — pairwise judge attempts that never produced both orientations
-- `statistics` — per-model wins, losses, draws, and judge agreement
-- `ratings` — full-data Bradley–Terry point estimates from resolved judgments, on a 400-point scale centered at 1500, with optional 95% percentile bounds and an `unavailable` reason when a finite rating was not produced
+- `statistics` — per-model wins, losses, draws, and per-model orientation-agreement counts among that model's pairs
+- `ratings` — one record per requested candidate: a full-data Bradley–Terry point estimate from resolved judgments, on a 400-point scale centered at 1500, optional 95% percentile bounds, or `rating: null` with an `unavailable` reason
 
-`expected_pairs` is the number of unordered model pairs across the loaded tasks. `resolved_pairs` is the number of persisted resolved judgments. `failed_pairs` is the number of failed judgment pairs. `complete` is true only when those resolved and failed counts match a finished pairwise experiment (`resolved_pairs == expected_pairs` and `failed_pairs == 0`). The process still exits non-zero on incomplete judging; the JSON is the record of completeness, not the exit code.
+When `--judge` is used, `judgments`, `judgment_failures`, `statistics`, and `ratings` are always present. Empty arrays mean the judge ran and that collection has no entries. Absence of those keys means no judge was configured. `results` and `comparisons` keep their existing schema.
+
+Judge-run `run` fields:
+
+- `expected_pairs`, `resolved_pairs`, `failed_pairs` — unordered-pair coverage. `complete` is true only when `resolved_pairs == expected_pairs` and `failed_pairs == 0`.
+- `orientation_agreement` — pair-level orientation agreement: `resolved_pairs`, `orientation_agreeing_pairs`, `orientation_disagreeing_pairs`, `agreement_rate`. Each unordered resolved pair is counted once. `agreement_rate` is agreeing / resolved, or `0.0` when `resolved_pairs` is 0. This is not a measure of position bias.
+- `judge_decoding` — judge request decoding (temperature 0)
+- `bootstrap_seed`, `bootstrap_replicates`, `bootstrap_clusters`, `bootstrap_ran` — bootstrap request and whether resampling ran
+- `bootstrap_valid` — finite replicate count; present only when the resampling loop ran
+- `bootstrap_unavailable` — why interval bounds were not produced (`too_few_tasks`, `original_unrated`, or `invalid_replicates`)
+
+The process still exits non-zero on incomplete judging; the JSON is the record of completeness, not the exit code. Requested candidates remain in `ratings` even with no resolved judgments: `rating` is `null`, bounds are omitted, and `unavailable` is set (typically `no_comparisons`).
 
 `results[].duration_ms` is the total candidate execution duration after it acquires a provider permit, including retries and retry backoff.
 
@@ -125,7 +142,7 @@ Both orientations must succeed to produce a resolved judgment. A permanently fai
 
 Results retain task-file and CLI model order. Statistics and ratings are ordered by model ID.
 
-The saved run is an audit of one execution: models, judge, task file path, the loaded tasks, the provider base URL, Arena-controlled concurrency, timeout, and retry-attempt settings, and, when a judge is used, pairwise completeness, the judge decoding configuration, and bootstrap metadata. It does not store API keys. Candidate completions use the provider default decoding and are not deterministic. Judge calls request `temperature` 0, but providers and models may still vary. `--seed` only controls the bootstrap RNG and does not make model completions deterministic. When intervals were produced, the same seed reproduces them from the persisted judgments. Raw judge completions are kept so a later audit can see what was parsed.
+The saved run is an audit of one execution: models, judge, task file path, the loaded tasks, the provider base URL, Arena-controlled concurrency, timeout, and retry-attempt settings, and, when a judge is used, pairwise coverage, pair-level orientation agreement, the judge decoding configuration, rating availability, and bootstrap metadata. It does not store API keys. Candidate completions use the provider default decoding and are not deterministic. Judge calls request `temperature` 0, but providers and models may still vary. `--seed` only controls the bootstrap RNG and does not make model completions deterministic. When intervals were produced, the same seed reproduces them from the persisted judgments. Raw judge completions are kept so a later audit can see what was parsed.
 
 ## Ratings
 
