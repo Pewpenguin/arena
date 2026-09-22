@@ -198,7 +198,14 @@ fn format_percent(rate: f64) -> String {
 fn rating_cell(value: Option<f64>) -> String {
     match value {
         Some(value) => format_rating(value),
-        None => "unavailable".into(),
+        None => "rating unavailable".into(),
+    }
+}
+
+fn bound_cell(value: Option<f64>) -> String {
+    match value {
+        Some(value) => format_rating(value),
+        None => "interval unavailable".into(),
     }
 }
 
@@ -323,32 +330,44 @@ fn push_models(html: &mut String, models: &[ModelReport<'_>], judge_used: bool) 
         html.push_str(
             "<p class=\"note\">Bradley–Terry rating · derived from resolved pairwise judgments</p>\n",
         );
-    }
-    html.push_str("<div class=\"scroll\"><table>\n<thead><tr>");
-    html.push_str(
-        "<th>Model</th><th>W</th><th>L</th><th>D</th><th>Total</th><th>Rating</th><th>Lower bound</th><th>Upper bound</th><th>Unavailable reason</th>",
-    );
-    html.push_str("</tr></thead>\n<tbody>\n");
-    for model in models {
-        html.push_str("<tr><td class=\"model-id\">");
-        html.push_str(&escape(&model.model.to_string()));
-        html.push_str("</td><td>");
-        html.push_str(&model.wins.to_string());
-        html.push_str("</td><td>");
-        html.push_str(&model.losses.to_string());
-        html.push_str("</td><td>");
-        html.push_str(&model.draws.to_string());
-        html.push_str("</td><td>");
-        html.push_str(&model.total.to_string());
-        html.push_str("</td><td>");
-        html.push_str(&rating_cell(model.rating));
-        html.push_str("</td><td>");
-        html.push_str(&rating_cell(model.rating_lower));
-        html.push_str("</td><td>");
-        html.push_str(&rating_cell(model.rating_upper));
-        html.push_str("</td><td>");
-        html.push_str(model.unavailable.map(unavailable).unwrap_or(""));
-        html.push_str("</td></tr>\n");
+        html.push_str("<div class=\"scroll\"><table>\n<thead><tr>");
+        html.push_str(
+            "<th>Model</th><th>W</th><th>L</th><th>D</th><th>Total</th><th>Rating</th><th>Lower bound</th><th>Upper bound</th><th>Unavailable reason</th>",
+        );
+        html.push_str("</tr></thead>\n<tbody>\n");
+        for model in models {
+            html.push_str("<tr><td class=\"model-id\">");
+            html.push_str(&escape(&model.model.to_string()));
+            html.push_str("</td><td>");
+            html.push_str(&model.wins.to_string());
+            html.push_str("</td><td>");
+            html.push_str(&model.losses.to_string());
+            html.push_str("</td><td>");
+            html.push_str(&model.draws.to_string());
+            html.push_str("</td><td>");
+            html.push_str(&model.total.to_string());
+            html.push_str("</td><td>");
+            html.push_str(&rating_cell(model.rating));
+            html.push_str("</td><td>");
+            html.push_str(&bound_cell(model.rating_lower));
+            html.push_str("</td><td>");
+            html.push_str(&bound_cell(model.rating_upper));
+            html.push_str("</td><td>");
+            html.push_str(model.unavailable.map(unavailable).unwrap_or(""));
+            html.push_str("</td></tr>\n");
+        }
+    } else {
+        html.push_str(
+            "<p class=\"note\">Requested candidate models. Pairwise outcomes and ratings are omitted because no judge was configured.</p>\n",
+        );
+        html.push_str("<div class=\"scroll\"><table>\n<thead><tr>");
+        html.push_str("<th>Model</th>");
+        html.push_str("</tr></thead>\n<tbody>\n");
+        for model in models {
+            html.push_str("<tr><td class=\"model-id\">");
+            html.push_str(&escape(&model.model.to_string()));
+            html.push_str("</td></tr>\n");
+        }
     }
     html.push_str("</tbody></table></div>\n</section>\n");
 }
@@ -383,7 +402,7 @@ fn push_results(html: &mut String, results: &[CandidateRow<'_>]) {
 fn push_pairs(html: &mut String, pairs: &[PairRow<'_>]) {
     html.push_str("<section>\n<h2>Pairwise results</h2>\n");
     html.push_str(
-        "<p class=\"note\">Resolved judgments are the primary observations. Orientation disagreement is recorded, not interpreted as position bias.</p>\n",
+        "<p class=\"note\">Resolved judgments are the primary observations. AB and BA winners are mapped into the original A/B model identities. Orientation disagreement is recorded, not interpreted as position bias.</p>\n",
     );
     if pairs.is_empty() {
         html.push_str("<p>No resolved judgments.</p>\n</section>\n");
@@ -428,7 +447,7 @@ fn push_audit(html: &mut String, pairs: &[PairRow<'_>]) {
     }
     html.push_str("<section class=\"secondary\">\n<h2>Audit details</h2>\n");
     html.push_str(
-        "<p class=\"note\">Raw judge completions and orientation records. Secondary to the pairwise outcomes above.</p>\n",
+        "<p class=\"note\">Orientation results are mapped into the original A/B model identities. Raw judge completions are the unmapped prompt-frame text, including BA before that mapping.</p>\n",
     );
     for pair in pairs {
         html.push_str("<details>\n<summary>");
@@ -449,21 +468,21 @@ fn push_audit(html: &mut String, pairs: &[PairRow<'_>]) {
         );
         dt_dd(
             html,
-            "AB winner",
+            "AB winner (original A/B frame)",
             &opt_decision(pair.orientation_ab.as_ref()),
         );
         dt_dd(
             html,
-            "BA winner",
+            "BA winner (original A/B frame)",
             &opt_decision(pair.orientation_ba.as_ref()),
         );
         dt_dd(html, "Reason AB", &opt_text(pair.reason_ab));
         dt_dd(html, "Reason BA", &opt_text(pair.reason_ba));
         dt_dd(html, "Duration", &format!("{} ms", pair.duration_ms));
-        html.push_str("<dt>Raw AB completion</dt><dd><pre>");
+        html.push_str("<dt>Raw AB judge completion (AB prompt frame)</dt><dd><pre>");
         html.push_str(&opt_text(pair.raw_ab));
         html.push_str("</pre></dd>\n");
-        html.push_str("<dt>Raw BA completion</dt><dd><pre>");
+        html.push_str("<dt>Raw BA judge completion (BA prompt frame)</dt><dd><pre>");
         html.push_str(&opt_text(pair.raw_ba));
         html.push_str("</pre></dd>\n");
         html.push_str("</dl>\n</details>\n");
@@ -529,7 +548,7 @@ fn push_bootstrap(html: &mut String, bootstrap: &BootstrapReport) {
         if bootstrap.bounds_present {
             "present"
         } else {
-            "unavailable"
+            "interval unavailable"
         },
     );
     html.push_str("</div>\n<dl>\n");
@@ -781,6 +800,49 @@ mod tests {
         assert!(!html.contains("Failed judgments"));
         assert!(!html.contains("Bootstrap"));
         assert!(!html.contains("no_comparisons"));
+        assert!(!html.contains("<th>W</th>"));
+        assert!(!html.contains("<th>Rating</th>"));
+        assert!(!html.contains("rating unavailable"));
+        assert!(!html.contains("interval unavailable"));
+    }
+
+    #[test]
+    fn no_judge_report_does_not_render_win_loss_or_rating_columns() {
+        let data = output(
+            run_meta(&["m0", "m1"], None),
+            vec![task("t1")],
+            vec![EvaluatedResult {
+                task_id: "t1".into(),
+                model: ModelId::new("m0"),
+                response: CompletionResponse {
+                    text: "hello".into(),
+                },
+                evaluation: None,
+                duration_ms: 5,
+            }],
+            None,
+            None,
+            None,
+            None,
+        );
+        let html = render_output(&data);
+        assert!(html.contains("No judge"));
+        assert!(html.contains("m0"));
+        assert!(html.contains("m1"));
+        assert!(html.contains("Requested candidate models"));
+        assert!(html.contains("<th>Model</th>"));
+        assert!(!html.contains("<th>W</th>"));
+        assert!(!html.contains("<th>L</th>"));
+        assert!(!html.contains("<th>D</th>"));
+        assert!(!html.contains("<th>Total</th>"));
+        assert!(!html.contains("<th>Rating</th>"));
+        assert!(!html.contains("<th>Lower bound</th>"));
+        assert!(!html.contains("<th>Upper bound</th>"));
+        assert!(!html.contains("<th>Unavailable reason</th>"));
+        assert!(!html.contains("Bradley–Terry"));
+        assert!(!html.contains("rating unavailable"));
+        assert!(!html.contains("interval unavailable"));
+        assert!(!html.contains(">0</td>"));
     }
 
     #[test]
@@ -847,11 +909,50 @@ mod tests {
         assert!(html.contains("a &lt; b &amp; c"));
         assert!(html.contains("&lt;/pre&gt;&lt;script&gt;alert(1)&lt;/script&gt;"));
         assert!(!html.contains("</pre><script>alert(1)</script>"));
-        assert!(html.contains("Raw AB completion"));
+        assert!(html.contains("Raw AB judge completion (AB prompt frame)"));
+        assert!(html.contains("Raw BA judge completion (BA prompt frame)"));
         assert!(
             html.contains("{&quot;winner&quot;:&quot;b&quot;,&quot;reason&quot;:&quot;ba&quot;}")
         );
         assert!(!html.contains("{\"winner\":\"b\",\"reason\":\"ba\"}"));
+    }
+
+    #[test]
+    fn audit_distinguishes_mapped_ba_winner_from_raw_ba_prompt_frame() {
+        let mut mapped = judgment();
+        mapped.orientation_ba = Some(JudgeDecision::B);
+        mapped.raw_ba = Some(r#"{"winner":"a","reason":"position a in BA prompt"}"#.into());
+        let data = output(
+            run_meta(&["m0", "m1"], Some("judge"))
+                .with_judge_coverage(1, 1, 0)
+                .with_orientation_agreement(stats::pair_agreement(&[mapped.clone()])),
+            vec![task("t1")],
+            vec![],
+            Some(vec![mapped]),
+            Some(vec![]),
+            None,
+            None,
+        );
+        let html = render_output(&data);
+        assert!(html.contains("mapped into the original A/B model identities"));
+        assert!(html.contains("AB winner (original A/B frame)"));
+        assert!(html.contains("BA winner (original A/B frame)"));
+        assert!(html.contains("Raw BA judge completion (BA prompt frame)"));
+        assert!(html.contains("Raw AB judge completion (AB prompt frame)"));
+        let ba_winner = html.find("BA winner (original A/B frame)").unwrap();
+        let ba_raw = html
+            .find("Raw BA judge completion (BA prompt frame)")
+            .unwrap();
+        assert!(ba_winner < ba_raw);
+        let after_ba_winner = &html[ba_winner..ba_raw];
+        assert!(
+            after_ba_winner.contains(">B<"),
+            "mapped BA winner should be B in the original A/B frame: {after_ba_winner}"
+        );
+        assert!(
+            html.contains("{&quot;winner&quot;:&quot;a&quot;,&quot;reason&quot;:&quot;position a in BA prompt&quot;}"),
+            "raw BA JSON must remain the unmapped prompt-frame completion"
+        );
     }
 
     #[test]
@@ -892,7 +993,9 @@ mod tests {
         assert!(html.contains("744"));
         assert!(html.contains("invalid_replicates"));
         assert!(html.contains("Rating intervals"));
-        assert!(html.contains("unavailable"));
+        assert!(html.contains("interval unavailable"));
+        assert!(!html.contains("rating unavailable"));
+        assert!(html.contains("1500.00"));
         assert!(html.contains(">yes<"));
         assert!(!html.contains("implementation failed"));
         assert!(!html.contains("bootstrap failed"));
@@ -942,8 +1045,82 @@ mod tests {
         assert!(html.contains("m2"));
         assert!(html.contains("1595.42"));
         assert!(!html.contains("1595.4242509439325"));
-        assert!(html.contains("unavailable"));
+        assert!(html.contains("rating unavailable"));
+        assert!(html.contains("interval unavailable"));
         assert!(html.contains("no_comparisons"));
         assert!(html.contains("Bradley–Terry rating · derived from resolved pairwise judgments"));
+    }
+
+    #[test]
+    fn point_rating_stays_visible_when_bootstrap_bounds_are_absent() {
+        let data = output(
+            run_meta(&["m0", "m1"], Some("judge"))
+                .with_judge_coverage(1, 1, 0)
+                .with_orientation_agreement(PairAgreement {
+                    resolved_pairs: 1,
+                    orientation_agreeing_pairs: 1,
+                    orientation_disagreeing_pairs: 0,
+                    agreement_rate: 1.0,
+                })
+                .with_bootstrap(&BootstrapMeta {
+                    seed: 0,
+                    replicates: 1000,
+                    valid: Some(744),
+                    clusters: 2,
+                    ran: true,
+                    unavailable: Some(BootstrapUnavailable::InvalidReplicates),
+                }),
+            vec![task("t1")],
+            vec![],
+            Some(vec![]),
+            Some(vec![]),
+            Some(stats::aggregate(
+                &[],
+                &[ModelId::new("m0"), ModelId::new("m1")],
+            )),
+            Some(vec![
+                ModelRating {
+                    model: ModelId::new("m0"),
+                    rating: Some(1595.4242509439325),
+                    rating_lower: None,
+                    rating_upper: None,
+                    unavailable: None,
+                },
+                ModelRating {
+                    model: ModelId::new("m1"),
+                    rating: None,
+                    rating_lower: None,
+                    rating_upper: None,
+                    unavailable: Some(UnavailableReason::NoComparisons),
+                },
+            ]),
+        );
+        let html = render_output(&data);
+        assert!(html.contains("1595.42"));
+        assert!(html.contains("interval unavailable"));
+        assert!(html.contains("rating unavailable"));
+        assert!(html.contains("no_comparisons"));
+        assert!(html.contains("invalid_replicates"));
+        let rating_header = html.find("<th>Rating</th>").unwrap();
+        let lower_header = html.find("<th>Lower bound</th>").unwrap();
+        let m0 = html.find("m0").unwrap();
+        let m1 = html.find(">m1<").or_else(|| html.find("m1")).unwrap();
+        assert!(rating_header < lower_header);
+        assert!(
+            html[m0..m1].contains("1595.42"),
+            "point rating must remain visible on the rated model"
+        );
+        assert!(
+            !html[m0..m1].contains("rating unavailable"),
+            "a present point rating must not be labeled rating unavailable"
+        );
+        assert!(
+            html[m0..m1].contains("interval unavailable"),
+            "missing bootstrap bounds must be labeled interval unavailable"
+        );
+        assert!(
+            html[m1..].contains("rating unavailable"),
+            "a missing point rating must stay distinguishable as rating unavailable"
+        );
     }
 }

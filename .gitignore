@@ -24,3 +24,6 @@ results.json
 complete.json
 no-judge.json
 tasks-small.json
+complete.html
+no-judge.html
+report.html
