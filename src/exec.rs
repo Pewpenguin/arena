@@ -1,10 +1,13 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use tokio::sync::mpsc;
+
 use crate::bootstrap;
 use crate::compare::compare_all;
 use crate::error::{Error, Result};
 use crate::evaluate::evaluate_result;
+use crate::event::ExperimentEvent;
 use crate::execute::{ExecutionResult, execute_models};
 use crate::judge::{Judgment, JudgmentFailure, judge_pairs};
 use crate::persist::{self, Output, RunMetadata};
@@ -50,9 +53,48 @@ pub fn expected_pairs(task_count: usize, model_count: usize) -> usize {
 pub async fn collect_exec<P>(
     provider: &P,
     config: &ExecConfig,
+    on_candidate: impl FnMut(&ExecutionResult),
+    on_judgment: impl FnMut(&Judgment),
+    on_failure: impl FnMut(&JudgmentFailure),
+) -> Result<(Output, usize)>
+where
+    P: ModelProvider + Clone + Send + 'static,
+{
+    collect_exec_inner(
+        provider,
+        config,
+        on_candidate,
+        on_judgment,
+        on_failure,
+        None,
+    )
+    .await
+}
+
+pub async fn collect_exec_with_events<P>(
+    provider: &P,
+    config: &ExecConfig,
+    events: mpsc::UnboundedSender<ExperimentEvent>,
+) -> Result<(Output, usize)>
+where
+    P: ModelProvider + Clone + Send + 'static,
+{
+    collect_exec_inner(provider, config, |_| {}, |_| {}, |_| {}, Some(events)).await
+}
+
+fn emit_event(events: &Option<mpsc::UnboundedSender<ExperimentEvent>>, event: ExperimentEvent) {
+    if let Some(tx) = events {
+        let _ = tx.send(event);
+    }
+}
+
+async fn collect_exec_inner<P>(
+    provider: &P,
+    config: &ExecConfig,
     mut on_candidate: impl FnMut(&ExecutionResult),
     mut on_judgment: impl FnMut(&Judgment),
     mut on_failure: impl FnMut(&JudgmentFailure),
+    events: Option<mpsc::UnboundedSender<ExperimentEvent>>,
 ) -> Result<(Output, usize)>
 where
     P: ModelProvider + Clone + Send + 'static,
@@ -60,7 +102,18 @@ where
     validate_judge(&config.models, config.judge.as_ref())?;
     let mut results = Vec::new();
     for task in &config.tasks {
-        let executed = execute_models(provider, task, &config.models, &mut on_candidate).await?;
+        let executed = execute_models(provider, task, &config.models, |result| {
+            on_candidate(result);
+            emit_event(
+                &events,
+                ExperimentEvent::CandidateFinished {
+                    task_id: result.task_id.clone(),
+                    model: result.model.clone(),
+                    duration_ms: result.duration_ms,
+                },
+            );
+        })
+        .await?;
         for result in executed {
             results.push(evaluate_result(task, result));
         }
@@ -85,8 +138,28 @@ where
                 &mut on_judgment,
             )
             .await?;
+            for judgment in &outcome.judgments {
+                emit_event(
+                    &events,
+                    ExperimentEvent::PairResolved {
+                        task_id: judgment.task_id.clone(),
+                        model_a: judgment.model_a.clone(),
+                        model_b: judgment.model_b.clone(),
+                        judgment: judgment.clone(),
+                    },
+                );
+            }
             for failure in &outcome.failures {
                 on_failure(failure);
+                emit_event(
+                    &events,
+                    ExperimentEvent::PairFailed {
+                        task_id: failure.task_id.clone(),
+                        model_a: failure.model_a.clone(),
+                        model_b: failure.model_b.clone(),
+                        failure: failure.clone(),
+                    },
+                );
             }
             judgments.extend(outcome.judgments);
             judgment_failures.extend(outcome.failures);
@@ -100,36 +173,48 @@ where
         config.started_at.clone(),
         config.base_url.clone(),
     );
-    let (judgments, judgment_failures, statistics, ratings) = if config.judge.is_some() {
-        let statistics = stats::aggregate(&judgments, &config.models);
-        let (ratings, meta) =
-            bootstrap::rate_with_uncertainty(&judgments, &config.models, config.seed);
-        run = run.with_bootstrap(&meta);
-        let expected = expected_pairs(config.tasks.len(), config.models.len());
-        let resolved = judgments.len();
-        let failed = judgment_failures.len();
-        if expected != resolved + failed {
-            return Err(Error::InconsistentPairCoverage {
+    let (judgments, judgment_failures, statistics, ratings, expected, resolved, failed) =
+        if config.judge.is_some() {
+            let statistics = stats::aggregate(&judgments, &config.models);
+            let (ratings, meta) =
+                bootstrap::rate_with_uncertainty(&judgments, &config.models, config.seed);
+            run = run.with_bootstrap(&meta);
+            let expected = expected_pairs(config.tasks.len(), config.models.len());
+            let resolved = judgments.len();
+            let failed = judgment_failures.len();
+            if expected != resolved + failed {
+                return Err(Error::InconsistentPairCoverage {
+                    expected,
+                    resolved,
+                    failed,
+                });
+            }
+            run = run
+                .with_judge_coverage(expected, resolved, failed)
+                .with_orientation_agreement(stats::pair_agreement(&judgments))
+                .with_judge_decoding(persist::JudgeDecoding::arena_default());
+            (
+                Some(judgments),
+                Some(judgment_failures),
+                Some(statistics),
+                Some(ratings),
                 expected,
                 resolved,
                 failed,
-            });
-        }
-        run = run
-            .with_judge_coverage(expected, resolved, failed)
-            .with_orientation_agreement(stats::pair_agreement(&judgments))
-            .with_judge_decoding(persist::JudgeDecoding::arena_default());
-        (
-            Some(judgments),
-            Some(judgment_failures),
-            Some(statistics),
-            Some(ratings),
-        )
-    } else {
-        (None, None, None, None)
-    };
+            )
+        } else {
+            (None, None, None, None, 0, 0, 0)
+        };
 
-    let failed_pairs = judgment_failures.as_ref().map_or(0, Vec::len);
+    emit_event(
+        &events,
+        ExperimentEvent::RunComplete {
+            expected_pairs: expected,
+            resolved_pairs: resolved,
+            failed_pairs: failed,
+        },
+    );
+
     Ok((
         Output {
             run,
@@ -141,7 +226,7 @@ where
             statistics,
             ratings,
         },
-        failed_pairs,
+        failed,
     ))
 }
 
@@ -179,6 +264,8 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use crate::event::ExperimentEvent;
+    use crate::judge::JudgeDecision;
     use crate::provider::{CompletionRequest, CompletionResponse, ProviderError};
 
     fn sample_task() -> Task {
@@ -645,5 +732,218 @@ mod tests {
             parsed["run"]["orientation_agreement"]["orientation_disagreeing_pairs"],
             2
         );
+    }
+
+    async fn drain_events(
+        mut rx: mpsc::UnboundedReceiver<ExperimentEvent>,
+    ) -> Vec<ExperimentEvent> {
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        events
+    }
+
+    fn candidate_finished(events: &[ExperimentEvent]) -> Vec<&ExperimentEvent> {
+        events
+            .iter()
+            .filter(|event| matches!(event, ExperimentEvent::CandidateFinished { .. }))
+            .collect()
+    }
+
+    fn pair_resolved(events: &[ExperimentEvent]) -> Vec<&ExperimentEvent> {
+        events
+            .iter()
+            .filter(|event| matches!(event, ExperimentEvent::PairResolved { .. }))
+            .collect()
+    }
+
+    fn pair_failed(events: &[ExperimentEvent]) -> Vec<&ExperimentEvent> {
+        events
+            .iter()
+            .filter(|event| matches!(event, ExperimentEvent::PairFailed { .. }))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn candidate_finished_emits_one_event_with_task_and_model() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (output, failed_pairs) =
+            collect_exec_with_events(&OkProvider, &config(&["m0"], None), tx)
+                .await
+                .unwrap();
+        assert_eq!(failed_pairs, 0);
+        let events = drain_events(rx).await;
+        let finished = candidate_finished(&events);
+        assert_eq!(finished.len(), 1);
+        match finished[0] {
+            ExperimentEvent::CandidateFinished {
+                task_id,
+                model,
+                duration_ms: _,
+            } => {
+                assert_eq!(task_id, "t1");
+                assert_eq!(*model, ModelId::new("m0"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert_eq!(output.results[0].task_id, "t1");
+        assert_eq!(output.results[0].model, ModelId::new("m0"));
+    }
+
+    #[tokio::test]
+    async fn pair_resolution_emits_one_event_for_the_unordered_pair() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        collect_exec_with_events(&PrefersM0, &config(&["m0", "m1"], Some("judge")), tx)
+            .await
+            .unwrap();
+        let events = drain_events(rx).await;
+        assert_eq!(pair_resolved(&events).len(), 1);
+        assert!(pair_failed(&events).is_empty());
+        match pair_resolved(&events)[0] {
+            ExperimentEvent::PairResolved {
+                task_id,
+                model_a,
+                model_b,
+                judgment,
+            } => {
+                assert_eq!(task_id, "t1");
+                assert_eq!(*model_a, ModelId::new("m0"));
+                assert_eq!(*model_b, ModelId::new("m1"));
+                assert_eq!(judgment.model_a, ModelId::new("m0"));
+                assert_eq!(judgment.model_b, ModelId::new("m1"));
+                assert_eq!(judgment.winner, JudgeDecision::A);
+                assert!(judgment.agreement);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn orientation_disagreement_emits_one_resolved_draw() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        collect_exec_with_events(&OkProvider, &config(&["m0", "m1"], Some("judge")), tx)
+            .await
+            .unwrap();
+        let events = drain_events(rx).await;
+        assert_eq!(pair_resolved(&events).len(), 1);
+        assert!(pair_failed(&events).is_empty());
+        match pair_resolved(&events)[0] {
+            ExperimentEvent::PairResolved { judgment, .. } => {
+                assert_eq!(judgment.winner, JudgeDecision::Draw);
+                assert!(!judgment.agreement);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn orientation_failure_emits_one_pair_failed_and_no_resolved_pair() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (output, failed_pairs) =
+            collect_exec_with_events(&FailJudge, &config(&["m0", "m1"], Some("judge")), tx)
+                .await
+                .unwrap();
+        assert_eq!(failed_pairs, 1);
+        let events = drain_events(rx).await;
+        assert!(pair_resolved(&events).is_empty());
+        assert_eq!(pair_failed(&events).len(), 1);
+        match pair_failed(&events)[0] {
+            ExperimentEvent::PairFailed {
+                task_id,
+                model_a,
+                model_b,
+                failure,
+            } => {
+                assert_eq!(task_id, "t1");
+                assert_eq!(*model_a, ModelId::new("m0"));
+                assert_eq!(*model_b, ModelId::new("m1"));
+                assert_eq!(failure.task_id, "t1");
+                assert_eq!(failure.model_a, ModelId::new("m0"));
+                assert_eq!(failure.model_b, ModelId::new("m1"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert_eq!(output.judgments.as_ref().map(Vec::len), Some(0));
+        assert_eq!(output.judgment_failures.as_ref().map(Vec::len), Some(1));
+    }
+
+    #[tokio::test]
+    async fn run_complete_follows_pair_events_with_correct_counts() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        collect_exec_with_events(
+            &FailM0M1Judge,
+            &config(&["m0", "m1", "m2"], Some("judge")),
+            tx,
+        )
+        .await
+        .unwrap();
+        let events = drain_events(rx).await;
+        let last = events.last().expect("events");
+        match last {
+            ExperimentEvent::RunComplete {
+                expected_pairs,
+                resolved_pairs,
+                failed_pairs,
+            } => {
+                assert_eq!(*expected_pairs, 3);
+                assert_eq!(*resolved_pairs, 2);
+                assert_eq!(*failed_pairs, 1);
+                assert_eq!(*resolved_pairs + *failed_pairs, *expected_pairs);
+            }
+            other => panic!("RunComplete must be last, got {other:?}"),
+        }
+        let complete_at = events
+            .iter()
+            .position(|event| matches!(event, ExperimentEvent::RunComplete { .. }))
+            .unwrap();
+        let last_pair = events
+            .iter()
+            .rposition(|event| {
+                matches!(
+                    event,
+                    ExperimentEvent::PairResolved { .. } | ExperimentEvent::PairFailed { .. }
+                )
+            })
+            .unwrap();
+        assert!(last_pair < complete_at);
+        assert_eq!(pair_resolved(&events).len(), 2);
+        assert_eq!(pair_failed(&events).len(), 1);
+        assert_eq!(candidate_finished(&events).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn no_judge_run_emits_no_pair_events_and_zero_pair_counts() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        collect_exec_with_events(&OkProvider, &config(&["m0", "m1"], None), tx)
+            .await
+            .unwrap();
+        let events = drain_events(rx).await;
+        assert_eq!(candidate_finished(&events).len(), 2);
+        assert!(pair_resolved(&events).is_empty());
+        assert!(pair_failed(&events).is_empty());
+        match events.last() {
+            Some(ExperimentEvent::RunComplete {
+                expected_pairs,
+                resolved_pairs,
+                failed_pairs,
+            }) => {
+                assert_eq!(*expected_pairs, 0);
+                assert_eq!(*resolved_pairs, 0);
+                assert_eq!(*failed_pairs, 0);
+            }
+            other => panic!("expected RunComplete, got {other:?}"),
+        }
+        let ids: Vec<_> = candidate_finished(&events)
+            .into_iter()
+            .map(|event| match event {
+                ExperimentEvent::CandidateFinished { task_id, model, .. } => {
+                    (task_id.as_str(), model.clone())
+                }
+                _ => unreachable!(),
+            })
+            .collect();
+        assert!(ids.contains(&("t1", ModelId::new("m0"))));
+        assert!(ids.contains(&("t1", ModelId::new("m1"))));
     }
 }

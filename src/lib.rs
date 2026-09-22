@@ -3,6 +3,7 @@ pub mod cli;
 pub mod compare;
 pub mod error;
 pub mod evaluate;
+pub mod event;
 pub mod exec;
 pub mod execute;
 pub mod html;
