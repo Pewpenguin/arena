@@ -34,6 +34,10 @@ pub enum Error {
         resolved: usize,
         failed: usize,
     },
+    #[error("at least one candidate model is required")]
+    NoCandidates,
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 }

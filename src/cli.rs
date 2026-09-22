@@ -35,4 +35,8 @@ pub enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    Web {
+        #[arg(long, default_value_t = 3030)]
+        port: u16,
+    },
 }

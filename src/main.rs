@@ -13,6 +13,7 @@ use arena::provider::{
 };
 use arena::report;
 use arena::task;
+use arena::web;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -114,6 +115,9 @@ async fn main() -> Result<()> {
             let report = report::from_output(&data);
             let html = html::render(&report);
             std::fs::write(&output, html).map_err(persist::PersistError::from)?;
+        }
+        Command::Web { port } => {
+            web::serve(port).await?;
         }
     }
 

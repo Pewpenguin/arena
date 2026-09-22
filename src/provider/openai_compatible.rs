@@ -5,7 +5,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    CONNECT_TIMEOUT, CompletionRequest, CompletionResponse, ModelProvider, ProviderError,
+    CONNECT_TIMEOUT, CompletionRequest, CompletionResponse, ModelId, ModelProvider, ProviderError,
     REQUEST_TIMEOUT,
 };
 
@@ -67,6 +67,38 @@ impl OpenAICompatibleProvider {
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
+
+    pub async fn list_models(&self) -> Result<Vec<ModelId>, ProviderError> {
+        let response = self
+            .client
+            .get(models_url(&self.base_url))
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .map_err(|error| ProviderError::RequestFailed(error.to_string()))?;
+
+        let status = response.status();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| ProviderError::RequestFailed(error.to_string()))?;
+
+        if !status.is_success() {
+            let body = String::from_utf8_lossy(&bytes);
+            return Err(ProviderError::RequestFailed(format!(
+                "HTTP {status}: {body}"
+            )));
+        }
+
+        let parsed: ModelsResponse = serde_json::from_slice(&bytes)
+            .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
+
+        Ok(parsed
+            .data
+            .into_iter()
+            .map(|model| ModelId::new(model.id))
+            .collect())
+    }
 }
 
 impl ModelProvider for OpenAICompatibleProvider {
@@ -124,6 +156,10 @@ fn chat_completions_url(base_url: &str) -> String {
     format!("{}/chat/completions", base_url.trim_end_matches('/'))
 }
 
+fn models_url(base_url: &str) -> String {
+    format!("{}/models", base_url.trim_end_matches('/'))
+}
+
 #[derive(Serialize)]
 struct ChatCompletionRequest {
     model: String,
@@ -153,6 +189,16 @@ struct ChatChoice {
 #[derive(Deserialize)]
 struct ChatResponseMessage {
     content: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ModelsResponse {
+    data: Vec<ModelListEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelListEntry {
+    id: String,
 }
 
 #[cfg(test)]
@@ -478,5 +524,60 @@ mod tests {
             matches!(error, ProviderError::RequestFailed(_)),
             "{error:?}"
         );
+    }
+
+    #[test]
+    fn models_url_joins_base_without_duplicate_slash() {
+        assert_eq!(
+            models_url("https://api.openai.com/v1"),
+            "https://api.openai.com/v1/models"
+        );
+        assert_eq!(
+            models_url("https://api.openai.com/v1/"),
+            "https://api.openai.com/v1/models"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_parses_openai_compatible_ids() {
+        let mock = start_mock(
+            200,
+            "OK",
+            r#"{"object":"list","data":[{"id":"alpha","object":"model","owned_by":"x"},{"id":"beta"}]}"#,
+        )
+        .await;
+        let provider = OpenAICompatibleProvider::new("test-key", mock.base_url.as_str());
+
+        let models = provider.list_models().await.expect("models");
+        let raw = mock.request.await.expect("captured request");
+        mock.handle.abort();
+
+        let request = String::from_utf8_lossy(&raw);
+        assert_eq!(request_path(&request), "/v1/models");
+        assert_eq!(
+            header_value(&request, "authorization").as_deref(),
+            Some("Bearer test-key")
+        );
+        assert_eq!(models, vec![ModelId::new("alpha"), ModelId::new("beta")]);
+    }
+
+    #[tokio::test]
+    async fn list_models_http_failure_does_not_expose_api_key() {
+        let mock = start_mock(401, "Unauthorized", r#"{"error":"invalid_api_key"}"#).await;
+        let provider = OpenAICompatibleProvider::new("super-secret-key", mock.base_url.as_str());
+
+        let error = provider.list_models().await.expect_err("http error");
+        let raw = mock.request.await.expect("captured request");
+        mock.handle.abort();
+
+        let request = String::from_utf8_lossy(&raw);
+        assert_eq!(
+            header_value(&request, "authorization").as_deref(),
+            Some("Bearer super-secret-key")
+        );
+        let message = error.to_string();
+        assert!(message.contains("HTTP 401"), "{message}");
+        assert!(!message.contains("super-secret-key"), "{message}");
+        assert!(!message.contains("Bearer"), "{message}");
     }
 }

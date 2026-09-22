@@ -15,6 +15,7 @@ use crate::provider::{ModelId, ModelProvider};
 use crate::stats;
 use crate::task::Task;
 
+#[derive(Debug)]
 pub struct ExecConfig {
     pub tasks: Vec<Task>,
     pub models: Vec<ModelId>,

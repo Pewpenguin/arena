@@ -36,7 +36,7 @@ pub fn load(path: impl AsRef<Path>) -> Result<Vec<Task>, TaskError> {
     parse(&contents)
 }
 
-fn parse(contents: &str) -> Result<Vec<Task>, TaskError> {
+pub(crate) fn parse(contents: &str) -> Result<Vec<Task>, TaskError> {
     let tasks: Vec<Task> = serde_json::from_str(contents)?;
     let mut seen = HashSet::new();
     for task in &tasks {
