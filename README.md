@@ -21,9 +21,9 @@ The core uses a `ModelProvider` trait. Arena uses an OpenAI-compatible API endpo
 
 ## Setup
 
-Requires Rust and Cargo.
+Requires Rust 1.88 or newer and Cargo.
 
-Arena uses an OpenAI-compatible API endpoint. Set the API key in `.env`:
+The `run` and `exec` commands use an OpenAI-compatible API endpoint. Set the API key in `.env`:
 
     cp .env.example .env
 
@@ -62,6 +62,22 @@ Render a persisted experiment JSON file as a self-contained HTML audit report:
 
     cargo run -- report \
       --input results.json \
+      --output report.html
+
+Start the local web UI:
+
+    cargo run -- web
+
+It listens on `127.0.0.1:3030`. `--port` selects another port:
+
+    cargo run -- web --port 8080
+
+The page asks for an API key directly. It does not read `.env` or `ARENA_API_KEY`.
+
+A completed or incomplete web experiment is written to `arena-web/{run_id}.json`. A candidate execution failure does not write a file. `arena-web/` is gitignored. Pass a saved web experiment to `arena report`:
+
+    cargo run -- report \
+      --input arena-web/1.json \
       --output report.html
 
 ## Tasks
@@ -175,6 +191,12 @@ Bounds are omitted when they cannot be computed. `bootstrap_ran` is whether the 
 - `invalid_replicates` — the loop ran, but at least one replicate did not produce finite ratings for every model
 
 The interval is task-sampling variability of this observed-judgment estimator. It does not measure judge noise, residual position effects, task-selection bias, or performance on a different task distribution. It is not a test of pairwise rating differences.
+
+## Providers
+
+Requests use the OpenAI-compatible Chat Completions API.
+
+Candidate requests set `max_tokens`. Judge requests set `temperature` to `0` and `max_tokens`. That request shape is not compatible with OpenAI o-series and other reasoning models that reject `max_tokens` or `temperature`. Use a chat-completions model or server that accepts those fields.
 
 ## Limitations
 
