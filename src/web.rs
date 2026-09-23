@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::path::{Path as FilePath, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -23,6 +24,7 @@ use crate::provider::{ModelId, ModelProvider, OpenAICompatibleProvider};
 use crate::task::{self, Task};
 
 const BIND_HOST: [u8; 4] = [127, 0, 0, 1];
+const WEB_OUTPUT_DIR: &str = "arena-web";
 
 struct AppState {
     session: Mutex<Option<ProviderSession>>,
@@ -56,6 +58,7 @@ struct RunState {
     resolved_pairs: usize,
     failed_pairs: usize,
     pairs: Vec<PairRow>,
+    output_path: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -105,6 +108,8 @@ struct RunSnapshot {
     resolved_pairs: usize,
     failed_pairs: usize,
     pairs: Vec<PairRow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -133,6 +138,8 @@ enum ClientEvent {
         expected_pairs: usize,
         resolved_pairs: usize,
         failed_pairs: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_path: Option<String>,
     },
     RunFailed {
         seq: u64,
@@ -242,6 +249,7 @@ impl LiveRun {
                 resolved_pairs: 0,
                 failed_pairs: 0,
                 pairs,
+                output_path: None,
             }),
             events,
         }
@@ -283,6 +291,10 @@ impl LiveRun {
         self.finished.store(true, Ordering::Release);
         let _ = self.events.send(client);
     }
+
+    async fn record_output_path(&self, path: &FilePath) {
+        self.inner.lock().await.output_path = Some(path.display().to_string());
+    }
 }
 
 impl RunState {
@@ -303,6 +315,7 @@ impl RunState {
                 resolved_pairs: self.resolved_pairs,
                 failed_pairs: self.failed_pairs,
                 pairs: self.pairs.clone(),
+                output_path: self.output_path.clone(),
             }),
         }
     }
@@ -380,6 +393,7 @@ impl RunState {
                     expected_pairs,
                     resolved_pairs,
                     failed_pairs,
+                    output_path: self.output_path.clone(),
                 }
             }
         }
@@ -567,7 +581,7 @@ async fn start_run(
     };
 
     let provider = OpenAICompatibleProvider::new(api_key, base_url);
-    match start_experiment(state, config, provider).await {
+    match start_experiment(state, config, provider, PathBuf::from(WEB_OUTPUT_DIR)).await {
         Ok(run_id) => (StatusCode::ACCEPTED, Json(StartResponse { run_id })).into_response(),
         Err(StartRunError::Busy) => {
             json_error(StatusCode::CONFLICT, "an experiment is already running")
@@ -575,10 +589,25 @@ async fn start_run(
     }
 }
 
+fn web_output_path(dir: &FilePath, run_id: &str) -> PathBuf {
+    dir.join(format!("{run_id}.json"))
+}
+
+fn write_experiment(path: &FilePath, output: &persist::Output) -> std::result::Result<(), String> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    persist::write(path, output).map_err(|error| error.to_string())
+}
+
 async fn start_experiment<P>(
     state: Arc<AppState>,
     config: ExecConfig,
     provider: P,
+    output_dir: PathBuf,
 ) -> std::result::Result<String, StartRunError>
 where
     P: ModelProvider + Clone + Send + 'static,
@@ -595,23 +624,38 @@ where
     };
 
     let run_id = live.id.clone();
+    let output_path = web_output_path(&output_dir, &run_id);
     tokio::spawn(async move {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let pump = tokio::spawn(pump_events(live.clone(), rx));
-        let result = exec::collect_exec_with_events(&provider, &config, tx).await;
-        let _ = pump.await;
-        if let Err(error) = result {
-            live.fail(error.to_string()).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let collect =
+            tokio::spawn(
+                async move { exec::collect_exec_with_events(&provider, &config, tx).await },
+            );
+        let mut completion = None;
+        while let Some(event) = rx.recv().await {
+            match event {
+                ExperimentEvent::RunComplete { .. } => completion = Some(event),
+                event => {
+                    live.apply(event).await;
+                }
+            }
+        }
+        match collect.await {
+            Ok(Ok((output, _failed_pairs))) => match write_experiment(&output_path, &output) {
+                Ok(()) => {
+                    live.record_output_path(&output_path).await;
+                    if let Some(event) = completion {
+                        live.apply(event).await;
+                    }
+                }
+                Err(error) => live.fail(error).await,
+            },
+            Ok(Err(error)) => live.fail(error.to_string()).await,
+            Err(error) => live.fail(error.to_string()).await,
         }
     });
 
     Ok(run_id)
-}
-
-async fn pump_events(live: Arc<LiveRun>, mut rx: mpsc::UnboundedReceiver<ExperimentEvent>) {
-    while let Some(event) = rx.recv().await {
-        live.apply(event).await;
-    }
 }
 
 async fn run_events(State(state): State<Arc<AppState>>, Path(run_id): Path<String>) -> Response {
@@ -1070,7 +1114,17 @@ function renderDash() {
   const statusEl = document.getElementById("dash_status");
   statusEl.textContent = statusLabel(view.status);
   statusEl.className = "badge " + (view.status === "complete" ? "complete" : view.status === "failed" ? "failed" : "running");
-  document.getElementById("dash_error").textContent = view.error || "";
+  const note = document.getElementById("dash_error");
+  if (view.error) {
+    note.textContent = view.error;
+    note.className = "status error";
+  } else if (view.output_path) {
+    note.textContent = "Saved " + view.output_path;
+    note.className = "status";
+  } else {
+    note.textContent = "";
+    note.className = "status error";
+  }
   document.getElementById("ov_candidates").textContent = String(view.candidate_count || 0);
   document.getElementById("ov_tasks").textContent = String(view.task_count || 0);
   document.getElementById("ov_judge").textContent = view.judge || "None";
@@ -1143,6 +1197,7 @@ function applyEvent(msg) {
       view.expected_pairs = msg.expected_pairs;
       view.resolved_pairs = msg.resolved_pairs;
       view.failed_pairs = msg.failed_pairs;
+      view.output_path = msg.output_path || null;
       view.finished_at = Date.now();
       stopElapsed();
       break;
@@ -1177,6 +1232,7 @@ function showDashboard(runId) {
     failed_pairs: 0,
     pairs: [],
     error: null,
+    output_path: null,
   };
   seenSeq = 0;
   startElapsed();
@@ -1326,6 +1382,13 @@ mod tests {
                 attempts: 1,
             }],
         }
+    }
+
+    fn test_output_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("arena-web-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     async fn wait_until_idle(state: &AppState) {
@@ -1484,9 +1547,14 @@ mod tests {
             0,
         )
         .unwrap();
-        let run_id = start_experiment(state.clone(), config, OkProvider)
-            .await
-            .unwrap();
+        let run_id = start_experiment(
+            state.clone(),
+            config,
+            OkProvider,
+            test_output_dir("start-id"),
+        )
+        .await
+        .unwrap();
         assert!(!run_id.is_empty());
         let live = state.run.lock().await.clone().unwrap();
         assert_eq!(live.id, run_id);
@@ -1503,7 +1571,7 @@ mod tests {
             0,
         )
         .unwrap();
-        start_experiment(state.clone(), config, HangProvider)
+        start_experiment(state.clone(), config, HangProvider, test_output_dir("busy"))
             .await
             .unwrap();
         let config = build_exec_config(
@@ -1515,7 +1583,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            start_experiment(state, config, HangProvider).await,
+            start_experiment(state, config, HangProvider, test_output_dir("busy-again")).await,
             Err(StartRunError::Busy)
         ));
     }
@@ -1623,9 +1691,14 @@ mod tests {
             0,
         )
         .unwrap();
-        start_experiment(state.clone(), config, OkProvider)
-            .await
-            .unwrap();
+        start_experiment(
+            state.clone(),
+            config,
+            OkProvider,
+            test_output_dir("complete-counts"),
+        )
+        .await
+        .unwrap();
         wait_until_idle(&state).await;
 
         let live = state.run.lock().await.clone().unwrap();
@@ -1663,9 +1736,14 @@ mod tests {
             0,
         )
         .unwrap();
-        start_experiment(state.clone(), config, FailProvider)
-            .await
-            .unwrap();
+        start_experiment(
+            state.clone(),
+            config,
+            FailProvider,
+            test_output_dir("failed-then-ok"),
+        )
+        .await
+        .unwrap();
         wait_until_idle(&state).await;
 
         let live = state.run.lock().await.clone().unwrap();
@@ -1685,7 +1763,14 @@ mod tests {
             0,
         )
         .unwrap();
-        start_experiment(state, config, OkProvider).await.unwrap();
+        start_experiment(
+            state,
+            config,
+            OkProvider,
+            test_output_dir("failed-then-ok-next"),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -1732,6 +1817,7 @@ mod tests {
                 resolved_pairs: 0,
                 failed_pairs: 0,
                 pairs: Vec::new(),
+                output_path: None,
             }),
         };
         let value = serde_json::to_value(&event).unwrap();
@@ -1822,5 +1908,189 @@ mod tests {
             }
             other => panic!("expected snapshot, got {other:?}"),
         }
+    }
+
+    const SECRET_API_KEY: &str = "super-secret-web-key";
+
+    #[derive(Clone)]
+    struct SecretProvider {
+        api_key: &'static str,
+    }
+
+    impl ModelProvider for SecretProvider {
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> std::result::Result<CompletionResponse, ProviderError> {
+            let text = if request.model == ModelId::new("judge") {
+                r#"{"winner":"a","reason":"ok"}"#.to_string()
+            } else {
+                request.model.to_string()
+            };
+            if text.contains(self.api_key) {
+                return Err(ProviderError::RequestFailed(
+                    "api key leaked into completion".into(),
+                ));
+            }
+            Ok(CompletionResponse { text })
+        }
+    }
+
+    #[derive(Clone)]
+    struct FailJudge;
+
+    impl ModelProvider for FailJudge {
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> std::result::Result<CompletionResponse, ProviderError> {
+            if request.model == ModelId::new("judge") {
+                return Ok(CompletionResponse {
+                    text: "not a judgment".into(),
+                });
+            }
+            Ok(CompletionResponse {
+                text: request.model.to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_web_run_writes_the_exec_output_for_report() {
+        let state = Arc::new(AppState::new());
+        let dir = test_output_dir("saved-output");
+        let config = build_exec_config(
+            vec!["m0".into(), "m1".into()],
+            Some("judge".into()),
+            vec![task()],
+            "https://example.test/v1".into(),
+            0,
+        )
+        .unwrap();
+        let run_id = start_experiment(
+            state.clone(),
+            config,
+            SecretProvider {
+                api_key: SECRET_API_KEY,
+            },
+            dir.clone(),
+        )
+        .await
+        .unwrap();
+        wait_until_idle(&state).await;
+
+        let path = web_output_path(&dir, &run_id);
+        let saved = path.display().to_string();
+        let live = state.run.lock().await.clone().unwrap();
+        match live.snapshot().await {
+            ClientEvent::Snapshot { snapshot } => {
+                assert_eq!(snapshot.status, RunStatus::Complete);
+                assert_eq!(snapshot.output_path.as_deref(), Some(saved.as_str()));
+            }
+            other => panic!("expected snapshot, got {other:?}"),
+        }
+
+        let json = std::fs::read_to_string(&path).unwrap();
+        assert!(!json.contains(SECRET_API_KEY), "{json}");
+        assert!(!json.contains("api_key"), "{json}");
+        assert!(!json.contains("authorization"), "{json}");
+
+        let output = persist::read(&path).unwrap();
+        assert_eq!(output.tasks.len(), 1);
+        assert_eq!(output.tasks[0].id, "t1");
+        assert_eq!(output.results.len(), 2);
+        assert_eq!(output.results[0].response.text, "m0");
+        assert_eq!(output.results[1].response.text, "m1");
+        assert!(output.results[0].evaluation.is_none());
+        assert!(output.comparisons.is_empty());
+        assert_eq!(output.judgments.as_ref().map(Vec::len), Some(1));
+        assert_eq!(output.judgment_failures.as_ref().map(Vec::len), Some(0));
+        assert_eq!(output.statistics.as_ref().map(Vec::len), Some(2));
+        assert_eq!(output.ratings.as_ref().map(Vec::len), Some(2));
+        assert_eq!(output.run.complete, Some(true));
+        assert_eq!(output.run.base_url, "https://example.test/v1");
+        assert_eq!(
+            output.run.models,
+            vec![ModelId::new("m0"), ModelId::new("m1")]
+        );
+        assert_eq!(output.run.judge, Some(ModelId::new("judge")));
+        assert!(output.run.bootstrap_seed.is_some());
+        assert_eq!(
+            output.judgments.as_ref().unwrap()[0].winner,
+            JudgeDecision::Draw
+        );
+
+        let report = crate::report::from_output(&output);
+        assert_eq!(report.summary.complete, Some(true));
+        assert_eq!(report.results.len(), 2);
+        assert_eq!(report.results[0].response, "m0");
+        assert_eq!(report.pairs.len(), 1);
+        let html = crate::html::render(&report);
+        assert!(html.contains("m0"));
+        assert!(html.contains("m1"));
+        assert!(!html.contains(SECRET_API_KEY));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn candidate_failure_does_not_write_an_experiment() {
+        let state = Arc::new(AppState::new());
+        let dir = test_output_dir("candidate-fail");
+        let config = build_exec_config(
+            vec!["m0".into()],
+            None,
+            vec![task()],
+            "https://example.test/v1".into(),
+            0,
+        )
+        .unwrap();
+        let run_id = start_experiment(state.clone(), config, FailProvider, dir.clone())
+            .await
+            .unwrap();
+        wait_until_idle(&state).await;
+
+        let path = web_output_path(&dir, &run_id);
+        assert!(!path.exists());
+        let live = state.run.lock().await.clone().unwrap();
+        match live.snapshot().await {
+            ClientEvent::Snapshot { snapshot } => {
+                assert_eq!(snapshot.status, RunStatus::Failed);
+                assert!(snapshot.output_path.is_none());
+                assert!(snapshot.error.is_some());
+            }
+            other => panic!("expected snapshot, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn incomplete_judge_run_still_writes_the_exec_output() {
+        let state = Arc::new(AppState::new());
+        let dir = test_output_dir("incomplete-judge");
+        let config = build_exec_config(
+            vec!["m0".into(), "m1".into()],
+            Some("judge".into()),
+            vec![task()],
+            "https://example.test/v1".into(),
+            0,
+        )
+        .unwrap();
+        let run_id = start_experiment(state.clone(), config, FailJudge, dir.clone())
+            .await
+            .unwrap();
+        wait_until_idle(&state).await;
+
+        let output = persist::read(web_output_path(&dir, &run_id)).unwrap();
+        assert_eq!(output.results.len(), 2);
+        assert_eq!(output.run.complete, Some(false));
+        assert_eq!(output.run.failed_pairs, Some(1));
+        assert_eq!(output.judgments.as_ref().map(Vec::len), Some(0));
+        assert_eq!(output.judgment_failures.as_ref().map(Vec::len), Some(1));
+        assert_eq!(output.ratings.as_ref().map(Vec::len), Some(2));
+        let report = crate::report::from_output(&output);
+        assert_eq!(report.summary.complete, Some(false));
+        assert_eq!(report.failed_pairs.len(), 1);
+        assert!(!report.results.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
