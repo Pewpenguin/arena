@@ -66,6 +66,7 @@ struct RunState {
 enum RunStatus {
     Running,
     Complete,
+    Incomplete,
     Failed,
 }
 
@@ -384,7 +385,11 @@ impl RunState {
                 resolved_pairs,
                 failed_pairs,
             } => {
-                self.status = RunStatus::Complete;
+                self.status = if failed_pairs == 0 {
+                    RunStatus::Complete
+                } else {
+                    RunStatus::Incomplete
+                };
                 self.expected_pairs = expected_pairs;
                 self.resolved_pairs = resolved_pairs;
                 self.failed_pairs = failed_pairs;
@@ -779,6 +784,7 @@ button { font: inherit; padding: .4rem .8rem; margin: .4rem .4rem 0 0; cursor: p
 .badge { font-size: .8rem; letter-spacing: .08em; font-weight: 700; }
 .badge.running { color: #5e4a16; }
 .badge.complete { color: #2b4b34; }
+.badge.incomplete { color: #5e5b54; }
 .badge.failed { color: #8b2d2d; }
 .elapsed { color: #5e5b54; font-variant-numeric: tabular-nums; }
 .overview { display: grid; grid-template-columns: repeat(auto-fit, minmax(7.5rem, 1fr)); gap: .75rem 1rem; margin: 1rem 0 1.25rem; }
@@ -992,6 +998,7 @@ function compactOutcome(row) {
 
 function statusLabel(status) {
   if (status === "complete") return "Complete";
+  if (status === "incomplete") return "Incomplete";
   if (status === "failed") return "Failed";
   return "Running";
 }
@@ -1113,7 +1120,7 @@ function renderDash() {
   if (!view) return;
   const statusEl = document.getElementById("dash_status");
   statusEl.textContent = statusLabel(view.status);
-  statusEl.className = "badge " + (view.status === "complete" ? "complete" : view.status === "failed" ? "failed" : "running");
+  statusEl.className = "badge " + (view.status === "complete" ? "complete" : view.status === "incomplete" ? "incomplete" : view.status === "failed" ? "failed" : "running");
   const note = document.getElementById("dash_error");
   if (view.error) {
     note.textContent = view.error;
@@ -1193,7 +1200,7 @@ function applyEvent(msg) {
       break;
     }
     case "run_complete":
-      view.status = "complete";
+      view.status = msg.failed_pairs > 0 ? "incomplete" : "complete";
       view.expected_pairs = msg.expected_pairs;
       view.resolved_pairs = msg.resolved_pairs;
       view.failed_pairs = msg.failed_pairs;
@@ -1720,6 +1727,28 @@ mod tests {
                 assert_eq!(snapshot.candidate_count, 2);
                 assert_eq!(snapshot.task_count, 1);
                 assert_eq!(snapshot.judge.as_deref(), Some("judge"));
+            }
+            other => panic!("expected snapshot, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_judging_is_not_marked_complete() {
+        let live = live_run("1", &["m0", "m1"], Some("judge"));
+        live.apply(ExperimentEvent::RunComplete {
+            expected_pairs: 1,
+            resolved_pairs: 0,
+            failed_pairs: 1,
+        })
+        .await;
+
+        match live.snapshot().await {
+            ClientEvent::Snapshot { snapshot } => {
+                assert_eq!(snapshot.status, RunStatus::Incomplete);
+                assert_eq!(snapshot.expected_pairs, 1);
+                assert_eq!(snapshot.resolved_pairs, 0);
+                assert_eq!(snapshot.failed_pairs, 1);
+                assert!(snapshot.error.is_none());
             }
             other => panic!("expected snapshot, got {other:?}"),
         }
