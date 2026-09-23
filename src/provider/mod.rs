@@ -1,6 +1,16 @@
+mod anthropic;
+mod gemini;
+mod http;
 mod openai_compatible;
+mod openrouter;
 
+#[cfg(test)]
+mod test_support;
+
+pub use anthropic::AnthropicProvider;
+pub use gemini::GeminiProvider;
 pub use openai_compatible::OpenAICompatibleProvider;
+pub use openrouter::OpenRouterProvider;
 
 use std::fmt;
 

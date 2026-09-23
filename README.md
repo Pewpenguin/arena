@@ -4,7 +4,7 @@ Model-vs-model evaluation for LLMs.
 
 Arena runs the same tasks against multiple models, supports exact-match evaluation, and can compare model outputs using an LLM judge.
 
-The core uses a `ModelProvider` trait. Arena uses an OpenAI-compatible API endpoint.
+The core uses a `ModelProvider` trait, with an OpenAI-compatible adapter and native OpenRouter, Anthropic, and Gemini providers.
 
 ## Features
 
@@ -23,7 +23,7 @@ The core uses a `ModelProvider` trait. Arena uses an OpenAI-compatible API endpo
 
 Requires Rust 1.88 or newer and Cargo.
 
-The `run` and `exec` commands use an OpenAI-compatible API endpoint. Set the API key in `.env`:
+The `run` and `exec` commands default to an OpenAI-compatible API endpoint. Set the API key in `.env`:
 
     cp .env.example .env
 
@@ -31,7 +31,7 @@ Then set:
 
     ARENA_API_KEY=your_api_key
 
-`ARENA_BASE_URL` is optional and defaults to `https://api.openai.com/v1`. Set `ARENA_BASE_URL` to any service exposing the OpenAI-compatible API subset Arena requires. Use that service's API key through `ARENA_API_KEY`.
+`ARENA_BASE_URL` is optional and defaults to `https://api.openai.com/v1`. Set it to any service exposing the OpenAI-compatible API subset Arena requires, and pass that service's key through `ARENA_API_KEY`. OpenRouter, Anthropic, and Gemini use their own API keys and do not read `ARENA_BASE_URL`. See [Providers](#providers).
 
 Build the project:
 
@@ -54,7 +54,7 @@ Run multiple models against a task file:
       --judge MODEL_JUDGE \
       --output results.json
 
-`--model` can be specified multiple times. Model IDs must be unique. `--judge` must not match any `--model`. `--judge` and `--output` are optional. `--seed` sets the bootstrap RNG seed and defaults to `0`.
+`--model` can be specified multiple times. Model IDs must be unique. `--judge` must not match any `--model`. `--judge` and `--output` are optional. `--seed` sets the bootstrap RNG seed and defaults to `0`. `--provider` selects `openai` (the default), `openrouter`, `anthropic`, or `gemini`.
 
 Without `--output`, the JSON result is written to stdout. Each candidate provider request is tried up to three times (a 1s backoff, then 2s) for provider errors and invalid provider responses. An exhausted candidate failure still aborts the run without producing output. A permanently failed judge pair is saved in the output with `run.complete` set to false, and the process then exits non-zero.
 
@@ -194,9 +194,54 @@ The interval is task-sampling variability of this observed-judgment estimator. I
 
 ## Providers
 
-Requests use the OpenAI-compatible Chat Completions API.
+`run` and `exec` take `--provider`. Every provider uses the same request timeout, connection timeout, and retry behavior. API keys stay in the provider client: they are omitted from debug output and are not written to run JSON or HTML reports. The web UI keeps using an OpenAI-compatible endpoint.
 
-Candidate requests set `max_tokens`. Judge requests set `temperature` to `0` and `max_tokens`. That request shape is not compatible with OpenAI o-series and other reasoning models that reject `max_tokens` or `temperature`. Use a chat-completions model or server that accepts those fields.
+### OpenAI-compatible
+
+`OpenAICompatibleProvider` is the generic adapter for a Chat Completions API. It reads `ARENA_API_KEY` and optional `ARENA_BASE_URL`.
+
+    ARENA_API_KEY=your_api_key
+    ARENA_BASE_URL=https://api.openai.com/v1
+
+    cargo run -- run \
+      --provider openai \
+      --model MODEL \
+      --prompt "Explain Rust ownership in two sentences."
+
+Candidate requests set `max_tokens`. Judge requests set `temperature` to `0` and `max_tokens`. That Chat Completions request shape is not compatible with OpenAI o-series and other reasoning models that reject `max_tokens` or `temperature`. Use a chat-completions model or server that accepts those fields.
+
+### OpenRouter
+
+`OpenRouterProvider` calls OpenRouter's chat completions API with `ARENA_OPENROUTER_API_KEY`. It has its own client and does not read `ARENA_API_KEY` or `ARENA_BASE_URL`.
+
+    ARENA_OPENROUTER_API_KEY=your_openrouter_key
+
+    cargo run -- run \
+      --provider openrouter \
+      --model vendor/model \
+      --prompt "Explain Rust ownership in two sentences."
+
+### Anthropic
+
+`AnthropicProvider` calls Anthropic's Messages API with `ARENA_ANTHROPIC_API_KEY`. Temperature and max tokens are sent as `temperature` and `max_tokens`.
+
+    ARENA_ANTHROPIC_API_KEY=your_anthropic_key
+
+    cargo run -- run \
+      --provider anthropic \
+      --model MODEL \
+      --prompt "Explain Rust ownership in two sentences."
+
+### Gemini
+
+`GeminiProvider` calls Gemini's `generateContent` API with `ARENA_GEMINI_API_KEY`. Temperature and max tokens are sent as `generationConfig.temperature` and `generationConfig.maxOutputTokens`.
+
+    ARENA_GEMINI_API_KEY=your_gemini_key
+
+    cargo run -- run \
+      --provider gemini \
+      --model MODEL \
+      --prompt "Explain Rust ownership in two sentences."
 
 ## Limitations
 
