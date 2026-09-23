@@ -509,6 +509,10 @@ mod tests {
                     attempts: 3,
                 },
             ],
+            raw_ab: None,
+            reason_ab: None,
+            raw_ba: None,
+            reason_ba: None,
         };
         assert_eq!(
             serde_json::to_value(&failure).unwrap(),
@@ -551,6 +555,27 @@ mod tests {
         assert!(value.get("ratings").is_none());
         assert!(value["run"].get("complete").is_none());
         assert!(value["run"].get("orientation_agreement").is_none());
+    }
+
+    #[test]
+    fn judgment_failure_round_trips_kept_orientation_and_loads_older_files() {
+        let legacy = r#"{"task_id":"t1","model_a":"a","model_b":"b","judge_model":"judge","orientations":[]}"#;
+        let loaded: JudgmentFailure = serde_json::from_str(legacy).unwrap();
+        assert!(loaded.raw_ab.is_none());
+        assert!(loaded.reason_ab.is_none());
+        assert!(loaded.raw_ba.is_none());
+        assert!(loaded.reason_ba.is_none());
+
+        let mut kept = loaded;
+        kept.raw_ab = Some("ab raw".into());
+        kept.reason_ab = Some("ab reason".into());
+        let value = serde_json::to_value(&kept).unwrap();
+        assert_eq!(value["raw_ab"], "ab raw");
+        assert_eq!(value["reason_ab"], "ab reason");
+        assert!(value.get("raw_ba").is_none());
+        assert!(value.get("reason_ba").is_none());
+        let restored: JudgmentFailure = serde_json::from_value(value).unwrap();
+        assert_eq!(restored, kept);
     }
 
     #[test]

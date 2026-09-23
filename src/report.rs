@@ -93,6 +93,10 @@ pub struct FailedPairRow<'a> {
     pub model_a: &'a ModelId,
     pub model_b: &'a ModelId,
     pub orientations: &'a [OrientationFailure],
+    pub raw_ab: Option<&'a str>,
+    pub reason_ab: Option<&'a str>,
+    pub raw_ba: Option<&'a str>,
+    pub reason_ba: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,6 +225,10 @@ fn failed_pair_row(failure: &JudgmentFailure) -> FailedPairRow<'_> {
         model_a: &failure.model_a,
         model_b: &failure.model_b,
         orientations: &failure.orientations,
+        raw_ab: failure.raw_ab.as_deref(),
+        reason_ab: failure.reason_ab.as_deref(),
+        raw_ba: failure.raw_ba.as_deref(),
+        reason_ba: failure.reason_ba.as_deref(),
     }
 }
 
@@ -451,6 +459,10 @@ mod tests {
                 error: "no valid judgment JSON found".into(),
                 attempts: 3,
             }],
+            raw_ab: None,
+            reason_ab: None,
+            raw_ba: None,
+            reason_ba: None,
         };
         let models = vec![ModelId::new("m0"), ModelId::new("m1")];
         let statistics = stats::aggregate(&judgments, &models);

@@ -1,13 +1,49 @@
-use reqwest::{Client, RequestBuilder};
+use reqwest::redirect::Policy;
+use reqwest::{Client, RequestBuilder, Url};
 
 use super::{CONNECT_TIMEOUT, ProviderError, REQUEST_TIMEOUT};
+
+const MAX_REDIRECTS: usize = 10;
 
 pub(super) fn client() -> Client {
     Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .connect_timeout(CONNECT_TIMEOUT)
+        .redirect(redirect_policy())
         .build()
         .expect("failed to create HTTP client")
+}
+
+fn redirect_policy() -> Policy {
+    Policy::custom(|attempt| {
+        if attempt.previous().len() > MAX_REDIRECTS {
+            return attempt.error("too many redirects");
+        }
+        match attempt.previous().last() {
+            Some(previous) if same_origin(previous, attempt.url()) => attempt.follow(),
+            Some(_) => attempt.stop(),
+            None => attempt.follow(),
+        }
+    })
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host() == right.host()
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+pub(super) fn reject_length_limit(
+    reason: Option<&str>,
+    length_reason: &str,
+) -> Result<(), ProviderError> {
+    if reason == Some(length_reason) {
+        Err(ProviderError::InvalidResponse(
+            "completion truncated by output length limit".into(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 pub(super) async fn execute_json(

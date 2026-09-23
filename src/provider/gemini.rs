@@ -92,9 +92,28 @@ impl ModelProvider for GeminiProvider {
 
 fn generate_content_url(base_url: &str, model: &str) -> String {
     format!(
-        "{}/models/{model}:generateContent",
-        base_url.trim_end_matches('/')
+        "{}/models/{}:generateContent",
+        base_url.trim_end_matches('/'),
+        encode_path_segment(model)
     )
+}
+
+fn encode_path_segment(segment: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        if matches!(
+            byte,
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~'
+        ) {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    encoded
 }
 
 fn candidate_text(response: GenerateResponse) -> Result<String, ProviderError> {
@@ -103,6 +122,7 @@ fn candidate_text(response: GenerateResponse) -> Result<String, ProviderError> {
             "missing completion content".into(),
         ));
     };
+    http::reject_length_limit(candidate.finish_reason.as_deref(), "MAX_TOKENS")?;
     let Some(parts) = candidate.content.and_then(|content| content.parts) else {
         return Err(ProviderError::InvalidResponse(
             "missing completion content".into(),
@@ -112,6 +132,9 @@ fn candidate_text(response: GenerateResponse) -> Result<String, ProviderError> {
     let mut text = String::new();
     let mut saw_text = false;
     for part in parts {
+        if part.thought {
+            continue;
+        }
         if let Some(piece) = part.text {
             saw_text = true;
             text.push_str(&piece);
@@ -161,6 +184,8 @@ struct GenerateResponse {
 #[derive(Deserialize)]
 struct Candidate {
     content: Option<ResponseContent>,
+    #[serde(default, rename = "finishReason")]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -171,12 +196,16 @@ struct ResponseContent {
 #[derive(Deserialize)]
 struct ResponsePart {
     text: Option<String>,
+    #[serde(default)]
+    thought: bool,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::test_support::{header_value, request_body, request_path, start_mock};
+    use crate::provider::test_support::{
+        header_value, request_body, request_path, start_cross_origin_redirect, start_mock,
+    };
     use crate::provider::{DEFAULT_MAX_TOKENS, ModelId};
 
     fn sample_request() -> CompletionRequest {
@@ -204,6 +233,22 @@ mod tests {
             ),
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-test:generateContent"
         );
+    }
+
+    #[test]
+    fn generate_content_url_encodes_model_id_as_one_segment() {
+        let url = generate_content_url(
+            "https://generativelanguage.googleapis.com/v1beta",
+            "gemini test?/#",
+        );
+        assert_eq!(
+            url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini%20test%3F%2F%23:generateContent"
+        );
+        assert!(!url.contains(' '));
+        assert!(!url.contains('?'));
+        assert!(!url.contains('#'));
+        assert!(url.ends_with(":generateContent"));
     }
 
     #[tokio::test]
@@ -296,5 +341,115 @@ mod tests {
         assert!(message.contains("[redacted]"), "{message}");
         assert!(!message.contains("super-secret-key"), "{message}");
         assert!(!rendered.contains("super-secret-key"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn complete_accepts_stop_finish_reason() {
+        let mock = start_mock(
+            200,
+            "OK",
+            r#"{"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"full answer"}]}}]}"#,
+        )
+        .await;
+        let provider = GeminiProvider::new("test-key", format!("{}/v1beta", mock.origin));
+
+        let response = provider
+            .complete(sample_request())
+            .await
+            .expect("completion");
+        mock.handle.abort();
+
+        assert_eq!(response.text, "full answer");
+    }
+
+    #[tokio::test]
+    async fn complete_rejects_max_tokens_finish_reason() {
+        let mock = start_mock(
+            200,
+            "OK",
+            r#"{"candidates":[{"finishReason":"MAX_TOKENS","content":{"parts":[{"text":"partial answer"},{"text":"secret thought","thought":true}]}}]}"#,
+        )
+        .await;
+        let provider = GeminiProvider::new("test-key", format!("{}/v1beta", mock.origin));
+
+        let error = provider
+            .complete(sample_request())
+            .await
+            .expect_err("truncated");
+        mock.handle.abort();
+
+        assert_eq!(
+            error,
+            ProviderError::InvalidResponse("completion truncated by output length limit".into())
+        );
+        assert!(crate::retry::is_retryable_provider(&error));
+        let message = error.to_string();
+        assert!(!message.contains("partial answer"), "{message}");
+        assert!(!message.contains("secret thought"), "{message}");
+    }
+
+    #[test]
+    fn candidate_text_excludes_thought_parts() {
+        let normal = candidate_text(
+            serde_json::from_str(
+                r#"{"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"answer"}]}}]}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(normal, "answer");
+
+        let mixed = candidate_text(
+            serde_json::from_str(
+                r#"{"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"secret thought","thought":true},{"text":"answer"}]}}]}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(mixed, "answer");
+
+        let multiple = candidate_text(
+            serde_json::from_str(
+                r#"{"candidates":[{"content":{"parts":[{"text":"Hello"},{"text":"world"}]}}]}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(multiple, "Helloworld");
+
+        let thought_only = candidate_text(
+            serde_json::from_str(
+                r#"{"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"secret thought","thought":true}]}}]}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            thought_only,
+            ProviderError::InvalidResponse("missing completion content".into())
+        );
+        assert!(!thought_only.to_string().contains("secret thought"));
+    }
+
+    #[tokio::test]
+    async fn cross_origin_redirect_does_not_forward_api_key() {
+        let redirect = start_cross_origin_redirect("super-secret-key").await;
+        let provider =
+            GeminiProvider::new("super-secret-key", format!("{}/v1beta", redirect.origin));
+
+        let error = provider
+            .complete(sample_request())
+            .await
+            .expect_err("redirect");
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let forwarded = redirect
+            .saw_secret
+            .load(std::sync::atomic::Ordering::SeqCst);
+        redirect.abort();
+
+        let message = error.to_string();
+        assert!(message.contains("302"), "{message}");
+        assert!(!message.contains("super-secret-key"), "{message}");
+        assert!(!forwarded, "api key was sent to the redirected origin");
     }
 }

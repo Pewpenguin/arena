@@ -131,7 +131,7 @@ where
 
     let candidate_total = (tasks.len() * models.len()) as u64;
     let candidates = progress_bar(candidate_total);
-    let pair_total = pair_count(tasks.len(), models.len());
+    let pair_total = judge_progress_len(tasks.len(), models.len());
     let judges = judge.as_ref().map(|_| progress_bar(pair_total));
 
     let config = ExecConfig {
@@ -176,7 +176,7 @@ where
                     "judge  {}  {} vs {}  failed  {}",
                     failure.task_id, failure.model_a, failure.model_b, detail
                 ));
-                judges.inc(failure.orientations.len() as u64);
+                judges.inc(1);
             }
         },
     )
@@ -189,9 +189,8 @@ where
     exec::complete_exec(output_data, failed_pairs, output.as_deref())
 }
 
-fn pair_count(tasks: usize, models: usize) -> u64 {
-    let n = models as u64;
-    tasks as u64 * n.saturating_sub(1) * n / 2 * 2
+fn judge_progress_len(tasks: usize, models: usize) -> u64 {
+    exec::expected_pairs(tasks, models) as u64
 }
 
 fn progress_bar(len: u64) -> ProgressBar {
@@ -202,4 +201,20 @@ fn progress_bar(len: u64) -> ProgressBar {
     );
     bar.enable_steady_tick(Duration::from_millis(100));
     bar
+}
+
+#[cfg(test)]
+mod tests {
+    use super::judge_progress_len;
+
+    #[test]
+    fn judge_progress_length_matches_expected_unordered_pairs() {
+        assert_eq!(judge_progress_len(1, 2), 1);
+        assert_eq!(judge_progress_len(2, 3), 6);
+        assert_eq!(judge_progress_len(0, 4), 0);
+        assert_eq!(
+            judge_progress_len(3, 4),
+            arena::exec::expected_pairs(3, 4) as u64
+        );
+    }
 }

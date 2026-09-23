@@ -74,11 +74,14 @@ impl ModelProvider for OpenRouterProvider {
         let parsed: ChatCompletionResponse = serde_json::from_slice(&bytes)
             .map_err(|error| http::invalid_json(&error, &self.api_key))?;
 
-        let text = parsed
-            .choices
-            .into_iter()
-            .next()
-            .and_then(|choice| choice.message.content)
+        let choice =
+            parsed.choices.into_iter().next().ok_or_else(|| {
+                ProviderError::InvalidResponse("missing completion content".into())
+            })?;
+        http::reject_length_limit(choice.finish_reason.as_deref(), "length")?;
+        let text = choice
+            .message
+            .content
             .ok_or_else(|| ProviderError::InvalidResponse("missing completion content".into()))?;
 
         Ok(CompletionResponse { text })
@@ -112,6 +115,8 @@ struct ChatCompletionResponse {
 
 #[derive(Deserialize)]
 struct ChatChoice {
+    #[serde(default)]
+    finish_reason: Option<String>,
     message: ChatResponseMessage,
 }
 
@@ -230,5 +235,48 @@ mod tests {
         assert!(!message.contains("super-secret-key"), "{message}");
         assert!(!message.contains("Bearer"), "{message}");
         assert!(!rendered.contains("super-secret-key"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn complete_accepts_stop_finish_reason() {
+        let mock = start_mock(
+            200,
+            "OK",
+            r#"{"choices":[{"finish_reason":"stop","message":{"content":"full answer"}}]}"#,
+        )
+        .await;
+        let provider = OpenRouterProvider::new("test-key", format!("{}/api/v1", mock.origin));
+
+        let response = provider
+            .complete(sample_request())
+            .await
+            .expect("completion");
+        mock.handle.abort();
+
+        assert_eq!(response.text, "full answer");
+    }
+
+    #[tokio::test]
+    async fn complete_rejects_length_finish_reason() {
+        let mock = start_mock(
+            200,
+            "OK",
+            r#"{"choices":[{"finish_reason":"length","message":{"content":"partial answer"}}]}"#,
+        )
+        .await;
+        let provider = OpenRouterProvider::new("test-key", format!("{}/api/v1", mock.origin));
+
+        let error = provider
+            .complete(sample_request())
+            .await
+            .expect_err("truncated");
+        mock.handle.abort();
+
+        assert_eq!(
+            error,
+            ProviderError::InvalidResponse("completion truncated by output length limit".into())
+        );
+        assert!(crate::retry::is_retryable_provider(&error));
+        assert!(!error.to_string().contains("partial answer"));
     }
 }

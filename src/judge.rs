@@ -69,6 +69,14 @@ pub struct JudgmentFailure {
     pub model_b: ModelId,
     pub judge_model: ModelId,
     pub orientations: Vec<OrientationFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_ab: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_ab: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_ba: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_ba: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -330,6 +338,15 @@ fn bound_error_text(text: &str) -> String {
     }
 }
 
+fn kept_orientation(
+    result: &Result<(Instant, Judgment), (u32, JudgeError)>,
+) -> (Option<String>, Option<String>) {
+    match result {
+        Ok((_, judgment)) => (judgment.raw.clone(), Some(judgment.reason.clone())),
+        Err(_) => (None, None),
+    }
+}
+
 fn orientation_failure(
     orientation: JudgeOrientation,
     attempts: u32,
@@ -425,13 +442,10 @@ where
             joined.expect("pairwise judging panicked");
         match result {
             Err(JudgeError::DifferentTasks) => return Err(JudgeError::DifferentTasks),
-            Ok(judgment) => {
-                on_complete(&judgment);
-                match orientation {
-                    0 => original[index] = Some(Ok((started, judgment))),
-                    _ => swapped[index] = Some(Ok((started, judgment))),
-                }
-            }
+            Ok(judgment) => match orientation {
+                0 => original[index] = Some(Ok((started, judgment))),
+                _ => swapped[index] = Some(Ok((started, judgment))),
+            },
             Err(error) => match orientation {
                 0 => original[index] = Some(Err((attempts, error))),
                 _ => swapped[index] = Some(Err((attempts, error))),
@@ -444,9 +458,13 @@ where
             match (orig, swap) {
                 (Ok((orig_started, orig)), Ok((swap_started, swap))) => {
                     let duration_ms = orig_started.min(swap_started).elapsed().as_millis() as u64;
-                    ordered[index] = Some(resolve_judgments(orig, swap, duration_ms));
+                    let resolved = resolve_judgments(orig, swap, duration_ms);
+                    on_complete(&resolved);
+                    ordered[index] = Some(resolved);
                 }
                 (orig, swap) => {
+                    let (raw_ab, reason_ab) = kept_orientation(&orig);
+                    let (raw_ba, reason_ba) = kept_orientation(&swap);
                     let mut orientations = Vec::new();
                     if let Err((attempts, error)) = orig {
                         orientations.push(orientation_failure(
@@ -469,6 +487,10 @@ where
                         model_b,
                         judge_model: judge_model.clone(),
                         orientations,
+                        raw_ab,
+                        reason_ab,
+                        raw_ba,
+                        reason_ba,
                     });
                 }
             }
@@ -1107,6 +1129,10 @@ mod tests {
             failure.attempts == crate::retry::ATTEMPTS
                 && failure.kind == JudgmentFailureKind::InvalidJson
         }));
+        assert!(outcome.failures[0].raw_ab.is_none());
+        assert!(outcome.failures[0].reason_ab.is_none());
+        assert!(outcome.failures[0].raw_ba.is_none());
+        assert!(outcome.failures[0].reason_ba.is_none());
         assert_eq!(
             provider.calls.load(Ordering::SeqCst),
             (crate::retry::ATTEMPTS * 2) as usize
@@ -1141,16 +1167,22 @@ mod tests {
             evaluation: None,
         };
         let results = vec![evaluated("m0", "m0"), evaluated("m1", "m1")];
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let callbacks_cb = Arc::clone(&callbacks);
 
         let outcome = judge_pairs(
             &FailSwappedOrientation,
             ModelId::new("judge"),
             &task,
             &results,
-            |_| {},
+            move |_| {
+                callbacks_cb.fetch_add(1, Ordering::SeqCst);
+            },
         )
         .await
         .unwrap();
+
+        assert_eq!(callbacks.load(Ordering::SeqCst), 0);
 
         assert!(outcome.judgments.is_empty());
         assert_eq!(outcome.failures.len(), 1);
@@ -1167,6 +1199,14 @@ mod tests {
             outcome.failures[0].orientations[0].kind,
             JudgmentFailureKind::InvalidJson
         );
+        assert_eq!(
+            outcome.failures[0].raw_ab.as_deref(),
+            Some(r#"{"winner":"a","reason":"ok"}"#)
+        );
+        assert_eq!(outcome.failures[0].reason_ab.as_deref(), Some("ok"));
+        assert!(outcome.failures[0].raw_ba.is_none());
+        assert!(outcome.failures[0].reason_ba.is_none());
+        assert!(outcome.judgments.is_empty());
     }
 
     #[derive(Clone)]
@@ -1257,5 +1297,155 @@ mod tests {
 
         assert!(matches!(error, JudgeError::DifferentTasks));
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn resolved_pair_notifies_progress_once_with_persisted_judgment() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(Mutex::new(None));
+        let calls_cb = Arc::clone(&calls);
+        let seen_cb = Arc::clone(&seen);
+        let provider = RecordJudgeRequest {
+            temperatures: Arc::new(Mutex::new(Vec::new())),
+            max_tokens: Arc::new(Mutex::new(Vec::new())),
+        };
+        let task = Task {
+            id: "t1".into(),
+            prompt: "p".into(),
+            evaluation: None,
+        };
+        let results = vec![evaluated("m0", "left"), evaluated("m1", "right")];
+
+        let outcome = judge_pairs(
+            &provider,
+            ModelId::new("judge"),
+            &task,
+            &results,
+            move |judgment| {
+                calls_cb.fetch_add(1, Ordering::SeqCst);
+                *seen_cb.lock().expect("seen") = Some(judgment.clone());
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.failures.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let notified = seen.lock().expect("seen").clone().expect("callback");
+        assert_eq!(notified, outcome.judgments[0]);
+        assert!(notified.orientation_ab.is_some());
+        assert!(notified.orientation_ba.is_some());
+    }
+
+    #[derive(Clone)]
+    struct FailOriginalOrientation;
+
+    impl ModelProvider for FailOriginalOrientation {
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            let a_is_m0 = request.prompt.contains("<response_a>\nm0\n</response_a>");
+            if a_is_m0 {
+                return Ok(CompletionResponse {
+                    text: "truncated <think>".into(),
+                });
+            }
+            Ok(CompletionResponse {
+                text: r#"{"winner":"b","reason":"ba-ok"}"#.into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_original_orientation_keeps_the_swapped_completion() {
+        let task = Task {
+            id: "t1".into(),
+            prompt: "p".into(),
+            evaluation: None,
+        };
+        let results = vec![evaluated("m0", "m0"), evaluated("m1", "m1")];
+
+        let outcome = judge_pairs(
+            &FailOriginalOrientation,
+            ModelId::new("judge"),
+            &task,
+            &results,
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.judgments.is_empty());
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(
+            outcome.failures[0].orientations[0].orientation,
+            JudgeOrientation::Ab
+        );
+        assert_eq!(
+            outcome.failures[0].raw_ba.as_deref(),
+            Some(r#"{"winner":"b","reason":"ba-ok"}"#)
+        );
+        assert_eq!(outcome.failures[0].reason_ba.as_deref(), Some("ba-ok"));
+        assert!(outcome.failures[0].raw_ab.is_none());
+        assert!(outcome.failures[0].reason_ab.is_none());
+    }
+
+    #[derive(Clone)]
+    struct AlwaysTruncated {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ModelProvider for AlwaysTruncated {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(ProviderError::InvalidResponse(
+                "completion truncated by output length limit".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_judge_completion_retries_then_fails_the_pair() {
+        let provider = AlwaysTruncated {
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let task = Task {
+            id: "t1".into(),
+            prompt: "p".into(),
+            evaluation: None,
+        };
+        let results = vec![evaluated("m0", "left"), evaluated("m1", "right")];
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let callbacks_cb = Arc::clone(&callbacks);
+
+        let outcome = judge_pairs(
+            &provider,
+            ModelId::new("judge"),
+            &task,
+            &results,
+            move |_| {
+                callbacks_cb.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            (crate::retry::ATTEMPTS * 2) as usize
+        );
+        assert_eq!(callbacks.load(Ordering::SeqCst), 0);
+        assert!(outcome.judgments.is_empty());
+        assert_eq!(outcome.failures.len(), 1);
+        assert!(outcome.failures[0].orientations.iter().all(|failure| {
+            failure.attempts == crate::retry::ATTEMPTS
+                && failure.kind == JudgmentFailureKind::Provider
+        }));
+        assert!(outcome.failures[0].raw_ab.is_none());
+        assert!(outcome.failures[0].raw_ba.is_none());
     }
 }

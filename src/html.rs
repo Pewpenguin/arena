@@ -506,7 +506,24 @@ fn push_failures(html: &mut String, failures: &[FailedPairRow<'_>]) {
             html.push_str(&escape(&failure_line(item)));
             html.push_str("</li>\n");
         }
-        html.push_str("</ul></dd>\n</dl>\n</article>\n");
+        html.push_str("</ul></dd>\n");
+        if let Some(reason) = failure.reason_ab {
+            dt_dd(html, "AB reason", &escape(reason));
+        }
+        if let Some(raw) = failure.raw_ab {
+            html.push_str("<dt>AB raw completion</dt><dd><pre>");
+            html.push_str(&escape(raw));
+            html.push_str("</pre></dd>\n");
+        }
+        if let Some(reason) = failure.reason_ba {
+            dt_dd(html, "BA reason", &escape(reason));
+        }
+        if let Some(raw) = failure.raw_ba {
+            html.push_str("<dt>BA raw completion</dt><dd><pre>");
+            html.push_str(&escape(raw));
+            html.push_str("</pre></dd>\n");
+        }
+        html.push_str("</dl>\n</article>\n");
     }
     html.push_str("</section>\n");
 }
@@ -858,6 +875,10 @@ mod tests {
                 error: "no valid judgment JSON found".into(),
                 attempts: 3,
             }],
+            raw_ab: None,
+            reason_ab: None,
+            raw_ba: None,
+            reason_ba: None,
         };
         let data = output(
             run_meta(&["m0", "m1"], Some("judge"))
@@ -885,6 +906,53 @@ mod tests {
         let pairwise = html.find("Pairwise results").unwrap();
         let failed = html.find("Failed judgments").unwrap();
         assert!(pairwise < failed);
+    }
+
+    #[test]
+    fn failed_pair_report_keeps_and_escapes_successful_orientation_raw() {
+        let failure = JudgmentFailure {
+            task_id: "t2".into(),
+            model_a: ModelId::new("m0"),
+            model_b: ModelId::new("m1"),
+            judge_model: ModelId::new("judge"),
+            orientations: vec![OrientationFailure {
+                orientation: JudgeOrientation::Ba,
+                kind: JudgmentFailureKind::Provider,
+                error: "upstream".into(),
+                attempts: 3,
+            }],
+            raw_ab: Some("<kept>".into()),
+            reason_ab: Some("a & b".into()),
+            raw_ba: None,
+            reason_ba: None,
+        };
+        let data = output(
+            run_meta(&["m0", "m1"], Some("judge"))
+                .with_judge_coverage(1, 0, 1)
+                .with_orientation_agreement(PairAgreement {
+                    resolved_pairs: 0,
+                    orientation_agreeing_pairs: 0,
+                    orientation_disagreeing_pairs: 0,
+                    agreement_rate: 0.0,
+                })
+                .with_judge_decoding(JudgeDecoding::arena_default()),
+            vec![task("t2")],
+            vec![],
+            Some(vec![]),
+            Some(vec![failure]),
+            None,
+            None,
+        );
+        let html = render_output(&data);
+        let failed = html.find("Failed judgments").unwrap();
+        let section = &html[failed..];
+        assert!(section.contains("AB reason"));
+        assert!(section.contains("a &amp; b"));
+        assert!(section.contains("AB raw completion"));
+        assert!(section.contains("&lt;kept&gt;"));
+        assert!(!section.contains("<kept>"));
+        assert!(!section.contains("BA raw completion"));
+        assert!(html.contains("class=\"failures\""));
     }
 
     #[test]

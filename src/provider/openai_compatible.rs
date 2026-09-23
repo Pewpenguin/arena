@@ -4,6 +4,7 @@ use std::time::Duration;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+use super::http;
 use super::{
     CONNECT_TIMEOUT, CompletionRequest, CompletionResponse, ModelId, ModelProvider, ProviderError,
     REQUEST_TIMEOUT,
@@ -69,29 +70,16 @@ impl OpenAICompatibleProvider {
     }
 
     pub async fn list_models(&self) -> Result<Vec<ModelId>, ProviderError> {
-        let response = self
-            .client
-            .get(models_url(&self.base_url))
-            .bearer_auth(&self.api_key)
-            .send()
-            .await
-            .map_err(|error| ProviderError::RequestFailed(error.to_string()))?;
-
-        let status = response.status();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|error| ProviderError::RequestFailed(error.to_string()))?;
-
-        if !status.is_success() {
-            let body = String::from_utf8_lossy(&bytes);
-            return Err(ProviderError::RequestFailed(format!(
-                "HTTP {status}: {body}"
-            )));
-        }
+        let bytes = http::execute_json(
+            self.client
+                .get(models_url(&self.base_url))
+                .bearer_auth(&self.api_key),
+            &self.api_key,
+        )
+        .await?;
 
         let parsed: ModelsResponse = serde_json::from_slice(&bytes)
-            .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
+            .map_err(|error| http::invalid_json(&error, &self.api_key))?;
 
         Ok(parsed
             .data
@@ -116,36 +104,26 @@ impl ModelProvider for OpenAICompatibleProvider {
             max_tokens: request.max_tokens,
         };
 
-        let response = self
-            .client
-            .post(chat_completions_url(&self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| ProviderError::RequestFailed(error.to_string()))?;
-
-        let status = response.status();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|error| ProviderError::RequestFailed(error.to_string()))?;
-
-        if !status.is_success() {
-            let body = String::from_utf8_lossy(&bytes);
-            return Err(ProviderError::RequestFailed(format!(
-                "HTTP {status}: {body}"
-            )));
-        }
+        let bytes = http::execute_json(
+            self.client
+                .post(chat_completions_url(&self.base_url))
+                .bearer_auth(&self.api_key)
+                .json(&body),
+            &self.api_key,
+        )
+        .await?;
 
         let parsed: ChatCompletionResponse = serde_json::from_slice(&bytes)
-            .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
+            .map_err(|error| http::invalid_json(&error, &self.api_key))?;
 
-        let text = parsed
-            .choices
-            .into_iter()
-            .next()
-            .and_then(|choice| choice.message.content)
+        let choice =
+            parsed.choices.into_iter().next().ok_or_else(|| {
+                ProviderError::InvalidResponse("missing completion content".into())
+            })?;
+        http::reject_length_limit(choice.finish_reason.as_deref(), "length")?;
+        let text = choice
+            .message
+            .content
             .ok_or_else(|| ProviderError::InvalidResponse("missing completion content".into()))?;
 
         Ok(CompletionResponse { text })
@@ -183,6 +161,8 @@ struct ChatCompletionResponse {
 
 #[derive(Deserialize)]
 struct ChatChoice {
+    #[serde(default)]
+    finish_reason: Option<String>,
     message: ChatResponseMessage,
 }
 
@@ -579,5 +559,79 @@ mod tests {
         assert!(message.contains("HTTP 401"), "{message}");
         assert!(!message.contains("super-secret-key"), "{message}");
         assert!(!message.contains("Bearer"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn complete_accepts_stop_finish_reason() {
+        let mock = start_mock(
+            200,
+            "OK",
+            r#"{"choices":[{"finish_reason":"stop","message":{"content":"full answer"}}]}"#,
+        )
+        .await;
+        let provider = OpenAICompatibleProvider::new("test-key", mock.base_url.as_str());
+
+        let response = provider
+            .complete(sample_request())
+            .await
+            .expect("completion");
+        mock.handle.abort();
+
+        assert_eq!(response.text, "full answer");
+    }
+
+    #[tokio::test]
+    async fn complete_rejects_length_finish_reason() {
+        let mock = start_mock(
+            200,
+            "OK",
+            r#"{"choices":[{"finish_reason":"length","message":{"content":"partial answer"}}]}"#,
+        )
+        .await;
+        let provider = OpenAICompatibleProvider::new("test-key", mock.base_url.as_str());
+
+        let error = provider
+            .complete(sample_request())
+            .await
+            .expect_err("truncated");
+        mock.handle.abort();
+
+        assert_eq!(
+            error,
+            ProviderError::InvalidResponse("completion truncated by output length limit".into())
+        );
+        assert!(crate::retry::is_retryable_provider(&error));
+        assert!(!error.to_string().contains("partial answer"));
+    }
+
+    #[tokio::test]
+    async fn complete_http_error_redacts_api_key_present_in_body() {
+        let mock = start_mock(500, "Internal Server Error", "bad key super-secret-key").await;
+        let provider = OpenAICompatibleProvider::new("super-secret-key", mock.base_url.as_str());
+
+        let error = provider
+            .complete(sample_request())
+            .await
+            .expect_err("http error");
+        mock.handle.abort();
+
+        let message = error.to_string();
+        assert!(message.contains("HTTP 500"), "{message}");
+        assert!(message.contains("[redacted]"), "{message}");
+        assert!(!message.contains("super-secret-key"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn list_models_http_error_redacts_api_key_present_in_body() {
+        let mock = start_mock(401, "Unauthorized", "bad key super-secret-key").await;
+        let provider = OpenAICompatibleProvider::new("super-secret-key", mock.base_url.as_str());
+
+        let error = provider.list_models().await.expect_err("http error");
+        mock.handle.abort();
+
+        let message = error.to_string();
+        assert!(message.contains("HTTP 401"), "{message}");
+        assert!(message.contains("[redacted]"), "{message}");
+        assert!(!message.contains("super-secret-key"), "{message}");
     }
 }

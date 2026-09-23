@@ -75,6 +75,7 @@ impl ModelProvider for AnthropicProvider {
 
         let parsed: MessagesResponse = serde_json::from_slice(&bytes)
             .map_err(|error| http::invalid_json(&error, &self.api_key))?;
+        http::reject_length_limit(parsed.stop_reason.as_deref(), "max_tokens")?;
 
         Ok(CompletionResponse {
             text: message_text(parsed.content)?,
@@ -125,6 +126,8 @@ struct Message {
 #[derive(Deserialize)]
 struct MessagesResponse {
     content: Vec<ContentBlock>,
+    #[serde(default)]
+    stop_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -137,7 +140,9 @@ struct ContentBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::test_support::{header_value, request_body, request_path, start_mock};
+    use crate::provider::test_support::{
+        header_value, request_body, request_path, start_cross_origin_redirect, start_mock,
+    };
     use crate::provider::{DEFAULT_MAX_TOKENS, ModelId};
 
     fn sample_request() -> CompletionRequest {
@@ -246,5 +251,70 @@ mod tests {
         assert!(message.contains("[redacted]"), "{message}");
         assert!(!message.contains("super-secret-key"), "{message}");
         assert!(!rendered.contains("super-secret-key"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn complete_accepts_end_turn() {
+        let mock = start_mock(
+            200,
+            "OK",
+            r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"full answer"}]}"#,
+        )
+        .await;
+        let provider = AnthropicProvider::new("test-key", format!("{}/v1", mock.origin));
+
+        let response = provider
+            .complete(sample_request())
+            .await
+            .expect("completion");
+        mock.handle.abort();
+
+        assert_eq!(response.text, "full answer");
+    }
+
+    #[tokio::test]
+    async fn complete_rejects_max_tokens_stop_reason() {
+        let mock = start_mock(
+            200,
+            "OK",
+            r#"{"stop_reason":"max_tokens","content":[{"type":"text","text":"partial answer"}]}"#,
+        )
+        .await;
+        let provider = AnthropicProvider::new("test-key", format!("{}/v1", mock.origin));
+
+        let error = provider
+            .complete(sample_request())
+            .await
+            .expect_err("truncated");
+        mock.handle.abort();
+
+        assert_eq!(
+            error,
+            ProviderError::InvalidResponse("completion truncated by output length limit".into())
+        );
+        assert!(crate::retry::is_retryable_provider(&error));
+        assert!(!error.to_string().contains("partial answer"));
+    }
+
+    #[tokio::test]
+    async fn cross_origin_redirect_does_not_forward_api_key() {
+        let redirect = start_cross_origin_redirect("super-secret-key").await;
+        let provider =
+            AnthropicProvider::new("super-secret-key", format!("{}/v1", redirect.origin));
+
+        let error = provider
+            .complete(sample_request())
+            .await
+            .expect_err("redirect");
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let forwarded = redirect
+            .saw_secret
+            .load(std::sync::atomic::Ordering::SeqCst);
+        redirect.abort();
+
+        let message = error.to_string();
+        assert!(message.contains("302"), "{message}");
+        assert!(!message.contains("super-secret-key"), "{message}");
+        assert!(!forwarded, "api key was sent to the redirected origin");
     }
 }

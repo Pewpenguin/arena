@@ -250,7 +250,7 @@ struct StartRequest {
     judge: Option<String>,
     tasks: serde_json::Value,
     #[serde(default)]
-    seed: u64,
+    seed: String,
 }
 
 #[derive(Serialize)]
@@ -561,10 +561,27 @@ fn waiting_pairs(tasks: &[Task], models: &[ModelId]) -> Vec<PairRow> {
     pairs
 }
 
+fn parse_seed(raw: &str) -> std::result::Result<u64, &'static str> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(0);
+    }
+    if !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("seed must be a non-negative integer");
+    }
+    raw.parse::<u64>()
+        .map_err(|_| "seed must be a non-negative integer")
+}
+
+fn listen_url(listener: &tokio::net::TcpListener) -> std::io::Result<String> {
+    let addr = listener.local_addr()?;
+    Ok(format!("http://{addr}"))
+}
+
 pub async fn serve(port: u16) -> Result<()> {
     let addr = std::net::SocketAddr::from((BIND_HOST, port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    println!("Arena web UI: http://127.0.0.1:{port}");
+    println!("Arena web UI: {}", listen_url(&listener)?);
     axum::serve(listener, router()).await?;
     Ok(())
 }
@@ -655,13 +672,17 @@ async fn start_run(
         Ok(tasks) => tasks,
         Err(error) => return json_error(StatusCode::BAD_REQUEST, error.to_string()),
     };
+    let seed = match parse_seed(&request.seed) {
+        Ok(seed) => seed,
+        Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
+    };
 
     let config = match build_exec_config(
         request.models,
         request.judge,
         tasks,
         resolved.base_url.clone(),
-        request.seed,
+        seed,
     ) {
         Ok(config) => config,
         Err(error) => return json_error(StatusCode::BAD_REQUEST, error.to_string()),
@@ -1374,7 +1395,7 @@ tr.detail-row td {
   <div class="launch">
     <div>
       <label for="seed">Bootstrap seed</label>
-      <input id="seed" type="number" value="0" min="0" step="1">
+      <input id="seed" type="text" inputmode="numeric" value="0">
     </div>
     <div class="launch-action">
       <button id="start" class="primary" type="button">Run Tournament →</button>
@@ -1805,6 +1826,10 @@ function pairDetail(row) {
         true
       );
     });
+    appendField(dl, "AB reason", row.failure.reason_ab, false);
+    appendPre(dl, "AB raw completion", row.failure.raw_ab);
+    appendField(dl, "BA reason", row.failure.reason_ba, false);
+    appendPre(dl, "BA raw completion", row.failure.raw_ba);
   }
   wrap.append(dl);
   return wrap;
@@ -2060,7 +2085,7 @@ document.getElementById("start").addEventListener("click", async () => {
       models: [...selected],
       judge: document.getElementById("judge").value || null,
       tasks,
-      seed: Number(document.getElementById("seed").value || 0),
+      seed: document.getElementById("seed").value.trim() || "0",
     }),
   });
   const body = await response.json().catch(() => ({}));
@@ -2148,6 +2173,10 @@ mod tests {
                 error: "nope".into(),
                 attempts: 1,
             }],
+            raw_ab: None,
+            reason_ab: None,
+            raw_ba: None,
+            reason_ba: None,
         }
     }
 
@@ -2987,7 +3016,7 @@ mod tests {
                 models: vec!["m0".into(), "m1".into()],
                 judge: None,
                 tasks: sample_tasks(),
-                seed: 0,
+                seed: "0".into(),
             }),
         )
         .await;
@@ -3002,7 +3031,7 @@ mod tests {
                 models: vec!["m0".into(), "m1".into()],
                 judge: None,
                 tasks: sample_tasks(),
-                seed: 0,
+                seed: "0".into(),
             }),
         )
         .await;
@@ -3017,10 +3046,74 @@ mod tests {
                 models: vec!["judge".into()],
                 judge: Some("judge".into()),
                 tasks: sample_tasks(),
-                seed: 0,
+                seed: "0".into(),
             }),
         )
         .await;
         assert_eq!(invalid_models.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn seed_decimal_string_preserves_values_above_the_js_safe_integer() {
+        let request: StartRequest = serde_json::from_str(
+            r#"{"provider":"openai","models":["m0","m1"],"tasks":[{"id":"t1","prompt":"p"}],"seed":"9007199254740993"}"#,
+        )
+        .unwrap();
+        let seed = parse_seed(&request.seed).unwrap();
+        assert_eq!(seed, 9_007_199_254_740_993);
+        assert_eq!(parse_seed(" 9007199254740993 ").unwrap(), seed);
+        assert_eq!(parse_seed("").unwrap(), 0);
+        assert_eq!(parse_seed("  ").unwrap(), 0);
+
+        let tasks = task::parse(&serde_json::to_string(&request.tasks).unwrap()).unwrap();
+        let config = build_exec_config(
+            request.models,
+            None,
+            tasks,
+            "https://example.test/v1".into(),
+            seed,
+        )
+        .unwrap();
+        assert_eq!(config.seed, 9_007_199_254_740_993);
+    }
+
+    #[test]
+    fn parse_seed_rejects_values_that_are_not_u64() {
+        assert!(parse_seed("nope").is_err());
+        assert!(parse_seed("-1").is_err());
+        assert!(parse_seed("1.5").is_err());
+        assert!(parse_seed("9007199254740993.0").is_err());
+        assert!(parse_seed("18446744073709551616").is_err());
+    }
+
+    #[tokio::test]
+    async fn start_run_rejects_seed_strings_that_are_not_u64() {
+        let state = Arc::new(AppState::new());
+        let response = start_run(
+            State(state),
+            Json(StartRequest {
+                provider: WebProviderKind::Openai,
+                base_url: "https://example.test/v1".into(),
+                api_key: "secret".into(),
+                models: vec!["m0".into(), "m1".into()],
+                judge: None,
+                tasks: sample_tasks(),
+                seed: "9007199254740993.0".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn port_zero_advertises_the_bound_address() {
+        let listener = tokio::net::TcpListener::bind(std::net::SocketAddr::from((BIND_HOST, 0)))
+            .await
+            .expect("bind");
+        let url = listen_url(&listener).expect("local addr");
+        let addr = listener.local_addr().expect("local addr");
+        assert_eq!(url, format!("http://{addr}"));
+        assert_ne!(addr.port(), 0);
+        assert!(addr.ip().is_loopback());
     }
 }

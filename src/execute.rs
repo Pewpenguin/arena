@@ -276,4 +276,42 @@ mod tests {
         assert!(message.contains("m1"), "{message}");
         assert!(message.contains("upstream down"), "{message}");
     }
+
+    #[derive(Clone)]
+    struct AlwaysTruncated {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ModelProvider for AlwaysTruncated {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(ProviderError::InvalidResponse(
+                "completion truncated by output length limit".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_completion_exhausts_retries_and_keeps_context() {
+        let provider = AlwaysTruncated {
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let error = execute_models(&provider, &sample_task(), &[ModelId::new("m1")], |_| {})
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            crate::retry::ATTEMPTS as usize
+        );
+        assert_eq!(error.task_id, "t1");
+        assert_eq!(error.model, ModelId::new("m1"));
+        assert_eq!(
+            error.source,
+            ProviderError::InvalidResponse("completion truncated by output length limit".into())
+        );
+    }
 }
