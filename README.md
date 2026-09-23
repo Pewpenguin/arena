@@ -194,7 +194,7 @@ The interval is task-sampling variability of this observed-judgment estimator. I
 
 ## Providers
 
-`run` and `exec` take `--provider`. Every provider uses the same request timeout, connection timeout, and retry behavior. API keys stay in the provider client: they are omitted from debug output and are not written to run JSON or HTML reports. The web UI keeps using an OpenAI-compatible endpoint.
+`run` and `exec` take `--provider`. Every provider uses the same request timeout, connection timeout, and retry behavior. API keys stay in the provider client: they are omitted from debug output and are not written to run JSON or HTML reports. The web UI selects OpenAI, Claude, Gemini, or an OpenAI-compatible endpoint; the key stays in server memory and is not written into the page or the saved run.
 
 ### OpenAI-compatible
 

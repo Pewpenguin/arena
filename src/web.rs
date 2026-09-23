@@ -20,7 +20,9 @@ use crate::event::ExperimentEvent;
 use crate::exec::{self, ExecConfig};
 use crate::judge::{Judgment, JudgmentFailure};
 use crate::persist;
-use crate::provider::{ModelId, ModelProvider, OpenAICompatibleProvider};
+use crate::provider::{
+    AnthropicProvider, GeminiProvider, ModelId, ModelProvider, OpenAICompatibleProvider,
+};
 use crate::task::{self, Task};
 
 const BIND_HOST: [u8; 4] = [127, 0, 0, 1];
@@ -33,6 +35,7 @@ struct AppState {
 }
 
 struct ProviderSession {
+    kind: WebProviderKind,
     api_key: String,
     base_url: String,
 }
@@ -153,8 +156,79 @@ enum StartRunError {
     Busy,
 }
 
+const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
+const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WebProviderKind {
+    Openai,
+    Claude,
+    Gemini,
+    Compatible,
+}
+
+impl WebProviderKind {
+    fn fixed_base_url(self) -> Option<&'static str> {
+        match self {
+            Self::Openai => Some(OPENAI_BASE_URL),
+            Self::Claude => Some(ANTHROPIC_BASE_URL),
+            Self::Gemini => Some(GEMINI_BASE_URL),
+            Self::Compatible => None,
+        }
+    }
+
+    fn supports_model_discovery(self) -> bool {
+        matches!(self, Self::Openai | Self::Compatible)
+    }
+}
+
+struct ResolvedWebProvider {
+    kind: WebProviderKind,
+    api_key: String,
+    base_url: String,
+}
+
+impl std::fmt::Debug for ResolvedWebProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedWebProvider")
+            .field("kind", &self.kind)
+            .field("base_url", &self.base_url)
+            .finish_non_exhaustive()
+    }
+}
+
+fn resolve_web_provider(
+    kind: WebProviderKind,
+    api_key: &str,
+    base_url: &str,
+) -> std::result::Result<ResolvedWebProvider, &'static str> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return Err("API key is required");
+    }
+    let base_url = match kind.fixed_base_url() {
+        Some(url) => url.to_string(),
+        None => {
+            let url = base_url.trim();
+            if url.is_empty() {
+                return Err("base URL is required");
+            }
+            url.to_string()
+        }
+    };
+    Ok(ResolvedWebProvider {
+        kind,
+        api_key: api_key.to_string(),
+        base_url,
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct ConnectRequest {
+    provider: WebProviderKind,
+    #[serde(default)]
     base_url: String,
     api_key: String,
 }
@@ -166,6 +240,8 @@ struct ModelsResponse {
 
 #[derive(Debug, Deserialize)]
 struct StartRequest {
+    provider: WebProviderKind,
+    #[serde(default)]
     base_url: String,
     #[serde(default)]
     api_key: String,
@@ -514,19 +590,27 @@ async fn load_models(
     State(state): State<Arc<AppState>>,
     Json(request): Json<ConnectRequest>,
 ) -> Response {
-    let base_url = request.base_url.trim().to_string();
-    let api_key = request.api_key.trim().to_string();
-    if api_key.is_empty() {
-        return json_error(StatusCode::BAD_REQUEST, "API key is required");
+    if !request.provider.supports_model_discovery() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "model discovery is not available for this provider",
+        );
     }
-    if base_url.is_empty() {
-        return json_error(StatusCode::BAD_REQUEST, "base URL is required");
-    }
+    let resolved = match resolve_web_provider(request.provider, &request.api_key, &request.base_url)
+    {
+        Ok(resolved) => resolved,
+        Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
+    };
 
-    let provider = OpenAICompatibleProvider::new(api_key.clone(), base_url.clone());
+    let provider =
+        OpenAICompatibleProvider::new(resolved.api_key.clone(), resolved.base_url.clone());
     match provider.list_models().await {
         Ok(models) => {
-            *state.session.lock().await = Some(ProviderSession { api_key, base_url });
+            *state.session.lock().await = Some(ProviderSession {
+                kind: resolved.kind,
+                api_key: resolved.api_key,
+                base_url: resolved.base_url,
+            });
             (
                 StatusCode::OK,
                 Json(ModelsResponse {
@@ -544,26 +628,24 @@ async fn start_run(
     Json(request): Json<StartRequest>,
 ) -> Response {
     let session = state.session.lock().await;
+    let saved = session
+        .as_ref()
+        .filter(|item| item.kind == request.provider);
     let api_key = if request.api_key.trim().is_empty() {
-        session.as_ref().map(|item| item.api_key.clone())
+        saved.map(|item| item.api_key.clone()).unwrap_or_default()
     } else {
-        Some(request.api_key.trim().to_string())
-    };
-    let Some(api_key) = api_key.filter(|key| !key.is_empty()) else {
-        return json_error(StatusCode::BAD_REQUEST, "API key is required");
+        request.api_key.clone()
     };
     let base_url = if request.base_url.trim().is_empty() {
-        session
-            .as_ref()
-            .map(|item| item.base_url.clone())
-            .unwrap_or_default()
+        saved.map(|item| item.base_url.clone()).unwrap_or_default()
     } else {
-        request.base_url.trim().to_string()
+        request.base_url.clone()
     };
     drop(session);
-    if base_url.is_empty() {
-        return json_error(StatusCode::BAD_REQUEST, "base URL is required");
-    }
+    let resolved = match resolve_web_provider(request.provider, &api_key, &base_url) {
+        Ok(resolved) => resolved,
+        Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
+    };
 
     let tasks_json = match serde_json::to_string(&request.tasks) {
         Ok(json) => json,
@@ -578,15 +660,29 @@ async fn start_run(
         request.models,
         request.judge,
         tasks,
-        base_url.clone(),
+        resolved.base_url.clone(),
         request.seed,
     ) {
         Ok(config) => config,
         Err(error) => return json_error(StatusCode::BAD_REQUEST, error.to_string()),
     };
 
-    let provider = OpenAICompatibleProvider::new(api_key, base_url);
-    match start_experiment(state, config, provider, PathBuf::from(WEB_OUTPUT_DIR)).await {
+    let output_dir = PathBuf::from(WEB_OUTPUT_DIR);
+    let started = match resolved.kind {
+        WebProviderKind::Openai | WebProviderKind::Compatible => {
+            let provider = OpenAICompatibleProvider::new(resolved.api_key, resolved.base_url);
+            start_experiment(state, config, provider, output_dir).await
+        }
+        WebProviderKind::Claude => {
+            let provider = AnthropicProvider::new(resolved.api_key, resolved.base_url);
+            start_experiment(state, config, provider, output_dir).await
+        }
+        WebProviderKind::Gemini => {
+            let provider = GeminiProvider::new(resolved.api_key, resolved.base_url);
+            start_experiment(state, config, provider, output_dir).await
+        }
+    };
+    match started {
         Ok(run_id) => (StatusCode::ACCEPTED, Json(StartResponse { run_id })).into_response(),
         Err(StartRunError::Busy) => {
             json_error(StatusCode::CONFLICT, "an experiment is already running")
@@ -762,137 +858,617 @@ const PAGE: &str = r#"<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Arena</title>
 <style>
-body { font: 16px/1.45 system-ui, sans-serif; max-width: 48rem; margin: 2rem auto; padding: 0 1rem; color: #1d1c19; }
-h1 { font-size: 1.5rem; margin: 0 0 .3rem; }
-h2 { font-size: 1.05rem; margin: 1.5rem 0 .5rem; }
-.meta { color: #5e5b54; margin: 0 0 1.25rem; }
-label, .label { display: block; margin: .85rem 0 .3rem; font-weight: 600; }
-input[type=text], input[type=password], input[type=number], textarea, select {
-  width: 100%; box-sizing: border-box; padding: .4rem .5rem; font: inherit;
+:root {
+  --ink: #1c1915;
+  --muted: #5e584f;
+  --line: #e0d8cc;
+  --bg: #f6f3ec;
+  --field: #fffdf8;
+  --editor: #f3eee6;
+  --select: #f4ebe3;
+  --accent: #c04a2c;
+  --ok: #2f6b45;
+  --warn: #8a5a12;
+  --bad: #9c3a32;
+  --mono: ui-monospace, "Cascadia Mono", "Segoe UI Mono", monospace;
+  --sans: "Segoe UI", system-ui, sans-serif;
 }
-textarea { min-height: 10rem; font-family: ui-monospace, monospace; }
-button { font: inherit; padding: .4rem .8rem; margin: .4rem .4rem 0 0; cursor: pointer; }
-.row { display: flex; gap: .5rem; align-items: end; }
-.row > * { flex: 1; }
-.status { margin: .75rem 0; min-height: 1.3em; }
-.status.error { color: #8b2d2d; }
-.status.ok { color: #2b4b34; }
-.models { border: 1px solid #d9d3c7; max-height: 16rem; overflow: auto; padding: .4rem .6rem; }
-.models label { font-weight: 400; margin: .2rem 0; }
-.dash-head { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; }
-.head-right { display: flex; align-items: baseline; gap: .75rem; }
-.badge { font-size: .8rem; letter-spacing: .08em; font-weight: 700; }
-.badge.running { color: #5e4a16; }
-.badge.complete { color: #2b4b34; }
-.badge.incomplete { color: #5e5b54; }
-.badge.failed { color: #8b2d2d; }
-.elapsed { color: #5e5b54; font-variant-numeric: tabular-nums; }
-.overview { display: grid; grid-template-columns: repeat(auto-fit, minmax(7.5rem, 1fr)); gap: .75rem 1rem; margin: 1rem 0 1.25rem; }
-.overview div { margin: 0; }
-.overview dt { font-size: .8rem; color: #5e5b54; }
-.overview dd { margin: .15rem 0 0; font-weight: 600; }
-section { margin: 1.25rem 0; }
-.bar { background: #efeae1; height: .55rem; margin: .35rem 0 .2rem; }
-.bar > span { display: block; height: 100%; background: #2b4b34; width: 0; }
-.pair { border-bottom: 1px solid #ece6da; }
-.pair > summary { display: grid; grid-template-columns: 5.5rem 1fr auto; gap: .5rem; align-items: baseline; padding: .5rem 0; cursor: pointer; list-style: none; }
-.pair > summary::-webkit-details-marker { display: none; }
-.pair .state { font-size: .75rem; font-weight: 700; letter-spacing: .04em; color: #5e5b54; }
-.pair.resolved .state { color: #2b4b34; }
-.pair.failed .state { color: #8b2d2d; }
-.pair .detail { font-size: .9rem; padding: 0 0 .75rem 0; color: #3f3d39; }
-.pair .detail dl { display: grid; grid-template-columns: 11rem 1fr; gap: .2rem .75rem; margin: .4rem 0; }
-.pair .detail dt { color: #5e5b54; }
-.pair .detail dd { margin: 0; }
-.pair .detail pre { margin: .25rem 0 .6rem; padding: .45rem .55rem; background: #f6f3ee; white-space: pre-wrap; font: .85rem/1.35 ui-monospace, monospace; }
+* { box-sizing: border-box; }
+html { color-scheme: light; }
+html, body { overflow-x: hidden; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 14px/1.45 var(--sans);
+}
+.wrap { max-width: 76rem; margin: 0 auto; padding: 24px 32px 32px; }
+.mast {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+.brand h1 {
+  margin: 0;
+  font-size: 1.5rem;
+  font-weight: 700;
+  letter-spacing: .04em;
+  line-height: 1;
+  text-transform: uppercase;
+}
+.kicker {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: .68rem;
+  font-weight: 600;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+}
+.workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-areas:
+    "provider provider"
+    "manual manual"
+    "candidates judge"
+    "tasks tasks"
+    "controls controls";
+  gap: 16px 24px;
+  align-items: start;
+  margin-top: 24px;
+}
+.provider { grid-area: provider; }
+.manual { grid-area: manual; }
+.candidates { grid-area: candidates; }
+.judge { grid-area: judge; }
+.tasks { grid-area: tasks; }
+.controls { grid-area: controls; }
+.workspace > .region { min-width: 0; }
+.region h2, label.region-title, .section-line h2, .experiment > h2 {
+  display: block;
+  margin: 0 0 8px;
+  padding: 0;
+  border: 0;
+  color: var(--muted);
+  font-size: .68rem;
+  font-weight: 600;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+.region .meta { margin: 0 0 8px; color: var(--muted); font-size: .82rem; }
+label { display: block; margin: 0 0 4px; color: var(--muted); font-size: .68rem; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; }
+label.region-title { margin-top: 0; }
+input[type=text], input[type=password], input[type=number], textarea, select {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 0;
+  background: var(--field);
+  color: inherit;
+  font: inherit;
+}
+input[type=text]:hover, input[type=password]:hover, input[type=number]:hover, textarea:hover, select:hover {
+  border-color: #cfc6b8;
+}
+input:focus, textarea:focus, select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+textarea {
+  min-height: 10rem;
+  padding: 8px 12px;
+  background: var(--editor);
+  font-family: var(--mono);
+  font-size: .84rem;
+  line-height: 1.45;
+}
+#seed { max-width: 8rem; font-family: var(--mono); font-size: .9rem; }
+button {
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+}
+button.secondary:hover { border-color: var(--ink); }
+button.primary {
+  padding: 8px 14px;
+  border-color: var(--ink);
+  background: var(--ink);
+  color: var(--bg);
+  font-size: .72rem;
+  font-weight: 600;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+button.primary:hover { background: #000; border-color: #000; }
+button.text-button {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+}
+tr.openable button.text-button::before {
+  content: "";
+  display: inline-block;
+  width: 0;
+  height: 0;
+  margin-right: .4rem;
+  border-style: solid;
+  border-width: .28rem 0 .28rem .38rem;
+  border-color: transparent transparent transparent currentColor;
+  vertical-align: .05rem;
+}
+tr.open button.text-button::before {
+  border-width: .38rem .28rem 0 .28rem;
+  border-color: currentColor transparent transparent transparent;
+  vertical-align: .1rem;
+}
+.segments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 24px;
+  width: auto;
+  max-width: 100%;
+  margin: 0 0 16px;
+}
+button.segment {
+  margin: 0;
+  padding: 0 0 4px;
+  border: 0;
+  border-bottom: 1px solid transparent;
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: .72rem;
+  font-weight: 600;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+button.segment.is-selected {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  background: transparent;
+}
+button.segment:hover { color: var(--ink); }
+button.segment.is-selected:hover { color: var(--accent); }
+.provider-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 16px;
+  align-items: flex-end;
+}
+.provider-fields > div { flex: 1 1 16rem; min-width: 0; }
+.provider-fields > .actions { flex: 0 1 auto; margin: 0; }
+.picker { position: relative; }
+.picker.is-open, .region.menu-open { position: relative; z-index: 40; }
+.picker-toggle {
+  display: flex;
+  width: 100%;
+  justify-content: space-between;
+  align-items: center;
+  gap: .6rem;
+  padding: .4rem .55rem;
+  text-align: left;
+  font-weight: 400;
+  background: var(--field);
+}
+.picker-toggle span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.picker-toggle span.placeholder { color: var(--muted); }
+.picker-toggle span.mono-label { font-family: var(--mono); font-size: .86rem; }
+.picker-toggle::after {
+  content: "";
+  flex: 0 0 auto;
+  width: 0;
+  height: 0;
+  border-style: solid;
+  border-width: .34rem .26rem 0 .26rem;
+  border-color: currentColor transparent transparent transparent;
+}
+.picker-menu {
+  display: none;
+  position: absolute;
+  z-index: 2;
+  left: 0;
+  right: 0;
+  top: calc(100% + 2px);
+  flex-direction: column;
+  max-height: min(16rem, 45vh);
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 0;
+  background: var(--field);
+}
+.picker-menu.is-open { display: flex; }
+.picker-menu.above { top: auto; bottom: calc(100% + 2px); }
+.picker-menu input {
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  border-radius: 0;
+}
+.picker-options { min-width: 0; min-height: 0; overflow: auto; }
+.picker-option, button.picker-option {
+  display: flex;
+  align-items: center;
+  gap: .55rem;
+  width: max-content;
+  min-width: 100%;
+  margin: 0;
+  padding: .4rem .55rem;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  font-weight: 400;
+  font-family: var(--mono);
+  font-size: .86rem;
+  text-align: left;
+  white-space: nowrap;
+}
+label.picker-option { margin: 0; color: inherit; letter-spacing: 0; text-transform: none; }
+button.picker-option.plain { font-family: var(--sans); font-size: .9rem; letter-spacing: 0; text-transform: none; }
+.picker-option.is-selected { background: var(--select); border-left: 2px solid var(--accent); }
+.picker-option:hover, button.picker-option:hover { background: var(--editor); }
+.picker-option.is-selected:hover, button.picker-option.is-selected:hover { background: #efe2d6; }
+.picker-empty { margin: 0; padding: 8px; color: var(--muted); font-size: .82rem; }
+.inline { display: flex; gap: 8px; align-items: center; }
+.inline input { flex: 1; }
+.inline button { flex: 0 0 auto; }
+.actions { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.actions .status { margin: 0; }
+.status { margin: 8px 0; min-height: 1.3em; }
+.status.error { color: var(--bad); }
+.status.ok { color: var(--ok); }
+#dash_error { margin: 16px 0 0; font-family: var(--mono); font-size: .84rem; overflow-wrap: anywhere; text-transform: none; letter-spacing: 0; font-weight: 400; }
+#dash_error:empty { display: none; }
+.experiment { margin-top: 24px; }
+.experiment > h2.results-title { margin-top: 24px; }
+.facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 32px;
+  margin: 0 0 24px;
+}
+.facts div { min-width: 0; }
+.facts dt {
+  margin: 0;
+  color: var(--muted);
+  font-size: .68rem;
+  font-weight: 600;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+.facts dd {
+  margin: 4px 0 0;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: .92rem;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.mono { font-family: var(--mono); font-size: .86rem; overflow-wrap: anywhere; }
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.head-right { display: flex; align-items: baseline; gap: 16px; }
+.run-status {
+  color: var(--ink);
+  font-size: .72rem;
+  font-weight: 600;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+.run-status.running { color: var(--accent); }
+.run-status.complete { color: var(--ok); }
+.run-status.incomplete { color: var(--warn); }
+.run-status.failed { color: var(--bad); }
+.elapsed { font-family: var(--mono); font-size: .86rem; font-variant-numeric: tabular-nums; color: var(--muted); }
+.table-scroll { overflow-x: auto; }
+table.sheet { width: 100%; border-collapse: collapse; background: transparent; }
+table.sheet th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  text-align: left;
+  padding: 6px 12px 6px 0;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--muted);
+  font-size: .68rem;
+  font-weight: 600;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+table.sheet td {
+  padding: 8px 12px 8px 0;
+  border-bottom: 1px solid var(--line);
+  vertical-align: baseline;
+}
+input[type=checkbox] { width: auto; margin: 0; accent-color: var(--accent); }
+#ov_resolved.hot { color: var(--ok); }
+#ov_failed.hot { color: var(--bad); }
+.progress-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 16px;
+  margin: 0;
+}
+.section-line { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; }
+.section-line h2 { margin: 0; }
+.section-line .meta { margin: 0; color: var(--muted); font-family: var(--mono); font-size: .82rem; letter-spacing: 0; text-transform: none; }
+.bar { height: 2px; margin-top: 8px; overflow: hidden; border-radius: 0; background: var(--line); }
+.bar > span { display: block; height: 100%; width: 0; background: var(--accent); }
+#dashboard.is-complete .bar > span { background: var(--ok); }
+#dashboard.is-incomplete .bar > span { background: var(--warn); }
+#dashboard.is-failed .bar > span { background: var(--bad); }
+.results { margin-top: 8px; }
+table.pairs { min-width: 42rem; }
+table.pairs th { border-top: 1px solid var(--line); }
+table.pairs td { padding: 8px 16px 8px 0; }
+table.pairs td.mono { white-space: nowrap; }
+.c-status { width: 8.5rem; }
+.c-task { width: 8rem; }
+.c-outcome { width: 16rem; }
+td.state {
+  font-size: .72rem;
+  font-weight: 600;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+tr.resolved .state { color: var(--ok); }
+tr.failed .state { color: var(--bad); }
+tr.judging .state { color: var(--warn); }
+tr.waiting .state { color: var(--muted); }
+tr.detail-row td {
+  padding: 12px 0 16px 24px;
+  border-bottom: 1px solid var(--line);
+  background: transparent;
+  cursor: auto;
+}
+.detail { font-size: .88rem; }
+.detail dl { display: grid; grid-template-columns: 14rem minmax(0, 1fr); gap: 8px 16px; margin: 0; }
+.detail dt {
+  color: var(--muted);
+  font-size: .68rem;
+  font-weight: 600;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.detail dd { margin: 0; min-width: 0; }
+.detail pre {
+  margin: 0;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 0;
+  background: var(--field);
+  white-space: pre-wrap;
+  font: .8rem/1.4 var(--mono);
+}
+.launch {
+  display: flex;
+  justify-content: space-between;
+  align-items: end;
+  gap: 24px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+.launch-action { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+.launch-action .status { margin: 0; text-align: right; }
+:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; }
+@media (max-width: 800px) {
+  .wrap { padding: 16px; }
+  .workspace {
+    grid-template-columns: 1fr;
+    grid-template-areas: "provider" "manual" "candidates" "judge" "tasks" "controls";
+    gap: 16px;
+  }
+  .segments { gap: 8px 16px; }
+  .provider-fields { flex-direction: column; align-items: stretch; }
+  .provider-fields > div { flex-basis: auto; width: 100%; }
+  .facts { gap: 12px 16px; }
+  .launch { flex-direction: column; align-items: stretch; }
+  .launch-action { align-items: flex-start; }
+  .launch-action .status { text-align: left; }
+  .detail dl { grid-template-columns: 1fr; }
+  .mast { align-items: flex-start; }
+}
 </style>
 </head>
 <body>
+<div class="wrap">
 <div id="config">
-<h1>Arena</h1>
-<p class="meta">Configure an OpenAI-compatible provider and start a tournament.</p>
-
-<label for="base_url">Provider base URL</label>
-<input id="base_url" type="text" value="https://api.openai.com/v1" autocomplete="off">
-
-<label for="api_key">API key</label>
-<input id="api_key" type="password" autocomplete="off">
-
-<button id="load" type="button">Load Models</button>
-<p id="status" class="status"></p>
-
-<label for="filter">Discovered models</label>
-<input id="filter" type="text" placeholder="Filter models" autocomplete="off">
-<div id="model_list" class="models"></div>
-
-<div class="row">
-  <div>
-    <label for="manual">Add model ID</label>
-    <input id="manual" type="text" placeholder="provider/model-id" autocomplete="off">
+<header class="mast">
+  <div class="brand">
+    <h1>Arena</h1>
+    <p class="kicker">Model evaluation workbench</p>
   </div>
-  <div>
-    <span class="label">&nbsp;</span>
-    <button id="add" type="button">Add</button>
+</header>
+
+<div class="workspace">
+<section class="region provider">
+  <h2>Provider</h2>
+  <div class="segments" role="group" aria-label="Provider">
+    <button type="button" class="segment is-selected" data-provider="openai" aria-pressed="true">OpenAI</button>
+    <button type="button" class="segment" data-provider="claude" aria-pressed="false">Claude</button>
+    <button type="button" class="segment" data-provider="gemini" aria-pressed="false">Gemini</button>
+    <button type="button" class="segment" data-provider="compatible" aria-pressed="false">OpenAI-compatible</button>
   </div>
-</div>
+  <div class="provider-fields">
+    <div id="base_url_field" hidden>
+      <label for="base_url">Base URL</label>
+      <input id="base_url" class="mono" type="text" autocomplete="off" spellcheck="false">
+    </div>
+    <div>
+      <label for="api_key">API key</label>
+      <input id="api_key" type="password" autocomplete="off">
+    </div>
+    <div id="load_actions" class="actions">
+      <button id="load" class="secondary" type="button">Load Models</button>
+      <p id="status" class="status"></p>
+    </div>
+  </div>
+</section>
 
-<h2>Candidate models</h2>
-<p class="meta">Select one or more candidates. IDs must be unique.</p>
-<div id="candidates" class="models"></div>
+<section class="region manual" id="manual_field" hidden>
+  <h2>Model ID</h2>
+  <p class="meta">This provider does not list models. Enter an ID to add it.</p>
+  <div class="inline">
+    <input id="manual" class="mono" type="text" placeholder="model-id" autocomplete="off">
+    <button id="add" class="secondary" type="button">Add</button>
+  </div>
+</section>
 
-<h2>Judge model</h2>
-<p class="meta">Optional. Must not be a candidate.</p>
-<select id="judge">
-  <option value="">No judge</option>
-</select>
+<section class="region candidates">
+  <h2>Candidate models</h2>
+  <div class="picker" id="candidate_picker">
+    <button id="candidate_toggle" class="picker-toggle" type="button" aria-expanded="false" aria-controls="candidate_menu">
+      <span id="candidate_label" class="placeholder">Select candidate models</span>
+    </button>
+    <div id="candidate_menu" class="picker-menu">
+      <input id="candidate_search" type="text" placeholder="Search models..." autocomplete="off">
+      <div id="candidate_options" class="picker-options"></div>
+    </div>
+  </div>
+</section>
 
-<label for="tasks">Tasks JSON</label>
-<textarea id="tasks">[
+<section class="region judge">
+  <h2>Judge model</h2>
+  <div class="picker" id="judge_picker">
+    <button id="judge_toggle" class="picker-toggle" type="button" aria-expanded="false" aria-controls="judge_menu">
+      <span id="judge_label" class="placeholder">No judge</span>
+    </button>
+    <div id="judge_menu" class="picker-menu">
+      <input id="judge_search" type="text" placeholder="Search models..." autocomplete="off">
+      <div id="judge_options" class="picker-options"></div>
+    </div>
+  </div>
+  <input id="judge" type="hidden" value="">
+</section>
+
+<section class="region tasks">
+  <label for="tasks" class="region-title">Tasks JSON</label>
+  <textarea id="tasks">[
   {
     "id": "t1",
     "prompt": "Explain Rust ownership in two sentences."
   }
 ]</textarea>
+</section>
 
-<label for="seed">Bootstrap seed</label>
-<input id="seed" type="number" value="0" min="0" step="1">
-
-<button id="start" type="button">Start Tournament</button>
-<p id="run_status" class="status"></p>
+<section class="region controls">
+  <div class="launch">
+    <div>
+      <label for="seed">Bootstrap seed</label>
+      <input id="seed" type="number" value="0" min="0" step="1">
+    </div>
+    <div class="launch-action">
+      <button id="start" class="primary" type="button">Run Tournament →</button>
+      <p id="run_status" class="status"></p>
+    </div>
+  </div>
+</section>
+</div>
 </div>
 
 <div id="dashboard" hidden>
-  <div class="dash-head">
-    <h1>Arena</h1>
+  <header class="mast">
+    <div class="brand">
+      <h1>Arena</h1>
+      <p class="kicker">Model evaluation workbench</p>
+    </div>
     <div class="head-right">
       <span id="dash_elapsed" class="elapsed">0:00</span>
-      <span id="dash_status" class="badge running">Running</span>
+      <span id="dash_status" class="run-status running">Running</span>
+    </div>
+  </header>
+  <div class="experiment">
+  <p id="dash_error" class="status error"></p>
+  <h2>Experiment</h2>
+  <dl class="facts">
+    <div>
+      <dt>Candidates</dt>
+      <dd id="ov_candidates" class="num">0</dd>
+    </div>
+    <div>
+      <dt>Tasks</dt>
+      <dd id="ov_tasks" class="num">0</dd>
+    </div>
+    <div>
+      <dt>Judge</dt>
+      <dd id="ov_judge" class="mono">—</dd>
+    </div>
+    <div>
+      <dt>Resolved</dt>
+      <dd id="ov_resolved" class="num">0</dd>
+    </div>
+    <div>
+      <dt>Failed</dt>
+      <dd id="ov_failed" class="num">0</dd>
+    </div>
+  </dl>
+  <div class="progress-grid">
+    <div>
+      <div class="section-line">
+        <h2>Candidates</h2>
+        <p id="cand_label" class="meta">0 / 0</p>
+      </div>
+      <div class="bar"><span id="cand_bar"></span></div>
+    </div>
+    <div>
+      <div class="section-line">
+        <h2>Pairs</h2>
+        <p id="pair_label" class="meta">0 / 0 pairs</p>
+      </div>
+      <div class="bar"><span id="pair_bar"></span></div>
     </div>
   </div>
-  <p id="dash_error" class="status error"></p>
-  <dl class="overview">
-    <div><dt>Candidates</dt><dd id="ov_candidates">0</dd></div>
-    <div><dt>Tasks</dt><dd id="ov_tasks">0</dd></div>
-    <div><dt>Judge</dt><dd id="ov_judge">—</dd></div>
-    <div><dt>Resolved</dt><dd id="ov_resolved">0</dd></div>
-    <div><dt>Failed</dt><dd id="ov_failed">0</dd></div>
-  </dl>
-  <section>
-    <h2>Candidates</h2>
-    <div class="bar"><span id="cand_bar"></span></div>
-    <p id="cand_label" class="meta">0 / 0</p>
-  </section>
-  <section>
-    <h2>Pairs</h2>
-    <div class="bar"><span id="pair_bar"></span></div>
-    <p id="pair_label" class="meta">0 / 0 pairs</p>
-    <div id="pair_list"></div>
-  </section>
+  <h2 class="results-title">Pairwise evaluation</h2>
+  <div class="results table-scroll">
+    <table class="sheet pairs">
+      <colgroup>
+        <col class="c-status">
+        <col class="c-task">
+        <col>
+        <col class="c-outcome">
+      </colgroup>
+      <thead>
+        <tr>
+          <th>Status</th>
+          <th>Task</th>
+          <th>Models</th>
+          <th>Outcome</th>
+        </tr>
+      </thead>
+      <tbody id="pair_list"></tbody>
+    </table>
+  </div>
+  </div>
+</div>
 </div>
 
 <script>
 const models = [];
 const selected = new Set();
+let provider = "openai";
+let candidateQuery = "";
+let judgeQuery = "";
+let activeMenu = "";
+let judgeValue = "";
 let view = null;
 let seenSeq = 0;
 let elapsedTimer = null;
@@ -912,48 +1488,164 @@ function baseUrl() {
   return document.getElementById("base_url").value.trim();
 }
 
+function clearJudgeIfCandidate(id) {
+  if (judgeValue !== id) return;
+  judgeValue = "";
+  document.getElementById("judge").value = "";
+}
+
+function toggleCandidate(id, on) {
+  if (on) selected.add(id); else selected.delete(id);
+  clearJudgeIfCandidate(id);
+  render();
+}
+
+function placeMenu(menu, toggle) {
+  menu.classList.remove("above");
+  const rect = toggle.getBoundingClientRect();
+  const spaceBelow = window.innerHeight - rect.bottom;
+  if (spaceBelow < 180 && rect.top > spaceBelow) menu.classList.add("above");
+}
+
+function setMenu(name) {
+  if (activeMenu === name) return;
+  if (activeMenu === "candidate" || name !== "candidate") {
+    candidateQuery = "";
+    document.getElementById("candidate_search").value = "";
+  }
+  if (activeMenu === "judge" || name !== "judge") {
+    judgeQuery = "";
+    document.getElementById("judge_search").value = "";
+  }
+  activeMenu = name;
+  const candidateOn = name === "candidate";
+  const judgeOn = name === "judge";
+  document.getElementById("candidate_menu").classList.toggle("is-open", candidateOn);
+  document.getElementById("judge_menu").classList.toggle("is-open", judgeOn);
+  document.getElementById("candidate_picker").classList.toggle("is-open", candidateOn);
+  document.getElementById("judge_picker").classList.toggle("is-open", judgeOn);
+  document.querySelector(".candidates").classList.toggle("menu-open", candidateOn);
+  document.querySelector(".judge").classList.toggle("menu-open", judgeOn);
+  document.getElementById("candidate_toggle").setAttribute("aria-expanded", candidateOn ? "true" : "false");
+  document.getElementById("judge_toggle").setAttribute("aria-expanded", judgeOn ? "true" : "false");
+  if (candidateOn) {
+    const menu = document.getElementById("candidate_menu");
+    placeMenu(menu, document.getElementById("candidate_toggle"));
+    document.getElementById("candidate_search").focus();
+  }
+  if (judgeOn) {
+    const menu = document.getElementById("judge_menu");
+    placeMenu(menu, document.getElementById("judge_toggle"));
+    document.getElementById("judge_search").focus();
+  }
+}
+
 function render() {
-  const query = document.getElementById("filter").value.trim().toLowerCase();
-  const list = document.getElementById("model_list");
-  list.replaceChildren();
-  models.filter((id) => !query || id.toLowerCase().includes(query)).forEach((id) => {
-    const label = document.createElement("label");
-    const box = document.createElement("input");
-    box.type = "checkbox";
-    box.checked = selected.has(id);
-    box.addEventListener("change", () => {
-      if (box.checked) selected.add(id); else selected.delete(id);
-      if (document.getElementById("judge").value === id) {
-        document.getElementById("judge").value = "";
-      }
+  const label = document.getElementById("candidate_label");
+  if (selected.size === 0) {
+    label.textContent = "Select candidate models";
+    label.className = "placeholder";
+  } else if (selected.size === 1) {
+    label.textContent = "1 model selected";
+    label.className = "";
+  } else {
+    label.textContent = selected.size + " models selected";
+    label.className = "";
+  }
+  const options = document.getElementById("candidate_options");
+  options.replaceChildren();
+  const visible = models.filter((id) => !candidateQuery || id.toLowerCase().includes(candidateQuery));
+  if (visible.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "picker-empty";
+    empty.textContent = models.length === 0 ? "No models yet" : "No matching models";
+    options.append(empty);
+  } else {
+    visible.forEach((id) => {
+      const row = document.createElement("label");
+      row.className = "picker-option" + (selected.has(id) ? " is-selected" : "");
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.checked = selected.has(id);
+      box.addEventListener("change", () => toggleCandidate(id, box.checked));
+      const text = document.createElement("span");
+      text.textContent = id;
+      row.append(box, text);
+      options.append(row);
+    });
+  }
+
+  if (judgeValue && selected.has(judgeValue)) judgeValue = "";
+  document.getElementById("judge").value = judgeValue;
+  const judgeLabel = document.getElementById("judge_label");
+  if (judgeValue) {
+    judgeLabel.textContent = judgeValue;
+    judgeLabel.className = "mono-label";
+  } else {
+    judgeLabel.textContent = "No judge";
+    judgeLabel.className = "placeholder";
+  }
+  const judgeOptions = document.getElementById("judge_options");
+  judgeOptions.replaceChildren();
+  const none = document.createElement("button");
+  none.type = "button";
+  none.className = "picker-option plain" + (judgeValue ? "" : " is-selected");
+  none.textContent = "No judge";
+  none.addEventListener("click", () => {
+    judgeValue = "";
+    document.getElementById("judge").value = "";
+    setMenu("");
+    render();
+  });
+  judgeOptions.append(none);
+  const judgeNeedle = judgeQuery.trim().toLowerCase();
+  const judgeModels = models.filter((id) => !selected.has(id) && (!judgeNeedle || id.toLowerCase().includes(judgeNeedle)));
+  if (models.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "picker-empty";
+    empty.textContent = "No models yet";
+    judgeOptions.append(empty);
+  }
+  judgeModels.forEach((id) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "picker-option" + (judgeValue === id ? " is-selected" : "");
+    button.textContent = id;
+    button.addEventListener("click", () => {
+      judgeValue = id;
+      document.getElementById("judge").value = id;
+      setMenu("");
       render();
     });
-    label.append(box, " " + id);
-    list.append(label);
+    judgeOptions.append(button);
   });
+}
 
-  const candidates = document.getElementById("candidates");
-  candidates.replaceChildren();
-  [...selected].forEach((id) => {
-    const div = document.createElement("div");
-    div.textContent = id;
-    candidates.append(div);
+function applyProvider(next) {
+  provider = next;
+  models.length = 0;
+  selected.clear();
+  judgeValue = "";
+  document.getElementById("judge").value = "";
+  candidateQuery = "";
+  judgeQuery = "";
+  document.getElementById("candidate_search").value = "";
+  document.getElementById("judge_search").value = "";
+  document.getElementById("base_url").value = "";
+  document.getElementById("api_key").value = "";
+  status("status", "", true);
+  document.querySelectorAll(".segment").forEach((button) => {
+    const on = button.dataset.provider === next;
+    button.classList.toggle("is-selected", on);
+    button.setAttribute("aria-pressed", on ? "true" : "false");
   });
-
-  const judge = document.getElementById("judge");
-  const current = judge.value;
-  judge.replaceChildren();
-  const none = document.createElement("option");
-  none.value = "";
-  none.textContent = "No judge";
-  judge.append(none);
-  models.filter((id) => !selected.has(id)).forEach((id) => {
-    const option = document.createElement("option");
-    option.value = id;
-    option.textContent = id;
-    judge.append(option);
-  });
-  judge.value = selected.has(current) ? "" : current;
+  const discovery = next === "openai" || next === "compatible";
+  document.getElementById("base_url_field").hidden = next !== "compatible";
+  document.getElementById("load_actions").hidden = !discovery;
+  document.getElementById("manual").value = "";
+  document.getElementById("manual_field").hidden = discovery;
+  setMenu("");
+  render();
 }
 
 function addModel(id) {
@@ -1062,11 +1754,12 @@ function upsertPair(taskId, modelA, modelB, status, judgment, failure) {
   });
 }
 
-function appendField(dl, label, value) {
+function appendField(dl, label, value, mono) {
   if (value == null || value === "") return;
   const dt = document.createElement("dt");
   dt.textContent = label;
   const dd = document.createElement("dd");
+  if (mono) dd.className = "mono";
   dd.textContent = value;
   dl.append(dt, dd);
 }
@@ -1086,29 +1779,30 @@ function pairDetail(row) {
   const wrap = document.createElement("div");
   wrap.className = "detail";
   const dl = document.createElement("dl");
-  appendField(dl, "Task", row.task_id);
-  appendField(dl, "Model A", row.model_a);
-  appendField(dl, "Model B", row.model_b);
+  appendField(dl, "Task", row.task_id, true);
+  appendField(dl, "Model A", row.model_a, true);
+  appendField(dl, "Model B", row.model_b, true);
   if (row.judgment) {
     const j = row.judgment;
-    appendField(dl, "Final winner", decisionText(j.winner, j.model_a, j.model_b));
-    appendField(dl, "Agreement", j.agreement ? "agree" : "disagree");
-    appendField(dl, "Duration", j.duration_ms + " ms");
-    appendField(dl, "Judge", j.judge_model);
-    appendField(dl, "AB winner (mapped A/B frame)", j.orientation_ab == null ? null : decisionText(j.orientation_ab, j.model_a, j.model_b));
-    appendField(dl, "BA winner (mapped A/B frame)", j.orientation_ba == null ? null : decisionText(j.orientation_ba, j.model_a, j.model_b));
-    appendField(dl, "Reason AB", j.reason_ab);
-    appendField(dl, "Reason BA", j.reason_ba);
+    appendField(dl, "Final winner", decisionText(j.winner, j.model_a, j.model_b), true);
+    appendField(dl, "Agreement", j.agreement ? "agree" : "disagree", false);
+    appendField(dl, "Duration", j.duration_ms + " ms", true);
+    appendField(dl, "Judge", j.judge_model, true);
+    appendField(dl, "AB winner (mapped A/B frame)", j.orientation_ab == null ? null : decisionText(j.orientation_ab, j.model_a, j.model_b), true);
+    appendField(dl, "BA winner (mapped A/B frame)", j.orientation_ba == null ? null : decisionText(j.orientation_ba, j.model_a, j.model_b), true);
+    appendField(dl, "Reason AB", j.reason_ab, false);
+    appendField(dl, "Reason BA", j.reason_ba, false);
     appendPre(dl, "Raw AB (prompt frame)", j.raw_ab);
     appendPre(dl, "Raw BA (prompt frame)", j.raw_ba);
   }
   if (row.failure) {
-    appendField(dl, "Judge", row.failure.judge_model);
+    appendField(dl, "Judge", row.failure.judge_model, true);
     (row.failure.orientations || []).forEach((item) => {
       appendField(
         dl,
         item.orientation.toUpperCase() + " " + item.kind,
-        item.error + " (attempts: " + item.attempts + ")"
+        item.error + " (attempts: " + item.attempts + ")",
+        true
       );
     });
   }
@@ -1118,9 +1812,12 @@ function pairDetail(row) {
 
 function renderDash() {
   if (!view) return;
+  const dash = document.getElementById("dashboard");
+  dash.classList.remove("is-running", "is-complete", "is-incomplete", "is-failed");
+  dash.classList.add(view.status === "complete" ? "is-complete" : view.status === "incomplete" ? "is-incomplete" : view.status === "failed" ? "is-failed" : "is-running");
   const statusEl = document.getElementById("dash_status");
   statusEl.textContent = statusLabel(view.status);
-  statusEl.className = "badge " + (view.status === "complete" ? "complete" : view.status === "incomplete" ? "incomplete" : view.status === "failed" ? "failed" : "running");
+  statusEl.className = "run-status " + (view.status === "complete" ? "complete" : view.status === "incomplete" ? "incomplete" : view.status === "failed" ? "failed" : "running");
   const note = document.getElementById("dash_error");
   if (view.error) {
     note.textContent = view.error;
@@ -1135,8 +1832,12 @@ function renderDash() {
   document.getElementById("ov_candidates").textContent = String(view.candidate_count || 0);
   document.getElementById("ov_tasks").textContent = String(view.task_count || 0);
   document.getElementById("ov_judge").textContent = view.judge || "None";
-  document.getElementById("ov_resolved").textContent = String(view.resolved_pairs);
-  document.getElementById("ov_failed").textContent = String(view.failed_pairs);
+  const resolved = document.getElementById("ov_resolved");
+  resolved.textContent = String(view.resolved_pairs);
+  resolved.className = "num" + (view.resolved_pairs > 0 ? " hot" : "");
+  const failed = document.getElementById("ov_failed");
+  failed.textContent = String(view.failed_pairs);
+  failed.className = "num" + (view.failed_pairs > 0 ? " hot" : "");
   renderElapsed();
   const candDone = view.candidate_completed;
   const candTotal = view.candidate_total;
@@ -1149,27 +1850,45 @@ function renderDash() {
   const list = document.getElementById("pair_list");
   list.replaceChildren();
   view.pairs.forEach((row) => {
-    const details = document.createElement("details");
-    details.className = "pair " + row.status;
     const key = pairKey(row);
-    details.open = openPairs.has(key);
-    details.addEventListener("toggle", () => {
-      if (details.open) openPairs.add(key); else openPairs.delete(key);
-    });
-    const summary = document.createElement("summary");
-    const state = document.createElement("span");
+    const expandable = row.status === "resolved" || row.status === "failed";
+    const tr = document.createElement("tr");
+    tr.className = row.status + (expandable ? " openable" : "") + (openPairs.has(key) ? " open" : "");
+    const state = document.createElement("td");
     state.className = "state";
-    state.textContent = row.status === "resolved" ? "Resolved" : row.status === "failed" ? "Failed" : row.status === "judging" ? "Judging" : "Waiting";
-    const vs = document.createElement("span");
-    vs.textContent = row.model_a + " vs " + row.model_b + " · " + row.task_id;
-    const out = document.createElement("span");
-    out.textContent = compactOutcome(row);
-    summary.append(state, vs, out);
-    details.append(summary);
-    if (row.status === "resolved" || row.status === "failed") {
-      details.append(pairDetail(row));
+    const stateText = row.status === "resolved" ? "Resolved" : row.status === "failed" ? "Failed" : row.status === "judging" ? "Judging" : "Waiting";
+    if (expandable) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "text-button";
+      button.textContent = stateText;
+      button.addEventListener("click", () => {
+        if (openPairs.has(key)) openPairs.delete(key); else openPairs.add(key);
+        renderDash();
+      });
+      state.append(button);
+    } else {
+      state.textContent = stateText;
     }
-    list.append(details);
+    const task = document.createElement("td");
+    task.className = "mono";
+    task.textContent = row.task_id;
+    const modelsCell = document.createElement("td");
+    modelsCell.className = "mono";
+    modelsCell.textContent = row.model_a + "  ↔  " + row.model_b;
+    const out = document.createElement("td");
+    out.textContent = compactOutcome(row);
+    tr.append(state, task, modelsCell, out);
+    list.append(tr);
+    if (expandable && openPairs.has(key)) {
+      const detail = document.createElement("tr");
+      detail.className = "detail-row";
+      const td = document.createElement("td");
+      td.colSpan = 4;
+      td.append(pairDetail(row));
+      detail.append(td);
+      list.append(detail);
+    }
   });
 }
 
@@ -1257,10 +1976,46 @@ function showDashboard(runId) {
   };
 }
 
-document.getElementById("filter").addEventListener("input", render);
-document.getElementById("add").addEventListener("click", () => {
+document.querySelectorAll(".segment").forEach((button) => {
+  button.addEventListener("click", () => applyProvider(button.dataset.provider));
+});
+document.getElementById("candidate_toggle").addEventListener("click", () => {
+  setMenu(activeMenu === "candidate" ? "" : "candidate");
+  render();
+});
+document.getElementById("judge_toggle").addEventListener("click", () => {
+  setMenu(activeMenu === "judge" ? "" : "judge");
+  render();
+});
+document.getElementById("candidate_search").addEventListener("input", () => {
+  candidateQuery = document.getElementById("candidate_search").value.trim().toLowerCase();
+  render();
+});
+document.getElementById("judge_search").addEventListener("input", () => {
+  judgeQuery = document.getElementById("judge_search").value;
+  render();
+});
+document.addEventListener("click", (event) => {
+  if (!activeMenu) return;
+  const root = document.getElementById(activeMenu === "candidate" ? "candidate_picker" : "judge_picker");
+  if (root.contains(event.target)) return;
+  setMenu("");
+  render();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || !activeMenu) return;
+  setMenu("");
+  render();
+});
+function submitManual() {
   addModel(document.getElementById("manual").value);
   document.getElementById("manual").value = "";
+}
+document.getElementById("add").addEventListener("click", submitManual);
+document.getElementById("manual").addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  submitManual();
 });
 
 document.getElementById("load").addEventListener("click", async () => {
@@ -1268,7 +2023,11 @@ document.getElementById("load").addEventListener("click", async () => {
   const response = await fetch("/api/models", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ base_url: baseUrl(), api_key: apiKey() }),
+    body: JSON.stringify({
+      provider,
+      base_url: provider === "compatible" ? baseUrl() : "",
+      api_key: apiKey(),
+    }),
   });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -1295,7 +2054,8 @@ document.getElementById("start").addEventListener("click", async () => {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      base_url: baseUrl(),
+      provider,
+      base_url: provider === "compatible" ? baseUrl() : "",
       api_key: apiKey(),
       models: [...selected],
       judge: document.getElementById("judge").value || null,
@@ -1311,7 +2071,7 @@ document.getElementById("start").addEventListener("click", async () => {
   showDashboard(body.run_id);
 });
 
-render();
+applyProvider("openai");
 </script>
 </body>
 </html>
@@ -2121,5 +2881,146 @@ mod tests {
         assert_eq!(report.failed_pairs.len(), 1);
         assert!(!report.results.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn selected_provider_uses_the_matching_client() {
+        let openai = resolve_web_provider(
+            WebProviderKind::Openai,
+            " super-secret-web-key ",
+            "https://ignored.example/v1",
+        )
+        .unwrap();
+        assert_eq!(openai.api_key, "super-secret-web-key");
+        assert_eq!(openai.base_url, "https://api.openai.com/v1");
+        let openai_client = OpenAICompatibleProvider::new(&openai.api_key, &openai.base_url);
+        assert_eq!(openai_client.base_url(), "https://api.openai.com/v1");
+        assert!(!format!("{openai_client:?}").contains("super-secret-web-key"));
+
+        let compatible = resolve_web_provider(
+            WebProviderKind::Compatible,
+            "key",
+            " https://deepinfra.example/v1/ ",
+        )
+        .unwrap();
+        assert_eq!(compatible.base_url, "https://deepinfra.example/v1/");
+        assert_eq!(
+            OpenAICompatibleProvider::new(&compatible.api_key, &compatible.base_url).base_url(),
+            "https://deepinfra.example/v1/"
+        );
+
+        let claude =
+            resolve_web_provider(WebProviderKind::Claude, "key", "https://nope.example").unwrap();
+        assert_eq!(claude.base_url, "https://api.anthropic.com/v1");
+        assert!(!WebProviderKind::Claude.supports_model_discovery());
+        assert_eq!(
+            AnthropicProvider::new(&claude.api_key, &claude.base_url).base_url(),
+            "https://api.anthropic.com/v1"
+        );
+
+        let gemini = resolve_web_provider(WebProviderKind::Gemini, "key", "").unwrap();
+        assert_eq!(
+            gemini.base_url,
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
+        assert!(!WebProviderKind::Gemini.supports_model_discovery());
+        let gemini_client = GeminiProvider::new("super-secret-web-key", &gemini.base_url);
+        assert_eq!(
+            gemini_client.base_url(),
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
+        assert!(!format!("{gemini_client:?}").contains("super-secret-web-key"));
+
+        assert_eq!(
+            resolve_web_provider(WebProviderKind::Compatible, "key", " ").unwrap_err(),
+            "base URL is required"
+        );
+        assert_eq!(
+            resolve_web_provider(WebProviderKind::Openai, " ", "").unwrap_err(),
+            "API key is required"
+        );
+        assert!(WebProviderKind::Openai.supports_model_discovery());
+        assert!(WebProviderKind::Compatible.supports_model_discovery());
+    }
+
+    fn sample_tasks() -> serde_json::Value {
+        serde_json::json!([{ "id": "t1", "prompt": "p" }])
+    }
+
+    #[tokio::test]
+    async fn load_models_rejects_providers_without_discovery() {
+        let state = Arc::new(AppState::new());
+        for kind in [WebProviderKind::Claude, WebProviderKind::Gemini] {
+            let response = load_models(
+                State(state.clone()),
+                Json(ConnectRequest {
+                    provider: kind,
+                    base_url: String::new(),
+                    api_key: "secret".into(),
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        let missing_url = load_models(
+            State(state),
+            Json(ConnectRequest {
+                provider: WebProviderKind::Compatible,
+                base_url: "  ".into(),
+                api_key: "secret".into(),
+            }),
+        )
+        .await;
+        assert_eq!(missing_url.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn start_run_rejects_invalid_provider_configuration() {
+        let state = Arc::new(AppState::new());
+        let missing_key = start_run(
+            State(state.clone()),
+            Json(StartRequest {
+                provider: WebProviderKind::Openai,
+                base_url: "https://evil.example/v1".into(),
+                api_key: " ".into(),
+                models: vec!["m0".into(), "m1".into()],
+                judge: None,
+                tasks: sample_tasks(),
+                seed: 0,
+            }),
+        )
+        .await;
+        assert_eq!(missing_key.status(), StatusCode::BAD_REQUEST);
+
+        let missing_url = start_run(
+            State(state.clone()),
+            Json(StartRequest {
+                provider: WebProviderKind::Compatible,
+                base_url: String::new(),
+                api_key: "secret".into(),
+                models: vec!["m0".into(), "m1".into()],
+                judge: None,
+                tasks: sample_tasks(),
+                seed: 0,
+            }),
+        )
+        .await;
+        assert_eq!(missing_url.status(), StatusCode::BAD_REQUEST);
+
+        let invalid_models = start_run(
+            State(state),
+            Json(StartRequest {
+                provider: WebProviderKind::Claude,
+                base_url: String::new(),
+                api_key: "secret".into(),
+                models: vec!["judge".into()],
+                judge: Some("judge".into()),
+                tasks: sample_tasks(),
+                seed: 0,
+            }),
+        )
+        .await;
+        assert_eq!(invalid_models.status(), StatusCode::BAD_REQUEST);
     }
 }
