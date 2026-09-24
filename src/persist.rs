@@ -612,4 +612,53 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn current_experiment_fixture_loads_and_reports() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/experiment.json");
+        let output = read(&path).expect("fixture");
+        let report = crate::report::from_output(&output);
+
+        assert_eq!(output.run.version, "1.2.0");
+        assert_eq!(output.run.complete, Some(false));
+        assert_eq!(output.run.expected_pairs, Some(2));
+        assert_eq!(output.run.resolved_pairs, Some(1));
+        assert_eq!(output.run.failed_pairs, Some(1));
+        assert_eq!(output.tasks.len(), 2);
+        assert_eq!(output.results.len(), 4);
+        assert_eq!(output.comparisons.len(), 1);
+        assert_eq!(output.judgments.as_ref().map(Vec::len), Some(1));
+        assert_eq!(output.judgment_failures.as_ref().map(Vec::len), Some(1));
+        assert_eq!(output.statistics.as_ref().map(Vec::len), Some(2));
+        assert_eq!(output.ratings.as_ref().map(Vec::len), Some(2));
+        assert_eq!(
+            output.run.bootstrap_unavailable,
+            Some(crate::bootstrap::BootstrapUnavailable::OriginalUnrated)
+        );
+        assert!(output.run.bootstrap_valid.is_none());
+
+        assert!(report.summary.judge_used);
+        assert_eq!(report.summary.complete, Some(false));
+        assert_eq!(report.summary.task_count, 2);
+        assert_eq!(report.summary.candidate_count, 2);
+        assert_eq!(report.pairs.len(), 1);
+        assert_eq!(report.failed_pairs.len(), 1);
+        assert_eq!(report.results.len(), 4);
+        assert_eq!(report.models.len(), 2);
+        assert!(report.models.iter().all(|model| model.rating.is_none()));
+        let bootstrap = report.bootstrap.as_ref().expect("bootstrap");
+        assert_eq!(bootstrap.seed, 0);
+        assert_eq!(bootstrap.replicates, 1000);
+        assert!(!bootstrap.ran);
+        assert!(bootstrap.valid.is_none());
+        assert_eq!(
+            bootstrap.unavailable,
+            Some(crate::bootstrap::BootstrapUnavailable::OriginalUnrated)
+        );
+
+        let html = crate::html::render(&report);
+        assert!(html.contains("INCOMPLETE"));
+        assert!(html.contains("model-a"));
+        assert!(html.contains("separated"));
+    }
 }

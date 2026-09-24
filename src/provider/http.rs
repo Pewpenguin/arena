@@ -14,7 +14,7 @@ pub(super) fn client() -> Client {
         .expect("failed to create HTTP client")
 }
 
-fn redirect_policy() -> Policy {
+pub(super) fn redirect_policy() -> Policy {
     Policy::custom(|attempt| {
         if attempt.previous().len() > MAX_REDIRECTS {
             return attempt.error("too many redirects");

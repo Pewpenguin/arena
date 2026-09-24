@@ -58,6 +58,7 @@ impl OpenAICompatibleProvider {
             client: Client::builder()
                 .timeout(request_timeout)
                 .connect_timeout(connect_timeout)
+                .redirect(http::redirect_policy())
                 .build()
                 .expect("failed to create HTTP client"),
             api_key: api_key.into(),
@@ -619,6 +620,29 @@ mod tests {
         assert!(message.contains("HTTP 500"), "{message}");
         assert!(message.contains("[redacted]"), "{message}");
         assert!(!message.contains("super-secret-key"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn cross_origin_redirect_does_not_forward_api_key() {
+        let redirect =
+            crate::provider::test_support::start_cross_origin_redirect("super-secret-key").await;
+        let provider =
+            OpenAICompatibleProvider::new("super-secret-key", format!("{}/v1", redirect.origin));
+
+        let error = provider
+            .complete(sample_request())
+            .await
+            .expect_err("redirect");
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let forwarded = redirect
+            .saw_secret
+            .load(std::sync::atomic::Ordering::SeqCst);
+        redirect.abort();
+
+        let message = error.to_string();
+        assert!(message.contains("302"), "{message}");
+        assert!(!message.contains("super-secret-key"), "{message}");
+        assert!(!forwarded, "api key was sent to the redirected origin");
     }
 
     #[tokio::test]

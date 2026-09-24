@@ -1,0 +1,167 @@
+{
+  "run": {
+    "version": "1.2.0",
+    "models": ["model-a", "model-b"],
+    "judge": "judge",
+    "tasks": "tasks.json",
+    "base_url": "https://api.openai.com/v1",
+    "started_at": "2026-09-23T12:00:00Z",
+    "provider_concurrency": 8,
+    "request_timeout_secs": 120,
+    "connect_timeout_secs": 10,
+    "candidate_attempts": 3,
+    "judge_attempts": 3,
+    "candidate_max_tokens": 4096,
+    "complete": false,
+    "expected_pairs": 2,
+    "resolved_pairs": 1,
+    "failed_pairs": 1,
+    "orientation_agreement": {
+      "resolved_pairs": 1,
+      "orientation_agreeing_pairs": 1,
+      "orientation_disagreeing_pairs": 0,
+      "agreement_rate": 1.0
+    },
+    "judge_decoding": {
+      "temperature": 0.0,
+      "max_tokens": 4096
+    },
+    "bootstrap_seed": 0,
+    "bootstrap_replicates": 1000,
+    "bootstrap_clusters": 1,
+    "bootstrap_ran": false,
+    "bootstrap_unavailable": "original_unrated"
+  },
+  "tasks": [
+    {
+      "id": "t1",
+      "prompt": "What is the capital of France? Answer with only the city name.",
+      "evaluation": {
+        "type": "exact",
+        "expected": "Paris"
+      }
+    },
+    {
+      "id": "t2",
+      "prompt": "Explain Rust ownership in two sentences."
+    }
+  ],
+  "results": [
+    {
+      "task_id": "t1",
+      "model": "model-a",
+      "response": {
+        "text": "Paris"
+      },
+      "evaluation": {
+        "score": 1.0
+      },
+      "duration_ms": 420
+    },
+    {
+      "task_id": "t1",
+      "model": "model-b",
+      "response": {
+        "text": "Lyon"
+      },
+      "evaluation": {
+        "score": 0.0
+      },
+      "duration_ms": 510
+    },
+    {
+      "task_id": "t2",
+      "model": "model-a",
+      "response": {
+        "text": "Ownership means each value has one owner. When the owner goes out of scope, the value is dropped."
+      },
+      "duration_ms": 880
+    },
+    {
+      "task_id": "t2",
+      "model": "model-b",
+      "response": {
+        "text": "Rust tracks which variable owns a value, and dropping that variable frees it."
+      },
+      "duration_ms": 910
+    }
+  ],
+  "comparisons": [
+    {
+      "task_id": "t1",
+      "model_a": "model-a",
+      "model_b": "model-b",
+      "winner": "model-a"
+    }
+  ],
+  "judgments": [
+    {
+      "task_id": "t1",
+      "model_a": "model-a",
+      "model_b": "model-b",
+      "judge_model": "judge",
+      "winner": "a",
+      "reason": "A is better",
+      "duration_ms": 1300,
+      "agreement": true,
+      "orientation_ab": "a",
+      "orientation_ba": "a",
+      "reason_ab": "A is better",
+      "reason_ba": "A is better",
+      "raw_ab": "{\"winner\":\"a\",\"reason\":\"A is better\"}",
+      "raw_ba": "{\"winner\":\"a\",\"reason\":\"A is better\"}"
+    }
+  ],
+  "judgment_failures": [
+    {
+      "task_id": "t2",
+      "model_a": "model-a",
+      "model_b": "model-b",
+      "judge_model": "judge",
+      "orientations": [
+        {
+          "orientation": "ba",
+          "kind": "invalid_json",
+          "error": "no valid judgment JSON found",
+          "attempts": 3
+        }
+      ],
+      "raw_ab": "{\"winner\":\"a\",\"reason\":\"clearer\"}",
+      "reason_ab": "clearer"
+    }
+  ],
+  "statistics": [
+    {
+      "model": "model-a",
+      "wins": 1,
+      "losses": 0,
+      "draws": 0,
+      "total": 1,
+      "agreement_count": 1,
+      "disagreement_count": 0,
+      "agreement_rate": 1.0
+    },
+    {
+      "model": "model-b",
+      "wins": 0,
+      "losses": 1,
+      "draws": 0,
+      "total": 1,
+      "agreement_count": 1,
+      "disagreement_count": 0,
+      "agreement_rate": 1.0
+    }
+  ],
+  "ratings": [
+    {
+      "model": "model-a",
+      "rating": null,
+      "unavailable": "separated"
+    },
+    {
+      "model": "model-b",
+      "rating": null,
+      "unavailable": "separated"
+    }
+  ]
+}
