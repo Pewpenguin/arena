@@ -1200,6 +1200,26 @@ button.picker-option.plain { font-family: var(--sans); font-size: .9rem; letter-
 .picker-option:hover, button.picker-option:hover { background: var(--editor); }
 .picker-option.is-selected:hover, button.picker-option.is-selected:hover { background: #efe2d6; }
 .picker-empty { margin: 0; padding: 8px; color: var(--muted); font-size: .82rem; }
+.selected-models {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.selected-models:empty { display: none; }
+.selected-models li {
+  min-width: 0;
+  max-width: 100%;
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  background: var(--field);
+  font-family: var(--mono);
+  font-size: .82rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
 .inline { display: flex; gap: 8px; align-items: center; }
 .inline input { flex: 1; }
 .inline button { flex: 0 0 auto; }
@@ -1233,6 +1253,38 @@ button.picker-option.plain { font-family: var(--sans); font-size: .9rem; letter-
   font-family: var(--mono);
   font-size: .92rem;
   font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+a.back-link {
+  display: inline-block;
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: .68rem;
+  font-weight: 600;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  text-decoration: none;
+}
+a.back-link:hover { color: var(--ink); }
+.candidate-models { margin: 0 0 24px; }
+.candidate-models[hidden] { display: none; }
+.candidate-models ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.candidate-models li {
+  min-width: 0;
+  max-width: 100%;
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  background: var(--field);
+  font-family: var(--mono);
+  font-size: .82rem;
+  line-height: 1.35;
   overflow-wrap: anywhere;
 }
 .mono { font-family: var(--mono); font-size: .86rem; overflow-wrap: anywhere; }
@@ -1420,6 +1472,7 @@ tr.detail-row td {
       <div id="candidate_options" class="picker-options"></div>
     </div>
   </div>
+  <ul id="selected_models" class="selected-models"></ul>
 </section>
 
 <section class="region judge">
@@ -1477,6 +1530,7 @@ tr.detail-row td {
 <div id="dashboard" hidden>
   <header class="mast">
     <div class="brand">
+      <a class="back-link" href="/">← Back to workbench</a>
       <h1>Arena</h1>
       <p class="kicker">Model evaluation workbench</p>
     </div>
@@ -1514,6 +1568,10 @@ tr.detail-row td {
       <dd id="ov_failed" class="num">0</dd>
     </div>
   </dl>
+  <div id="candidate_models" class="candidate-models" hidden>
+    <h2>Candidates</h2>
+    <ul id="candidate_model_list"></ul>
+  </div>
   <div class="progress-grid">
     <div>
       <div class="section-line">
@@ -1662,6 +1720,13 @@ function render() {
     label.textContent = selected.size + " models selected";
     label.className = "";
   }
+  const chips = document.getElementById("selected_models");
+  chips.replaceChildren();
+  selected.forEach((id) => {
+    const item = document.createElement("li");
+    item.textContent = id;
+    chips.append(item);
+  });
   const options = document.getElementById("candidate_options");
   options.replaceChildren();
   const visible = models.filter((id) => !candidateQuery || id.toLowerCase().includes(candidateQuery));
@@ -1928,6 +1993,40 @@ function pairDetail(row) {
   return wrap;
 }
 
+function candidateModels() {
+  const tournament = view.tournament;
+  if (tournament && tournament.candidates && tournament.candidates.length) {
+    return tournament.candidates;
+  }
+  const ids = [];
+  const seen = new Set();
+  (view.pairs || []).forEach((row) => {
+    [row.model_a, row.model_b].forEach((id) => {
+      if (!id || seen.has(id)) return;
+      seen.add(id);
+      ids.push(id);
+    });
+  });
+  return ids;
+}
+
+function renderCandidates() {
+  const section = document.getElementById("candidate_models");
+  const list = document.getElementById("candidate_model_list");
+  const ids = candidateModels();
+  list.replaceChildren();
+  if (!ids.length) {
+    section.hidden = true;
+    return;
+  }
+  section.hidden = false;
+  ids.forEach((id) => {
+    const item = document.createElement("li");
+    item.textContent = id;
+    list.append(item);
+  });
+}
+
 function renderDash() {
   if (!view) return;
   const dash = document.getElementById("dashboard");
@@ -1948,6 +2047,7 @@ function renderDash() {
     note.className = "status error";
   }
   document.getElementById("ov_candidates").textContent = String(view.candidate_count || 0);
+  renderCandidates();
   document.getElementById("ov_tasks").textContent = String(view.task_count || 0);
   document.getElementById("ov_judge").textContent = view.judge || "None";
   const format = view.tournament_format || "—";
