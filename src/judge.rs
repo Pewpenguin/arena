@@ -387,27 +387,42 @@ pub async fn judge_pairs<P>(
     judge_model: ModelId,
     task: &Task,
     results: &[EvaluatedResult],
+    on_complete: impl FnMut(&Judgment),
+) -> Result<JudgePairsOutcome, JudgeError>
+where
+    P: ModelProvider + Clone + Send + 'static,
+{
+    let pairs: Vec<(EvaluatedResult, EvaluatedResult)> = (0..results.len())
+        .flat_map(|i| {
+            ((i + 1)..results.len()).map(move |j| (results[i].clone(), results[j].clone()))
+        })
+        .collect();
+    judge_listed_pairs(provider, judge_model, task, &pairs, on_complete).await
+}
+
+pub(crate) async fn judge_listed_pairs<P>(
+    provider: &P,
+    judge_model: ModelId,
+    task: &Task,
+    pairs: &[(EvaluatedResult, EvaluatedResult)],
     mut on_complete: impl FnMut(&Judgment),
 ) -> Result<JudgePairsOutcome, JudgeError>
 where
     P: ModelProvider + Clone + Send + 'static,
 {
-    let pair_indices: Vec<_> = (0..results.len())
-        .flat_map(|i| ((i + 1)..results.len()).map(move |j| (i, j)))
-        .collect();
-    let pair_count = pair_indices.len();
-    let pair_models: Vec<(ModelId, ModelId)> = pair_indices
+    let pair_count = pairs.len();
+    let pair_models: Vec<(ModelId, ModelId)> = pairs
         .iter()
-        .map(|&(i, j)| (results[i].model.clone(), results[j].model.clone()))
+        .map(|(result_a, result_b)| (result_a.model.clone(), result_b.model.clone()))
         .collect();
 
     let semaphore = Arc::new(Semaphore::new(PROVIDER_CONCURRENCY));
     let mut set = JoinSet::new();
 
-    for (index, (i, j)) in pair_indices.into_iter().enumerate() {
+    for (index, (left, right)) in pairs.iter().enumerate() {
         for (orientation, (result_a, result_b)) in [
-            (0u8, (results[i].clone(), results[j].clone())),
-            (1u8, (results[j].clone(), results[i].clone())),
+            (0u8, (left.clone(), right.clone())),
+            (1u8, (right.clone(), left.clone())),
         ] {
             let provider = provider.clone();
             let judge_model = judge_model.clone();

@@ -36,6 +36,21 @@ pub enum Error {
     },
     #[error("at least one candidate model is required")]
     NoCandidates,
+    #[error(
+        "{format} requires a power-of-two number of candidates (2, 4, 8, ...), got {candidates}"
+    )]
+    UnsupportedTournament {
+        format: &'static str,
+        candidates: usize,
+    },
+    #[error("missing execution result for candidate {model} on task {task_id}")]
+    MissingCandidateResult { task_id: String, model: ModelId },
+    #[error("single-elimination cannot advance {winner} from {model_a} vs {model_b}")]
+    InvalidTournamentWinner {
+        model_a: ModelId,
+        model_b: ModelId,
+        winner: ModelId,
+    },
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]

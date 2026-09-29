@@ -24,6 +24,7 @@ use crate::provider::{
     AnthropicProvider, GeminiProvider, ModelId, ModelProvider, OpenAICompatibleProvider,
 };
 use crate::task::{self, Task};
+use crate::tournament::{self, Tournament, TournamentFormat};
 
 const BIND_HOST: [u8; 4] = [127, 0, 0, 1];
 const WEB_OUTPUT_DIR: &str = "arena-web";
@@ -62,6 +63,8 @@ struct RunState {
     failed_pairs: usize,
     pairs: Vec<PairRow>,
     output_path: Option<String>,
+    tournament_format: String,
+    tournament: Option<Tournament>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -114,6 +117,9 @@ struct RunSnapshot {
     pairs: Vec<PairRow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     output_path: Option<String>,
+    tournament_format: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tournament: Option<Tournament>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -144,6 +150,8 @@ enum ClientEvent {
         failed_pairs: usize,
         #[serde(skip_serializing_if = "Option::is_none")]
         output_path: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tournament: Option<Tournament>,
     },
     RunFailed {
         seq: u64,
@@ -251,6 +259,8 @@ struct StartRequest {
     tasks: serde_json::Value,
     #[serde(default)]
     seed: String,
+    #[serde(default)]
+    tournament: TournamentFormat,
 }
 
 #[derive(Serialize)]
@@ -299,12 +309,13 @@ impl LiveRun {
         let task_count = config.tasks.len();
         let candidate_total = task_count.saturating_mul(candidate_count);
         let expected_pairs = if config.judge.is_some() {
-            exec::expected_pairs(task_count, candidate_count)
+            tournament::planned_match_count(config.tournament, candidate_count)
+                .saturating_mul(task_count)
         } else {
             0
         };
         let pairs = if config.judge.is_some() {
-            waiting_pairs(&config.tasks, &config.models)
+            waiting_pairs(&config.tasks, &config.models, config.tournament)
         } else {
             Vec::new()
         };
@@ -327,6 +338,8 @@ impl LiveRun {
                 failed_pairs: 0,
                 pairs,
                 output_path: None,
+                tournament_format: config.tournament.as_str().to_string(),
+                tournament: None,
             }),
             events,
         }
@@ -372,6 +385,10 @@ impl LiveRun {
     async fn record_output_path(&self, path: &FilePath) {
         self.inner.lock().await.output_path = Some(path.display().to_string());
     }
+
+    async fn record_tournament(&self, tournament: Option<Tournament>) {
+        self.inner.lock().await.tournament = tournament;
+    }
 }
 
 impl RunState {
@@ -393,6 +410,8 @@ impl RunState {
                 failed_pairs: self.failed_pairs,
                 pairs: self.pairs.clone(),
                 output_path: self.output_path.clone(),
+                tournament_format: self.tournament_format.clone(),
+                tournament: self.tournament.clone(),
             }),
         }
     }
@@ -475,6 +494,7 @@ impl RunState {
                     resolved_pairs,
                     failed_pairs,
                     output_path: self.output_path.clone(),
+                    tournament: self.tournament.clone(),
                 }
             }
         }
@@ -542,20 +562,18 @@ fn upsert_pair(
     });
 }
 
-fn waiting_pairs(tasks: &[Task], models: &[ModelId]) -> Vec<PairRow> {
+fn waiting_pairs(tasks: &[Task], models: &[ModelId], format: TournamentFormat) -> Vec<PairRow> {
     let mut pairs = Vec::new();
     for task in tasks {
-        for i in 0..models.len() {
-            for j in (i + 1)..models.len() {
-                pairs.push(PairRow {
-                    task_id: task.id.clone(),
-                    model_a: models[i].to_string(),
-                    model_b: models[j].to_string(),
-                    status: PairStatus::Waiting,
-                    judgment: None,
-                    failure: None,
-                });
-            }
+        for (model_a, model_b) in tournament::opening_pairs(format, models) {
+            pairs.push(PairRow {
+                task_id: task.id.clone(),
+                model_a: model_a.to_string(),
+                model_b: model_b.to_string(),
+                status: PairStatus::Waiting,
+                judgment: None,
+                failure: None,
+            });
         }
     }
     pairs
@@ -677,12 +695,13 @@ async fn start_run(
         Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
     };
 
-    let config = match build_exec_config(
+    let config = match build_exec_config_with_format(
         request.models,
         request.judge,
         tasks,
         resolved.base_url.clone(),
         seed,
+        request.tournament,
     ) {
         Ok(config) => config,
         Err(error) => return json_error(StatusCode::BAD_REQUEST, error.to_string()),
@@ -766,6 +785,7 @@ where
             Ok(Ok((output, _failed_pairs))) => match write_experiment(&output_path, &output) {
                 Ok(()) => {
                     live.record_output_path(&output_path).await;
+                    live.record_tournament(output.tournament.clone()).await;
                     if let Some(event) = completion {
                         live.apply(event).await;
                     }
@@ -839,12 +859,31 @@ fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(serde_json::json!({ "error": message.into() }))).into_response()
 }
 
-pub(crate) fn build_exec_config(
+#[cfg(test)]
+fn build_exec_config(
     models: Vec<String>,
     judge: Option<String>,
     tasks: Vec<Task>,
     base_url: String,
     seed: u64,
+) -> Result<ExecConfig> {
+    build_exec_config_with_format(
+        models,
+        judge,
+        tasks,
+        base_url,
+        seed,
+        TournamentFormat::RoundRobin,
+    )
+}
+
+pub(crate) fn build_exec_config_with_format(
+    models: Vec<String>,
+    judge: Option<String>,
+    tasks: Vec<Task>,
+    base_url: String,
+    seed: u64,
+    tournament: TournamentFormat,
 ) -> Result<ExecConfig> {
     let models = exec::unique_models(
         models
@@ -861,10 +900,12 @@ pub(crate) fn build_exec_config(
         .filter(|value| !value.is_empty())
         .map(ModelId::new);
     exec::validate_judge(&models, judge.as_ref())?;
+    tournament::validate(tournament, models.len())?;
     Ok(ExecConfig {
         tasks,
         models,
         judge,
+        tournament,
         seed,
         tasks_path: None,
         started_at: persist::utc_timestamp(),
@@ -1288,6 +1329,8 @@ tr.detail-row td {
   padding-top: 16px;
   border-top: 1px solid var(--line);
 }
+.launch-fields { display: flex; flex-wrap: wrap; gap: 16px 24px; align-items: end; }
+.launch-fields select { width: 14rem; }
 .launch-action { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
 .launch-action .status { margin: 0; text-align: right; }
 :focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; }
@@ -1393,9 +1436,18 @@ tr.detail-row td {
 
 <section class="region controls">
   <div class="launch">
-    <div>
-      <label for="seed">Bootstrap seed</label>
-      <input id="seed" type="text" inputmode="numeric" value="0">
+    <div class="launch-fields">
+      <div>
+        <label for="tournament">Tournament</label>
+        <select id="tournament">
+          <option value="round_robin" selected>Round-robin</option>
+          <option value="single_elimination">Single-elimination</option>
+        </select>
+      </div>
+      <div>
+        <label for="seed">Bootstrap seed</label>
+        <input id="seed" type="text" inputmode="numeric" value="0">
+      </div>
     </div>
     <div class="launch-action">
       <button id="start" class="primary" type="button">Run Tournament →</button>
@@ -1432,6 +1484,10 @@ tr.detail-row td {
     <div>
       <dt>Judge</dt>
       <dd id="ov_judge" class="mono">—</dd>
+    </div>
+    <div>
+      <dt>Format</dt>
+      <dd id="ov_format">—</dd>
     </div>
     <div>
       <dt>Resolved</dt>
@@ -1477,6 +1533,23 @@ tr.detail-row td {
       </thead>
       <tbody id="pair_list"></tbody>
     </table>
+  </div>
+  <div id="bracket" hidden>
+    <h2>Single-elimination</h2>
+    <p id="bracket_status" class="meta"></p>
+    <div class="results table-scroll">
+      <table class="sheet">
+        <thead>
+          <tr>
+            <th>Task</th>
+            <th>Round</th>
+            <th>Match</th>
+            <th>Result</th>
+          </tr>
+        </thead>
+        <tbody id="bracket_list"></tbody>
+      </table>
+    </div>
   </div>
   </div>
 </div>
@@ -1857,6 +1930,7 @@ function renderDash() {
   document.getElementById("ov_candidates").textContent = String(view.candidate_count || 0);
   document.getElementById("ov_tasks").textContent = String(view.task_count || 0);
   document.getElementById("ov_judge").textContent = view.judge || "None";
+  document.getElementById("ov_format").textContent = view.tournament_format || "—";
   const resolved = document.getElementById("ov_resolved");
   resolved.textContent = String(view.resolved_pairs);
   resolved.className = "num" + (view.resolved_pairs > 0 ? " hot" : "");
@@ -1915,6 +1989,47 @@ function renderDash() {
       list.append(detail);
     }
   });
+  renderBracket();
+}
+
+function matchResult(match) {
+  if (match.outcome === "winner" && match.winner) return match.winner + " advances";
+  if (match.outcome === "draw") return "Draw";
+  if (match.outcome === "judgment_failed") return "Judgment failed";
+  return match.outcome || "—";
+}
+
+function renderBracket() {
+  const section = document.getElementById("bracket");
+  const tournament = view && view.tournament;
+  if (!tournament || tournament.format !== "single_elimination") {
+    section.hidden = true;
+    return;
+  }
+  section.hidden = false;
+  const lines = (tournament.tasks || []).map((task) => {
+    if (task.winner) return task.task_id + ": " + task.winner + " won";
+    if (task.status === "draw") return task.task_id + ": draw, no winner";
+    if (task.status === "incomplete") return task.task_id + ": no winner";
+    return task.task_id + ": " + (task.status || "");
+  });
+  document.getElementById("bracket_status").textContent = lines.length
+    ? lines.join(" · ")
+    : "No matches were played.";
+  const body = document.getElementById("bracket_list");
+  body.replaceChildren();
+  (tournament.tasks || []).forEach((task) => {
+    (task.matches || []).forEach((match) => {
+      const tr = document.createElement("tr");
+      [task.task_id, String(match.round), match.model_a + "  ↔  " + match.model_b, matchResult(match)].forEach((text, index) => {
+        const td = document.createElement("td");
+        if (index < 3) td.className = "mono";
+        td.textContent = text;
+        tr.append(td);
+      });
+      body.append(tr);
+    });
+  });
 }
 
 function applyEvent(msg) {
@@ -1949,6 +2064,7 @@ function applyEvent(msg) {
       view.resolved_pairs = msg.resolved_pairs;
       view.failed_pairs = msg.failed_pairs;
       view.output_path = msg.output_path || null;
+      if (msg.tournament) view.tournament = msg.tournament;
       view.finished_at = Date.now();
       stopElapsed();
       break;
@@ -1984,6 +2100,8 @@ function showDashboard(runId) {
     pairs: [],
     error: null,
     output_path: null,
+    tournament_format: "",
+    tournament: null,
   };
   seenSeq = 0;
   startElapsed();
@@ -2086,6 +2204,7 @@ document.getElementById("start").addEventListener("click", async () => {
       judge: document.getElementById("judge").value || null,
       tasks,
       seed: document.getElementById("seed").value.trim() || "0",
+      tournament: document.getElementById("tournament").value,
     }),
   });
   const body = await response.json().catch(() => ({}));
@@ -2636,6 +2755,8 @@ mod tests {
                 failed_pairs: 0,
                 pairs: Vec::new(),
                 output_path: None,
+                tournament_format: "round-robin".into(),
+                tournament: None,
             }),
         };
         let value = serde_json::to_value(&event).unwrap();
@@ -2651,7 +2772,7 @@ mod tests {
     #[test]
     fn unordered_pair_count_does_not_include_orientations() {
         let models = [ModelId::new("m0"), ModelId::new("m1"), ModelId::new("m2")];
-        let pairs = waiting_pairs(&[task()], &models);
+        let pairs = waiting_pairs(&[task()], &models, TournamentFormat::RoundRobin);
         assert_eq!(pairs.len(), 3);
         assert_eq!(exec::expected_pairs(1, 3), 3);
         assert_eq!(exec::expected_pairs(2, 3), 6);
@@ -3017,6 +3138,7 @@ mod tests {
                 judge: None,
                 tasks: sample_tasks(),
                 seed: "0".into(),
+                tournament: TournamentFormat::RoundRobin,
             }),
         )
         .await;
@@ -3032,6 +3154,7 @@ mod tests {
                 judge: None,
                 tasks: sample_tasks(),
                 seed: "0".into(),
+                tournament: TournamentFormat::RoundRobin,
             }),
         )
         .await;
@@ -3047,6 +3170,7 @@ mod tests {
                 judge: Some("judge".into()),
                 tasks: sample_tasks(),
                 seed: "0".into(),
+                tournament: TournamentFormat::RoundRobin,
             }),
         )
         .await;
@@ -3060,6 +3184,7 @@ mod tests {
         )
         .unwrap();
         let seed = parse_seed(&request.seed).unwrap();
+        assert_eq!(request.tournament, TournamentFormat::RoundRobin);
         assert_eq!(seed, 9_007_199_254_740_993);
         assert_eq!(parse_seed(" 9007199254740993 ").unwrap(), seed);
         assert_eq!(parse_seed("").unwrap(), 0);
@@ -3099,6 +3224,65 @@ mod tests {
                 judge: None,
                 tasks: sample_tasks(),
                 seed: "9007199254740993.0".into(),
+                tournament: TournamentFormat::RoundRobin,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn dashboard_pair_preview_follows_the_tournament_format() {
+        let round_robin = build_exec_config(
+            vec!["m0".into(), "m1".into(), "m2".into(), "m3".into()],
+            Some("judge".into()),
+            vec![task()],
+            "https://example.test/v1".into(),
+            0,
+        )
+        .unwrap();
+        let live = LiveRun::from_config("rr".into(), &round_robin);
+        {
+            let state = live.inner.try_lock().expect("lock");
+            assert_eq!(state.tournament_format, "round-robin");
+            assert_eq!(state.expected_pairs, 6);
+            assert_eq!(state.pairs.len(), 6);
+        }
+
+        let elimination = build_exec_config_with_format(
+            vec!["m0".into(), "m1".into(), "m2".into(), "m3".into()],
+            Some("judge".into()),
+            vec![task()],
+            "https://example.test/v1".into(),
+            0,
+            TournamentFormat::SingleElimination,
+        )
+        .unwrap();
+        let live = LiveRun::from_config("se".into(), &elimination);
+        let state = live.inner.try_lock().expect("lock");
+        assert_eq!(state.tournament_format, "single-elimination");
+        assert_eq!(state.expected_pairs, 3);
+        assert_eq!(state.pairs.len(), 2);
+        assert_eq!(state.pairs[0].model_a, "m0");
+        assert_eq!(state.pairs[0].model_b, "m1");
+        assert_eq!(state.pairs[1].model_a, "m2");
+        assert_eq!(state.pairs[1].model_b, "m3");
+    }
+
+    #[tokio::test]
+    async fn start_run_rejects_single_elimination_without_a_power_of_two_field() {
+        let state = Arc::new(AppState::new());
+        let response = start_run(
+            State(state),
+            Json(StartRequest {
+                provider: WebProviderKind::Openai,
+                base_url: String::new(),
+                api_key: "secret".into(),
+                models: vec!["m0".into(), "m1".into(), "m2".into()],
+                judge: Some("judge".into()),
+                tasks: sample_tasks(),
+                seed: "0".into(),
+                tournament: TournamentFormat::SingleElimination,
             }),
         )
         .await;

@@ -13,6 +13,7 @@ use crate::provider::ModelId;
 use crate::rating::ModelRating;
 use crate::stats::{ModelStats, PairAgreement};
 use crate::task::Task;
+use crate::tournament::Tournament;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JudgeDecoding {
@@ -159,6 +160,8 @@ pub struct Output {
     pub statistics: Option<Vec<ModelStats>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ratings: Option<Vec<ModelRating>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tournament: Option<Tournament>,
 }
 
 #[derive(Debug, Error)]
@@ -288,8 +291,10 @@ mod tests {
             judgment_failures: None,
             statistics: None,
             ratings: None,
+            tournament: None,
         };
         let value = serde_json::to_value(&output).unwrap();
+        assert!(value.get("tournament").is_none());
         assert!(value.get("run").is_some());
         assert_eq!(value["run"]["tasks"], "tasks.json");
         assert_eq!(
@@ -547,6 +552,7 @@ mod tests {
             judgment_failures: None,
             statistics: None,
             ratings: None,
+            tournament: None,
         };
         let value = serde_json::to_value(&output).unwrap();
         assert!(value.get("judgments").is_none());
@@ -592,6 +598,7 @@ mod tests {
             judgment_failures: Some(vec![]),
             statistics: Some(vec![]),
             ratings: Some(vec![]),
+            tournament: None,
         };
         let value = serde_json::to_value(&output).unwrap();
         assert_eq!(value["judgments"], serde_json::json!([]));
@@ -631,12 +638,14 @@ mod tests {
         assert_eq!(output.judgment_failures.as_ref().map(Vec::len), Some(1));
         assert_eq!(output.statistics.as_ref().map(Vec::len), Some(2));
         assert_eq!(output.ratings.as_ref().map(Vec::len), Some(2));
+        assert!(output.tournament.is_none());
         assert_eq!(
             output.run.bootstrap_unavailable,
             Some(crate::bootstrap::BootstrapUnavailable::OriginalUnrated)
         );
         assert!(output.run.bootstrap_valid.is_none());
 
+        assert!(report.tournament.is_none());
         assert!(report.summary.judge_used);
         assert_eq!(report.summary.complete, Some(false));
         assert_eq!(report.summary.task_count, 2);
@@ -660,5 +669,50 @@ mod tests {
         assert!(html.contains("INCOMPLETE"));
         assert!(html.contains("model-a"));
         assert!(html.contains("separated"));
+        assert!(!html.contains("single-elimination"));
+    }
+
+    #[test]
+    fn tournament_metadata_round_trips_and_old_output_omits_it() {
+        use crate::tournament::{
+            MatchOutcome, TaskBracket, Tournament, TournamentFormat, TournamentMatch,
+            TournamentStatus,
+        };
+
+        let tournament = Tournament {
+            format: TournamentFormat::RoundRobin,
+            candidates: vec![ModelId::new("a"), ModelId::new("b")],
+            status: TournamentStatus::Complete,
+            tasks: vec![TaskBracket {
+                task_id: "t1".into(),
+                status: TournamentStatus::Complete,
+                winner: None,
+                matches: vec![TournamentMatch {
+                    round: 1,
+                    model_a: ModelId::new("a"),
+                    model_b: ModelId::new("b"),
+                    winner: Some(ModelId::new("a")),
+                    outcome: MatchOutcome::Winner,
+                }],
+            }],
+        };
+        let output = Output {
+            run: run_meta(vec![ModelId::new("a"), ModelId::new("b")], None, None),
+            tasks: vec![],
+            results: vec![],
+            comparisons: vec![],
+            judgments: None,
+            judgment_failures: None,
+            statistics: None,
+            ratings: None,
+            tournament: Some(tournament.clone()),
+        };
+        let parsed: Output = serde_json::from_str(&to_pretty_json(&output).unwrap()).unwrap();
+        assert_eq!(parsed.tournament, Some(tournament));
+
+        let mut value = serde_json::to_value(&output).unwrap();
+        value.as_object_mut().unwrap().remove("tournament");
+        let legacy: Output = serde_json::from_value(value).unwrap();
+        assert!(legacy.tournament.is_none());
     }
 }

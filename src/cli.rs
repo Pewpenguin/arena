@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+use crate::tournament::TournamentFormat;
+
 #[derive(Debug, Parser)]
 #[command(name = "arena", version, about = "Arena")]
 pub struct Cli {
@@ -52,6 +54,8 @@ pub enum Command {
         output: Option<PathBuf>,
         #[arg(long)]
         judge: Option<String>,
+        #[arg(long, value_enum, default_value_t = TournamentFormat::RoundRobin)]
+        tournament: TournamentFormat,
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },

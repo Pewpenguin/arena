@@ -15,6 +15,7 @@ use arena::provider::{
 };
 use arena::report;
 use arena::task;
+use arena::tournament::{self, TournamentFormat};
 use arena::web;
 
 #[tokio::main]
@@ -33,9 +34,13 @@ async fn main() -> Result<()> {
             models,
             output,
             judge,
+            tournament,
             seed,
         } => {
-            exec_with_provider(provider, tasks_path, models, output, judge, seed).await?;
+            exec_with_provider(
+                provider, tasks_path, models, output, judge, tournament, seed,
+            )
+            .await?;
         }
         Command::Report { input, output } => {
             let data = persist::read(&input)?;
@@ -85,32 +90,46 @@ async fn exec_with_provider(
     models: Vec<String>,
     output: Option<PathBuf>,
     judge: Option<String>,
+    tournament: TournamentFormat,
     seed: u64,
 ) -> Result<()> {
     match choice {
         ProviderChoice::Openai => {
             let provider = OpenAICompatibleProvider::from_env()?;
             let base_url = provider.base_url().to_string();
-            run_exec(provider, base_url, tasks_path, models, output, judge, seed).await
+            run_exec(
+                provider, base_url, tasks_path, models, output, judge, tournament, seed,
+            )
+            .await
         }
         ProviderChoice::Openrouter => {
             let provider = OpenRouterProvider::from_env()?;
             let base_url = provider.base_url().to_string();
-            run_exec(provider, base_url, tasks_path, models, output, judge, seed).await
+            run_exec(
+                provider, base_url, tasks_path, models, output, judge, tournament, seed,
+            )
+            .await
         }
         ProviderChoice::Anthropic => {
             let provider = AnthropicProvider::from_env()?;
             let base_url = provider.base_url().to_string();
-            run_exec(provider, base_url, tasks_path, models, output, judge, seed).await
+            run_exec(
+                provider, base_url, tasks_path, models, output, judge, tournament, seed,
+            )
+            .await
         }
         ProviderChoice::Gemini => {
             let provider = GeminiProvider::from_env()?;
             let base_url = provider.base_url().to_string();
-            run_exec(provider, base_url, tasks_path, models, output, judge, seed).await
+            run_exec(
+                provider, base_url, tasks_path, models, output, judge, tournament, seed,
+            )
+            .await
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_exec<P>(
     provider: P,
     base_url: String,
@@ -118,6 +137,7 @@ async fn run_exec<P>(
     models: Vec<String>,
     output: Option<PathBuf>,
     judge: Option<String>,
+    tournament: TournamentFormat,
     seed: u64,
 ) -> Result<()>
 where
@@ -128,16 +148,18 @@ where
     exec::validate_judge(&models, judge.as_ref())?;
     let started_at = persist::utc_timestamp();
     let tasks = task::load(&tasks_path)?;
+    tournament::validate(tournament, models.len())?;
 
     let candidate_total = (tasks.len() * models.len()) as u64;
     let candidates = progress_bar(candidate_total);
-    let pair_total = judge_progress_len(tasks.len(), models.len());
+    let pair_total = judge_progress_len(tournament, tasks.len(), models.len());
     let judges = judge.as_ref().map(|_| progress_bar(pair_total));
 
     let config = ExecConfig {
         tasks,
         models,
         judge,
+        tournament,
         seed,
         tasks_path: Some(tasks_path),
         started_at,
@@ -189,8 +211,8 @@ where
     exec::complete_exec(output_data, failed_pairs, output.as_deref())
 }
 
-fn judge_progress_len(tasks: usize, models: usize) -> u64 {
-    exec::expected_pairs(tasks, models) as u64
+fn judge_progress_len(format: TournamentFormat, tasks: usize, models: usize) -> u64 {
+    tournament::planned_match_count(format, models).saturating_mul(tasks) as u64
 }
 
 fn progress_bar(len: u64) -> ProgressBar {
@@ -206,15 +228,20 @@ fn progress_bar(len: u64) -> ProgressBar {
 #[cfg(test)]
 mod tests {
     use super::judge_progress_len;
+    use arena::tournament::TournamentFormat;
 
     #[test]
     fn judge_progress_length_matches_expected_unordered_pairs() {
-        assert_eq!(judge_progress_len(1, 2), 1);
-        assert_eq!(judge_progress_len(2, 3), 6);
-        assert_eq!(judge_progress_len(0, 4), 0);
+        assert_eq!(judge_progress_len(TournamentFormat::RoundRobin, 1, 2), 1);
+        assert_eq!(judge_progress_len(TournamentFormat::RoundRobin, 2, 3), 6);
+        assert_eq!(judge_progress_len(TournamentFormat::RoundRobin, 0, 4), 0);
         assert_eq!(
-            judge_progress_len(3, 4),
+            judge_progress_len(TournamentFormat::RoundRobin, 3, 4),
             arena::exec::expected_pairs(3, 4) as u64
+        );
+        assert_eq!(
+            judge_progress_len(TournamentFormat::SingleElimination, 2, 4),
+            6
         );
     }
 }

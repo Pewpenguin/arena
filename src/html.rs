@@ -5,6 +5,9 @@ use crate::report::{
     BootstrapReport, CandidateRow, FailedPairRow, ModelReport, PairRow, Report, ReportSummary,
     RunConfig,
 };
+use crate::tournament::{
+    MatchOutcome, TaskBracket, Tournament, TournamentFormat, TournamentStatus,
+};
 
 pub fn render(report: &Report<'_>) -> String {
     let mut html = String::new();
@@ -22,9 +25,13 @@ pub fn render(report: &Report<'_>) -> String {
         &report.summary,
         &report.config,
         report.bootstrap.as_ref(),
+        report.tournament,
     );
     push_models(&mut html, &report.models, report.summary.judge_used);
     if report.summary.judge_used {
+        if let Some(tournament) = report.tournament {
+            push_tournament(&mut html, tournament);
+        }
         push_pairs(&mut html, &report.pairs);
         if !report.failed_pairs.is_empty() {
             push_failures(&mut html, &report.failed_pairs);
@@ -37,7 +44,7 @@ pub fn render(report: &Report<'_>) -> String {
     if report.summary.judge_used {
         push_audit(&mut html, &report.pairs);
     }
-    push_config(&mut html, &report.config);
+    push_config(&mut html, &report.config, report.tournament);
     html.push_str("</main>\n</body>\n</html>\n");
     html
 }
@@ -256,6 +263,7 @@ fn push_header(
     summary: &ReportSummary,
     config: &RunConfig<'_>,
     bootstrap: Option<&BootstrapReport>,
+    tournament: Option<&Tournament>,
 ) {
     html.push_str("<header>\n<p class=\"eyebrow\">Arena Experiment</p>\n");
     html.push_str("<h1>");
@@ -282,6 +290,10 @@ fn push_header(
         html.push_str(" · judge run");
     } else {
         html.push_str(" · no-judge run");
+    }
+    if let Some(tournament) = tournament {
+        html.push_str(" · ");
+        html.push_str(tournament.format.as_str());
     }
     html.push_str("</p>\n");
     if let Some(complete) = summary.complete {
@@ -397,6 +409,68 @@ fn push_results(html: &mut String, results: &[CandidateRow<'_>]) {
         html.push_str("</pre>\n</details>\n");
     }
     html.push_str("</section>\n");
+}
+
+fn push_tournament(html: &mut String, tournament: &Tournament) {
+    if tournament.format != TournamentFormat::SingleElimination {
+        return;
+    }
+    html.push_str("<section>\n<h2>Single-elimination</h2>\n");
+    html.push_str(
+        "<p class=\"note\">Match winners advance. A draw does not advance a candidate.</p>\n",
+    );
+    if tournament.tasks.iter().all(|task| task.matches.is_empty()) {
+        html.push_str("<p>No matches were played.</p>\n</section>\n");
+        return;
+    }
+    for task in &tournament.tasks {
+        html.push_str("<p>");
+        html.push_str(&escape(&task_result(task)));
+        html.push_str("</p>\n");
+    }
+    html.push_str("<div class=\"scroll\"><table>\n<thead><tr>");
+    html.push_str("<th>Task</th><th>Round</th><th>Model A</th><th>Model B</th><th>Result</th>");
+    html.push_str("</tr></thead>\n<tbody>\n");
+    for task in &tournament.tasks {
+        for row in &task.matches {
+            html.push_str("<tr><td>");
+            html.push_str(&escape(&task.task_id));
+            html.push_str("</td><td>");
+            html.push_str(&row.round.to_string());
+            html.push_str("</td><td class=\"model-id\">");
+            html.push_str(&escape(&row.model_a.to_string()));
+            html.push_str("</td><td class=\"model-id\">");
+            html.push_str(&escape(&row.model_b.to_string()));
+            html.push_str("</td><td>");
+            html.push_str(&escape(&match_result(row)));
+            html.push_str("</td></tr>\n");
+        }
+    }
+    html.push_str("</tbody></table></div>\n</section>\n");
+}
+
+fn task_result(task: &TaskBracket) -> String {
+    match task.status {
+        TournamentStatus::Complete => match &task.winner {
+            Some(winner) => format!("{}: {winner} won", task.task_id),
+            None => format!("{}: complete", task.task_id),
+        },
+        TournamentStatus::Draw => format!("{}: draw, no winner", task.task_id),
+        TournamentStatus::Incomplete => format!("{}: no winner", task.task_id),
+        TournamentStatus::NotJudged => format!("{}: not judged", task.task_id),
+    }
+}
+
+fn match_result(row: &crate::tournament::TournamentMatch) -> String {
+    match row.outcome {
+        MatchOutcome::Winner => row
+            .winner
+            .as_ref()
+            .map(|winner| format!("{winner} advances"))
+            .unwrap_or_else(|| "Winner".to_string()),
+        MatchOutcome::Draw => "Draw".to_string(),
+        MatchOutcome::JudgmentFailed => "Judgment failed".to_string(),
+    }
 }
 
 fn push_pairs(html: &mut String, pairs: &[PairRow<'_>]) {
@@ -581,7 +655,7 @@ fn push_bootstrap(html: &mut String, bootstrap: &BootstrapReport) {
     html.push_str("</dl>\n</section>\n");
 }
 
-fn push_config(html: &mut String, config: &RunConfig<'_>) {
+fn push_config(html: &mut String, config: &RunConfig<'_>, tournament: Option<&Tournament>) {
     html.push_str(
         "<section class=\"secondary\">\n<details>\n<summary>Run configuration</summary>\n<dl>\n",
     );
@@ -631,6 +705,10 @@ fn push_config(html: &mut String, config: &RunConfig<'_>) {
         &config.candidate_attempts.to_string(),
     );
     dt_dd(html, "Judge attempts", &config.judge_attempts.to_string());
+    if let Some(tournament) = tournament {
+        dt_dd(html, "Tournament", tournament.format.as_str());
+        dt_dd(html, "Tournament status", tournament.status.as_str());
+    }
     dt_dd(
         html,
         "Candidate max tokens",
@@ -722,6 +800,7 @@ mod tests {
             judgment_failures,
             statistics,
             ratings,
+            tournament: None,
         }
     }
 

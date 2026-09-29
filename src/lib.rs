@@ -15,4 +15,5 @@ pub mod report;
 mod retry;
 pub mod stats;
 pub mod task;
+pub mod tournament;
 pub mod web;

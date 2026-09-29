@@ -7,6 +7,7 @@ use crate::persist::{JudgeDecoding, Output};
 use crate::provider::ModelId;
 use crate::rating::{ModelRating, UnavailableReason};
 use crate::stats::ModelStats;
+use crate::tournament::Tournament;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Report<'a> {
@@ -17,6 +18,7 @@ pub struct Report<'a> {
     pub pairs: Vec<PairRow<'a>>,
     pub failed_pairs: Vec<FailedPairRow<'a>>,
     pub bootstrap: Option<BootstrapReport>,
+    pub tournament: Option<&'a Tournament>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -169,6 +171,7 @@ pub fn from_output(output: &Output) -> Report<'_> {
             .map(failed_pair_row)
             .collect(),
         bootstrap: bootstrap_report(output),
+        tournament: output.tournament.as_ref(),
     }
 }
 
@@ -322,6 +325,7 @@ mod tests {
             judgment_failures,
             statistics,
             ratings,
+            tournament: None,
         }
     }
 
@@ -648,5 +652,62 @@ mod tests {
             Some(BootstrapUnavailable::InvalidReplicates)
         );
         assert!(!bootstrap.bounds_present);
+    }
+
+    #[test]
+    fn single_elimination_report_keeps_match_progression() {
+        use crate::tournament::{
+            MatchOutcome, TaskBracket, Tournament, TournamentFormat, TournamentMatch,
+            TournamentStatus,
+        };
+
+        let tournament = Tournament {
+            format: TournamentFormat::SingleElimination,
+            candidates: vec![ModelId::new("m0"), ModelId::new("m1")],
+            status: TournamentStatus::Draw,
+            tasks: vec![TaskBracket {
+                task_id: "t1".into(),
+                status: TournamentStatus::Draw,
+                winner: None,
+                matches: vec![TournamentMatch {
+                    round: 1,
+                    model_a: ModelId::new("m0"),
+                    model_b: ModelId::new("m1"),
+                    winner: None,
+                    outcome: MatchOutcome::Draw,
+                }],
+            }],
+        };
+        let mut data = output(
+            run_meta(&["m0", "m1"], Some("judge")).with_judge_coverage(1, 1, 0),
+            vec![task("t1")],
+            Some(vec![judgment(
+                "t1",
+                "m0",
+                "m1",
+                JudgeDecision::Draw,
+                true,
+                JudgeDecision::Draw,
+                JudgeDecision::Draw,
+            )]),
+            Some(vec![]),
+            None,
+            None,
+        );
+        data.tournament = Some(tournament);
+        let report = from_output(&data);
+        let recorded = report.tournament.expect("tournament");
+        assert_eq!(recorded.format, TournamentFormat::SingleElimination);
+        assert_eq!(recorded.status, TournamentStatus::Draw);
+        assert!(recorded.tasks[0].winner.is_none());
+        assert_eq!(recorded.tasks[0].matches[0].outcome, MatchOutcome::Draw);
+
+        let html = crate::html::render(&report);
+        assert!(html.contains("single-elimination"));
+        assert!(html.contains("Single-elimination"));
+        assert!(html.contains("t1: draw, no winner"));
+        assert!(html.contains("Draw"));
+        assert!(html.contains("m0"));
+        assert!(html.contains("m1"));
     }
 }
