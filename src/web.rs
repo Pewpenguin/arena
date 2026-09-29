@@ -1235,10 +1235,20 @@ button.picker-option.plain { font-family: var(--sans); font-size: .9rem; letter-
 .facts {
   display: flex;
   flex-wrap: wrap;
-  gap: 12px 32px;
-  margin: 0 0 24px;
+  align-items: stretch;
+  gap: 6px 8px;
+  margin: 0 0 16px;
 }
-.facts div { min-width: 0; }
+.facts div {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  background: var(--field);
+}
 .facts dt {
   margin: 0;
   color: var(--muted);
@@ -1246,12 +1256,14 @@ button.picker-option.plain { font-family: var(--sans); font-size: .9rem; letter-
   font-weight: 600;
   letter-spacing: .12em;
   text-transform: uppercase;
+  white-space: nowrap;
 }
 .facts dd {
-  margin: 4px 0 0;
+  margin: 0;
   color: var(--ink);
   font-family: var(--mono);
-  font-size: .92rem;
+  font-size: .82rem;
+  line-height: 1.35;
   font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
 }
@@ -1408,7 +1420,6 @@ tr.detail-row td {
   .segments { gap: 8px 16px; }
   .provider-fields { flex-direction: column; align-items: stretch; }
   .provider-fields > div { flex-basis: auto; width: 100%; }
-  .facts { gap: 12px 16px; }
   .launch { flex-direction: column; align-items: stretch; }
   .launch-action { align-items: flex-start; }
   .launch-action .status { text-align: left; }
