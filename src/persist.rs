@@ -695,6 +695,7 @@ mod tests {
                     winner: Some(ModelId::new("a")),
                     outcome: MatchOutcome::Winner,
                     games: Vec::new(),
+                    seeded_fallback: false,
                 }],
             }],
         };

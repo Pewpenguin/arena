@@ -425,9 +425,9 @@ fn push_tournament(html: &mut String, tournament: &Tournament) {
     }
     html.push_str("</h2>\n<p class=\"note\">");
     html.push_str(if elimination && series {
-        "Each match is a best-of series. The winner advances. A drawn series plays single-game tie-breaks until one candidate wins."
+        "Each match is a best-of series. The winner advances. A drawn series plays up to three tie-breaks, then a seeded fallback."
     } else if elimination {
-        "Match winners advance. A drawn series plays single-game tie-breaks until one candidate wins."
+        "Match winners advance. A drawn series plays up to three tie-breaks, then a seeded fallback."
     } else {
         "Each pair plays one series. Draws do not count as wins."
     });
@@ -490,17 +490,20 @@ fn match_result(row: &crate::tournament::TournamentMatch, elimination: bool) -> 
     }
     let games = row.games.len();
     let game_label = if games == 1 { "game" } else { "games" };
+    let mut detail = format!("{games} {game_label}");
     let tiebreaks = row.games.iter().filter(|game| game.tiebreak).count();
-    if tiebreaks == 0 {
-        format!("{text} ({games} {game_label})")
-    } else {
+    if tiebreaks > 0 {
         let tie_label = if tiebreaks == 1 {
             "tie-break"
         } else {
             "tie-breaks"
         };
-        format!("{text} ({games} {game_label}, {tiebreaks} {tie_label})")
+        detail.push_str(&format!(", {tiebreaks} {tie_label}"));
     }
+    if row.seeded_fallback {
+        detail.push_str(", seeded fallback");
+    }
+    format!("{text} ({detail})")
 }
 
 fn push_pairs(html: &mut String, pairs: &[PairRow<'_>]) {

@@ -166,6 +166,7 @@ where
             &config.models,
             config.tournament,
             config.best_of,
+            config.seed,
             |judgment| {
                 on_judgment(judgment);
                 emit_event(
@@ -1159,6 +1160,7 @@ mod tests {
         assert_eq!(series.games[0].outcome, MatchOutcome::Draw);
         assert!(!series.games[0].tiebreak);
         assert!(series.games[1].tiebreak);
+        assert!(!series.seeded_fallback);
         assert_eq!(series.games[1].winner, Some(ModelId::new("m0")));
         assert_eq!(output.judgments.as_ref().map(Vec::len), Some(2));
         assert_eq!(output.run.expected_pairs, Some(2));
@@ -1190,9 +1192,54 @@ mod tests {
         assert!(!series.games[0].tiebreak);
         assert!(series.games[1].tiebreak);
         assert_eq!(series.games[1].outcome, MatchOutcome::JudgmentFailed);
+        assert!(!series.seeded_fallback);
         assert_eq!(output.judgments.as_ref().map(Vec::len), Some(1));
         assert_eq!(output.run.complete, Some(false));
         assert!(tournament.tasks[0].winner.is_none());
+    }
+
+    #[tokio::test]
+    async fn single_elimination_uses_a_seeded_fallback_after_three_tiebreak_draws() {
+        for (best_of, games) in [(1, 4), (3, 5), (5, 6)] {
+            let mut cfg = config(&["m0", "m1"], Some("judge"));
+            cfg.tournament = TournamentFormat::SingleElimination;
+            cfg.best_of = best_of;
+            cfg.seed = 11;
+            let (output, failed_pairs) = collect_exec(&OkProvider, &cfg, |_| {}, |_| {}, |_| {})
+                .await
+                .unwrap();
+            assert_eq!(failed_pairs, 0);
+            let tournament = output.tournament.as_ref().unwrap();
+            assert_eq!(tournament.status, TournamentStatus::Complete);
+            let series = &tournament.tasks[0].matches[0];
+            assert_eq!(series.round, 1);
+            assert_eq!(series.games.len(), games);
+            assert_eq!(series.games.iter().filter(|game| game.tiebreak).count(), 3);
+            assert!(
+                series
+                    .games
+                    .iter()
+                    .all(|game| { game.outcome == MatchOutcome::Draw && game.winner.is_none() })
+            );
+            assert!(series.seeded_fallback);
+            assert_eq!(series.outcome, MatchOutcome::Winner);
+            assert_eq!(
+                series.winner,
+                Some(tournament::seeded_fallback_winner(
+                    11,
+                    &series.model_a,
+                    &series.model_b
+                ))
+            );
+            assert_eq!(output.judgments.as_ref().map(Vec::len), Some(games));
+            let advanced = tournament.tasks[0].winner.clone();
+            assert_eq!(advanced.as_ref(), series.winner.as_ref());
+
+            let (repeat, _) = collect_exec(&OkProvider, &cfg, |_| {}, |_| {}, |_| {})
+                .await
+                .unwrap();
+            assert_eq!(repeat.tournament.unwrap().tasks[0].winner, advanced);
+        }
     }
 
     #[tokio::test]
@@ -1283,6 +1330,7 @@ mod tests {
                 .iter()
                 .all(|game| game.outcome == MatchOutcome::Draw && !game.tiebreak)
         );
+        assert!(!series.seeded_fallback);
         assert_eq!(output.judgments.as_ref().map(Vec::len), Some(2));
         assert_eq!(output.run.complete, Some(true));
     }

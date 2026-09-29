@@ -677,6 +677,7 @@ mod tests {
                     winner: None,
                     outcome: MatchOutcome::Draw,
                     games: Vec::new(),
+                    seeded_fallback: false,
                 }],
             }],
         };
@@ -748,6 +749,7 @@ mod tests {
                             tiebreak: false,
                         },
                     ],
+                    seeded_fallback: false,
                 }],
             }],
         };
@@ -800,6 +802,7 @@ mod tests {
                             tiebreak: true,
                         },
                     ],
+                    seeded_fallback: false,
                 }],
             }],
         };
@@ -814,5 +817,51 @@ mod tests {
         data.tournament = Some(tournament);
         let html = crate::html::render(&from_output(&data));
         assert!(html.contains("m0 advances (2 games, 1 tie-break)"));
+        assert!(!html.contains("m0 advances (2 games, 1 tie-break, seeded fallback)"));
+    }
+
+    #[test]
+    fn elimination_fallback_report_marks_the_seeded_advancement() {
+        use crate::tournament::{
+            MatchOutcome, SeriesGame, TaskBracket, Tournament, TournamentFormat, TournamentMatch,
+            TournamentStatus,
+        };
+
+        let draw = |tiebreak| SeriesGame {
+            winner: None,
+            outcome: MatchOutcome::Draw,
+            tiebreak,
+        };
+        let tournament = Tournament {
+            format: TournamentFormat::SingleElimination,
+            candidates: vec![ModelId::new("m0"), ModelId::new("m1")],
+            status: TournamentStatus::Complete,
+            best_of: 1,
+            tasks: vec![TaskBracket {
+                task_id: "t1".into(),
+                status: TournamentStatus::Complete,
+                winner: Some(ModelId::new("m0")),
+                matches: vec![TournamentMatch {
+                    round: 1,
+                    model_a: ModelId::new("m0"),
+                    model_b: ModelId::new("m1"),
+                    winner: Some(ModelId::new("m0")),
+                    outcome: MatchOutcome::Winner,
+                    games: vec![draw(false), draw(true), draw(true), draw(true)],
+                    seeded_fallback: true,
+                }],
+            }],
+        };
+        let mut data = output(
+            run_meta(&["m0", "m1"], Some("judge")).with_judge_coverage(4, 4, 0),
+            vec![task("t1")],
+            Some(vec![]),
+            Some(vec![]),
+            None,
+            None,
+        );
+        data.tournament = Some(tournament);
+        let html = crate::html::render(&from_output(&data));
+        assert!(html.contains("m0 advances (4 games, 3 tie-breaks, seeded fallback)"));
     }
 }

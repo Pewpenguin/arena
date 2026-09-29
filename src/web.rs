@@ -2140,12 +2140,14 @@ function matchResult(match, elimination) {
     text = match.outcome;
   }
   const games = match.games || [];
-  if (!games.length) return text;
+  if (!games.length && !match.seeded_fallback) return text;
+  if (!games.length) return text + " (seeded fallback)";
   text += " (" + games.length + (games.length === 1 ? " game" : " games");
   const tiebreaks = games.filter((game) => game.tiebreak).length;
   if (tiebreaks) {
     text += ", " + tiebreaks + (tiebreaks === 1 ? " tie-break" : " tie-breaks");
   }
+  if (match.seeded_fallback) text += ", seeded fallback";
   text += ")";
   return text;
 }

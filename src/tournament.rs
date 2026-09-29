@@ -76,6 +76,7 @@ pub struct SeriesGame {
 }
 
 pub const DEFAULT_BEST_OF: u32 = 1;
+const MAX_TIEBREAKS: u32 = 3;
 
 pub fn default_best_of() -> u32 {
     DEFAULT_BEST_OF
@@ -87,6 +88,44 @@ fn is_default_best_of(value: &u32) -> bool {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+/// Chooses an advancing candidate from the tournament seed and the two model ids.
+///
+/// Each id is scored on its own. The comparison never uses list position or
+/// lexicographic order, and swapping the pair does not change the winner.
+pub(crate) fn seeded_fallback_winner(seed: u64, model_a: &ModelId, model_b: &ModelId) -> ModelId {
+    for round in 0..64 {
+        let left = fallback_score(seed, round, model_a);
+        let right = fallback_score(seed, round, model_b);
+        if left > right {
+            return model_a.clone();
+        }
+        if right > left {
+            return model_b.clone();
+        }
+    }
+    model_a.clone()
+}
+
+fn fallback_score(seed: u64, round: u64, model: &ModelId) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in seed.to_le_bytes() {
+        hash = fnv_byte(hash, byte);
+    }
+    for byte in round.to_le_bytes() {
+        hash = fnv_byte(hash, byte);
+    }
+    for byte in model.to_string().as_bytes() {
+        hash = fnv_byte(hash, *byte);
+    }
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xff51afd7ed558ccd);
+    hash ^ (hash >> 33)
+}
+
+fn fnv_byte(hash: u64, byte: u8) -> u64 {
+    (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
 }
 
 /// One scheduled match and how it resolved.
@@ -101,6 +140,9 @@ pub struct TournamentMatch {
     /// Individual games. Empty for a single-game match, which is the v1.3.0 shape.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub games: Vec<SeriesGame>,
+    /// Set when three tie-breaks drew and the seed chose who advances.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub seeded_fallback: bool,
 }
 
 /// Bracket or round-robin result for a single task.
@@ -236,6 +278,7 @@ pub(crate) async fn play<P, F, R>(
     candidates: &[ModelId],
     format: TournamentFormat,
     best_of: u32,
+    seed: u64,
     mut on_judgment: F,
     mut on_round: R,
 ) -> Result<Tournament>
@@ -270,6 +313,7 @@ where
                     results,
                     candidates,
                     best_of,
+                    seed,
                     &mut on_judgment,
                     &mut on_round,
                 )
@@ -306,7 +350,7 @@ where
         &pairs,
         1,
         best_of,
-        false,
+        None,
         &mut *on_judgment,
         &mut *on_round,
     )
@@ -337,6 +381,7 @@ async fn play_single_elimination<P, F, R>(
     results: &[EvaluatedResult],
     candidates: &[ModelId],
     best_of: u32,
+    seed: u64,
     on_judgment: &mut F,
     on_round: &mut R,
 ) -> Result<TaskBracket>
@@ -359,7 +404,7 @@ where
             &pairs,
             round,
             best_of,
-            true,
+            Some(seed),
             &mut *on_judgment,
             &mut *on_round,
         )
@@ -458,7 +503,7 @@ async fn play_series<P, F, R>(
     pairs: &[(ModelId, ModelId)],
     round: u32,
     best_of: u32,
-    resolve_draws: bool,
+    tiebreak_seed: Option<u64>,
     on_judgment: &mut F,
     on_round: &mut R,
 ) -> Result<Vec<TournamentMatch>>
@@ -512,8 +557,11 @@ where
             Some(MatchOutcome::JudgmentFailed | MatchOutcome::Incomplete)
         )
     });
-    if resolve_draws && !blocked {
-        loop {
+    if let Some(seed) = tiebreak_seed
+        && !blocked
+    {
+        let mut halted = false;
+        for _ in 0..MAX_TIEBREAKS {
             let pending: Vec<(ModelId, ModelId)> = open
                 .iter()
                 .filter(|series| series.outcome == Some(MatchOutcome::Draw))
@@ -543,7 +591,15 @@ where
                 }
             }
             if halt {
+                halted = true;
                 break;
+            }
+        }
+        if !halted {
+            for series in &mut open {
+                if series.outcome == Some(MatchOutcome::Draw) {
+                    apply_seeded_fallback(series, seed);
+                }
             }
         }
     }
@@ -562,6 +618,7 @@ struct OpenSeries {
     games: Vec<SeriesGame>,
     outcome: Option<MatchOutcome>,
     winner: Option<ModelId>,
+    seeded_fallback: bool,
 }
 
 impl OpenSeries {
@@ -575,6 +632,7 @@ impl OpenSeries {
             games: Vec::new(),
             outcome: None,
             winner: None,
+            seeded_fallback: false,
         }
     }
 
@@ -592,8 +650,19 @@ impl OpenSeries {
             } else {
                 Vec::new()
             },
+            seeded_fallback: self.seeded_fallback,
         }
     }
+}
+
+fn apply_seeded_fallback(series: &mut OpenSeries, seed: u64) {
+    series.winner = Some(seeded_fallback_winner(
+        seed,
+        &series.model_a,
+        &series.model_b,
+    ));
+    series.outcome = Some(MatchOutcome::Winner);
+    series.seeded_fallback = true;
 }
 
 fn apply_game(
@@ -750,6 +819,7 @@ fn fold_round(
             winner,
             outcome,
             games: Vec::new(),
+            seeded_fallback: false,
         });
     }
     if stop {
@@ -1120,6 +1190,7 @@ mod tests {
         assert_eq!(loaded.best_of, DEFAULT_BEST_OF);
         assert!(loaded.tasks[0].matches[0].games.is_empty());
         assert_eq!(loaded.tasks[0].matches[0].games_played(), 1);
+        assert!(!loaded.tasks[0].matches[0].seeded_fallback);
     }
 
     #[test]
@@ -1178,15 +1249,17 @@ mod tests {
         for best_of in [1, 3, 5] {
             let mut series = drawn_regulation_series(best_of);
             let regulation = series.games.len();
-            apply_game(
-                &mut series,
-                &[scripted_judgment(JudgeDecision::Draw)],
-                &[],
-                best_of,
-                true,
-            )
-            .unwrap();
-            assert_eq!(series.outcome, Some(MatchOutcome::Draw));
+            for _ in 0..2 {
+                apply_game(
+                    &mut series,
+                    &[scripted_judgment(JudgeDecision::Draw)],
+                    &[],
+                    best_of,
+                    true,
+                )
+                .unwrap();
+                assert_eq!(series.outcome, Some(MatchOutcome::Draw));
+            }
             apply_game(
                 &mut series,
                 &[scripted_judgment(JudgeDecision::B)],
@@ -1198,6 +1271,7 @@ mod tests {
             assert_eq!(series.outcome, Some(MatchOutcome::Winner));
             assert_eq!(series.winner.as_ref(), Some(&id("B")));
             let finished = series.finish(best_of);
+            assert!(!finished.seeded_fallback);
             assert_eq!(finished.round, 1);
             assert!(
                 finished
@@ -1213,7 +1287,7 @@ mod tests {
                     .skip(regulation)
                     .all(|game| game.tiebreak)
             );
-            assert_eq!(finished.games_played(), regulation + 2);
+            assert_eq!(finished.games_played(), regulation + 3);
         }
     }
 
@@ -1253,6 +1327,75 @@ mod tests {
         assert!(!series.games[0].tiebreak);
         assert!(series.games[1].tiebreak);
         assert_eq!(series.games[1].outcome, MatchOutcome::JudgmentFailed);
+        assert!(!series.seeded_fallback);
+    }
+
+    #[test]
+    fn three_tiebreak_draws_advance_by_seeded_fallback() {
+        for best_of in [1, 3, 5] {
+            let mut series = drawn_regulation_series(best_of);
+            let regulation = series.games.len();
+            for _ in 0..MAX_TIEBREAKS {
+                apply_game(
+                    &mut series,
+                    &[scripted_judgment(JudgeDecision::Draw)],
+                    &[],
+                    best_of,
+                    true,
+                )
+                .unwrap();
+                assert_eq!(series.outcome, Some(MatchOutcome::Draw));
+            }
+            apply_seeded_fallback(&mut series, 11);
+            let finished = series.finish(best_of);
+            let again = seeded_fallback_winner(11, &id("A"), &id("B"));
+            assert_eq!(finished.outcome, MatchOutcome::Winner);
+            assert_eq!(finished.winner.as_ref(), Some(&again));
+            assert!(finished.seeded_fallback);
+            assert_eq!(finished.round, 1);
+            assert_eq!(finished.games.len(), regulation + 3);
+            assert!(
+                finished
+                    .games
+                    .iter()
+                    .all(|game| { game.outcome == MatchOutcome::Draw && game.winner.is_none() })
+            );
+            assert!(
+                finished
+                    .games
+                    .iter()
+                    .skip(regulation)
+                    .all(|game| game.tiebreak)
+            );
+            let json = serde_json::to_value(&finished).unwrap();
+            assert_eq!(json["seeded_fallback"], true);
+            assert!(
+                json["games"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|game| { game.get("winner").is_none() && game["outcome"] == "draw" })
+            );
+        }
+    }
+
+    #[test]
+    fn seeded_fallback_depends_on_the_seed_and_not_candidate_order() {
+        let left = id("alpha-model");
+        let right = id("beta-model");
+        let once = seeded_fallback_winner(7, &left, &right);
+        assert_eq!(once, seeded_fallback_winner(7, &left, &right));
+        assert_eq!(once, seeded_fallback_winner(7, &right, &left));
+        let mut winners = HashSet::new();
+        for seed in 0..64 {
+            winners.insert(seeded_fallback_winner(seed, &left, &right));
+        }
+        assert!(
+            winners.len() > 1,
+            "different seeds should be able to advance either candidate"
+        );
+        assert!(winners.contains(&left));
+        assert!(winners.contains(&right));
     }
 
     #[test]
@@ -1278,6 +1421,7 @@ mod tests {
         let json = serde_json::to_value(&finished).unwrap();
         assert!(json["games"][0].get("tiebreak").is_none());
         assert_eq!(json["games"][1]["tiebreak"], true);
+        assert!(json.get("seeded_fallback").is_none());
         assert_eq!(json["round"], 1);
         assert_eq!(json["winner"], "A");
         let restored: TournamentMatch = serde_json::from_value(json).unwrap();
