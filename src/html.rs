@@ -425,9 +425,9 @@ fn push_tournament(html: &mut String, tournament: &Tournament) {
     }
     html.push_str("</h2>\n<p class=\"note\">");
     html.push_str(if elimination && series {
-        "Each match is a best-of series. The winner advances. A draw does not advance a candidate."
+        "Each match is a best-of series. The winner advances. A drawn series plays single-game tie-breaks until one candidate wins."
     } else if elimination {
-        "Match winners advance. A draw does not advance a candidate."
+        "Match winners advance. A drawn series plays single-game tie-breaks until one candidate wins."
     } else {
         "Each pair plays one series. Draws do not count as wins."
     });
@@ -486,11 +486,20 @@ fn match_result(row: &crate::tournament::TournamentMatch, elimination: bool) -> 
         MatchOutcome::Incomplete => "Incomplete".to_string(),
     };
     if row.games.is_empty() {
-        text
+        return text;
+    }
+    let games = row.games.len();
+    let game_label = if games == 1 { "game" } else { "games" };
+    let tiebreaks = row.games.iter().filter(|game| game.tiebreak).count();
+    if tiebreaks == 0 {
+        format!("{text} ({games} {game_label})")
     } else {
-        let games = row.games.len();
-        let label = if games == 1 { "game" } else { "games" };
-        format!("{text} ({games} {label})")
+        let tie_label = if tiebreaks == 1 {
+            "tie-break"
+        } else {
+            "tie-breaks"
+        };
+        format!("{text} ({games} {game_label}, {tiebreaks} {tie_label})")
     }
 }
 

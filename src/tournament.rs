@@ -70,6 +70,9 @@ pub struct SeriesGame {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub winner: Option<ModelId>,
     pub outcome: MatchOutcome,
+    /// Played after a drawn elimination series. Absent on regulation games and old JSON.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tiebreak: bool,
 }
 
 pub const DEFAULT_BEST_OF: u32 = 1;
@@ -80,6 +83,10 @@ pub fn default_best_of() -> u32 {
 
 fn is_default_best_of(value: &u32) -> bool {
     *value == DEFAULT_BEST_OF
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// One scheduled match and how it resolved.
@@ -299,6 +306,7 @@ where
         &pairs,
         1,
         best_of,
+        false,
         &mut *on_judgment,
         &mut *on_round,
     )
@@ -351,6 +359,7 @@ where
             &pairs,
             round,
             best_of,
+            true,
             &mut *on_judgment,
             &mut *on_round,
         )
@@ -449,6 +458,7 @@ async fn play_series<P, F, R>(
     pairs: &[(ModelId, ModelId)],
     round: u32,
     best_of: u32,
+    resolve_draws: bool,
     on_judgment: &mut F,
     on_round: &mut R,
 ) -> Result<Vec<TournamentMatch>>
@@ -482,7 +492,7 @@ where
         on_round(&judged.failures);
         let mut halt = false;
         for series in open.iter_mut().filter(|series| series.outcome.is_none()) {
-            apply_game(series, &judged.judgments, &judged.failures, best_of)?;
+            apply_game(series, &judged.judgments, &judged.failures, best_of, false)?;
             if series.outcome == Some(MatchOutcome::JudgmentFailed) {
                 halt = true;
             }
@@ -494,6 +504,47 @@ where
                 }
             }
             break;
+        }
+    }
+    let blocked = open.iter().any(|series| {
+        matches!(
+            series.outcome,
+            Some(MatchOutcome::JudgmentFailed | MatchOutcome::Incomplete)
+        )
+    });
+    if resolve_draws && !blocked {
+        loop {
+            let pending: Vec<(ModelId, ModelId)> = open
+                .iter()
+                .filter(|series| series.outcome == Some(MatchOutcome::Draw))
+                .map(|series| (series.model_a.clone(), series.model_b.clone()))
+                .collect();
+            if pending.is_empty() {
+                break;
+            }
+            let listed = listed_pairs(&task.id, results, &pending)?;
+            let judged = judge::judge_listed_pairs(
+                provider,
+                judge_model.clone(),
+                task,
+                &listed,
+                &mut *on_judgment,
+            )
+            .await?;
+            on_round(&judged.failures);
+            let mut halt = false;
+            for series in &mut open {
+                if series.outcome != Some(MatchOutcome::Draw) {
+                    continue;
+                }
+                apply_game(series, &judged.judgments, &judged.failures, best_of, true)?;
+                if series.outcome == Some(MatchOutcome::Incomplete) {
+                    halt = true;
+                }
+            }
+            if halt {
+                break;
+            }
         }
     }
     Ok(open
@@ -528,16 +579,18 @@ impl OpenSeries {
     }
 
     fn finish(self, best_of: u32) -> TournamentMatch {
+        let persist_games =
+            best_of != DEFAULT_BEST_OF || self.games.iter().any(|game| game.tiebreak);
         TournamentMatch {
             round: self.round,
             model_a: self.model_a,
             model_b: self.model_b,
             winner: self.winner,
             outcome: self.outcome.unwrap_or(MatchOutcome::Incomplete),
-            games: if best_of == DEFAULT_BEST_OF {
-                Vec::new()
-            } else {
+            games: if persist_games {
                 self.games
+            } else {
+                Vec::new()
             },
         }
     }
@@ -548,6 +601,7 @@ fn apply_game(
     judgments: &[Judgment],
     failures: &[JudgmentFailure],
     best_of: u32,
+    tiebreak: bool,
 ) -> Result<()> {
     if failures
         .iter()
@@ -556,8 +610,13 @@ fn apply_game(
         series.games.push(SeriesGame {
             winner: None,
             outcome: MatchOutcome::JudgmentFailed,
+            tiebreak,
         });
-        series.outcome = Some(MatchOutcome::JudgmentFailed);
+        series.outcome = Some(if tiebreak {
+            MatchOutcome::Incomplete
+        } else {
+            MatchOutcome::JudgmentFailed
+        });
         series.winner = None;
         return Ok(());
     }
@@ -583,9 +642,20 @@ fn apply_game(
         JudgeDecision::Draw => (None, MatchOutcome::Draw),
     };
     series.games.push(SeriesGame {
-        winner: game_winner,
+        winner: game_winner.clone(),
         outcome: game_outcome,
+        tiebreak,
     });
+    if tiebreak {
+        if game_outcome == MatchOutcome::Winner {
+            series.outcome = Some(MatchOutcome::Winner);
+            series.winner = game_winner;
+        } else {
+            series.outcome = Some(MatchOutcome::Draw);
+            series.winner = None;
+        }
+        return Ok(());
+    }
     if let Some(end) = series_result(
         series.wins_a,
         series.wins_b,
@@ -1104,6 +1174,162 @@ mod tests {
     }
 
     #[test]
+    fn elimination_tiebreaks_resolve_a_drawn_series_for_any_best_of() {
+        for best_of in [1, 3, 5] {
+            let mut series = drawn_regulation_series(best_of);
+            let regulation = series.games.len();
+            apply_game(
+                &mut series,
+                &[scripted_judgment(JudgeDecision::Draw)],
+                &[],
+                best_of,
+                true,
+            )
+            .unwrap();
+            assert_eq!(series.outcome, Some(MatchOutcome::Draw));
+            apply_game(
+                &mut series,
+                &[scripted_judgment(JudgeDecision::B)],
+                &[],
+                best_of,
+                true,
+            )
+            .unwrap();
+            assert_eq!(series.outcome, Some(MatchOutcome::Winner));
+            assert_eq!(series.winner.as_ref(), Some(&id("B")));
+            let finished = series.finish(best_of);
+            assert_eq!(finished.round, 1);
+            assert!(
+                finished
+                    .games
+                    .iter()
+                    .take(regulation)
+                    .all(|game| !game.tiebreak)
+            );
+            assert!(
+                finished
+                    .games
+                    .iter()
+                    .skip(regulation)
+                    .all(|game| game.tiebreak)
+            );
+            assert_eq!(finished.games_played(), regulation + 2);
+        }
+    }
+
+    #[test]
+    fn tiebreak_judgment_failure_leaves_the_elimination_match_incomplete() {
+        use crate::judge::{JudgmentFailure, JudgmentFailureKind, OrientationFailure};
+
+        let mut series = OpenSeries::new(1, id("A"), id("B"));
+        apply_game(
+            &mut series,
+            &[scripted_judgment(JudgeDecision::Draw)],
+            &[],
+            1,
+            false,
+        )
+        .unwrap();
+        let failure = JudgmentFailure {
+            task_id: "t1".into(),
+            model_a: id("A"),
+            model_b: id("B"),
+            judge_model: id("judge"),
+            orientations: vec![OrientationFailure {
+                orientation: crate::judge::JudgeOrientation::Ab,
+                kind: JudgmentFailureKind::Provider,
+                error: "stopped".into(),
+                attempts: 1,
+            }],
+            raw_ab: None,
+            reason_ab: None,
+            raw_ba: None,
+            reason_ba: None,
+        };
+        apply_game(&mut series, &[], &[failure], 1, true).unwrap();
+        assert_eq!(series.outcome, Some(MatchOutcome::Incomplete));
+        assert!(series.winner.is_none());
+        assert_eq!(series.games.len(), 2);
+        assert!(!series.games[0].tiebreak);
+        assert!(series.games[1].tiebreak);
+        assert_eq!(series.games[1].outcome, MatchOutcome::JudgmentFailed);
+    }
+
+    #[test]
+    fn tiebreak_games_round_trip_and_legacy_games_omit_the_flag() {
+        let mut series = OpenSeries::new(1, id("A"), id("B"));
+        apply_game(
+            &mut series,
+            &[scripted_judgment(JudgeDecision::Draw)],
+            &[],
+            1,
+            false,
+        )
+        .unwrap();
+        apply_game(
+            &mut series,
+            &[scripted_judgment(JudgeDecision::A)],
+            &[],
+            1,
+            true,
+        )
+        .unwrap();
+        let finished = series.finish(1);
+        let json = serde_json::to_value(&finished).unwrap();
+        assert!(json["games"][0].get("tiebreak").is_none());
+        assert_eq!(json["games"][1]["tiebreak"], true);
+        assert_eq!(json["round"], 1);
+        assert_eq!(json["winner"], "A");
+        let restored: TournamentMatch = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, finished);
+
+        let legacy: SeriesGame =
+            serde_json::from_str(r#"{"winner":"A","outcome":"winner"}"#).unwrap();
+        assert!(!legacy.tiebreak);
+        assert_eq!(legacy.winner, Some(id("A")));
+    }
+
+    fn drawn_regulation_series(best_of: u32) -> OpenSeries {
+        let mut series = OpenSeries::new(1, id("A"), id("B"));
+        for _ in 0..best_of {
+            if series.outcome.is_some() {
+                break;
+            }
+            apply_game(
+                &mut series,
+                &[scripted_judgment(JudgeDecision::Draw)],
+                &[],
+                best_of,
+                false,
+            )
+            .unwrap();
+        }
+        assert_eq!(series.outcome, Some(MatchOutcome::Draw));
+        assert!(series.games.iter().all(|game| !game.tiebreak));
+        series
+    }
+
+    fn scripted_judgment(winner: JudgeDecision) -> Judgment {
+        Judgment {
+            task_id: "t1".into(),
+            model_a: id("A"),
+            model_b: id("B"),
+            judge_model: id("judge"),
+            winner,
+            reason: String::new(),
+            duration_ms: 1,
+            agreement: true,
+            orientation_ab: None,
+            orientation_ba: None,
+            reason_ab: None,
+            reason_ba: None,
+            raw_ab: None,
+            raw_ba: None,
+            raw: None,
+        }
+    }
+
+    #[test]
     fn best_of_rejects_even_and_zero_lengths() {
         for best_of in [0, 2, 4, 6] {
             let error = validate_best_of(best_of).unwrap_err();
@@ -1142,7 +1368,7 @@ mod tests {
                 raw_ba: None,
                 raw: None,
             };
-            apply_game(&mut series, &[judgment], &[], best_of).unwrap();
+            apply_game(&mut series, &[judgment], &[], best_of, false).unwrap();
             if series.outcome.is_some() {
                 break;
             }

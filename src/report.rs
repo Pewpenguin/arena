@@ -740,10 +740,12 @@ mod tests {
                         SeriesGame {
                             winner: Some(ModelId::new("m0")),
                             outcome: MatchOutcome::Winner,
+                            tiebreak: false,
                         },
                         SeriesGame {
                             winner: Some(ModelId::new("m0")),
                             outcome: MatchOutcome::Winner,
+                            tiebreak: false,
                         },
                     ],
                 }],
@@ -761,5 +763,56 @@ mod tests {
         let html = crate::html::render(&from_output(&data));
         assert!(html.contains("Best of 3"));
         assert!(html.contains("m0 won (2 games)"));
+        assert!(!html.contains("tie-break"));
+    }
+
+    #[test]
+    fn elimination_tiebreak_report_shows_the_game_count_and_tiebreak() {
+        use crate::tournament::{
+            MatchOutcome, SeriesGame, TaskBracket, Tournament, TournamentFormat, TournamentMatch,
+            TournamentStatus,
+        };
+
+        let tournament = Tournament {
+            format: TournamentFormat::SingleElimination,
+            candidates: vec![ModelId::new("m0"), ModelId::new("m1")],
+            status: TournamentStatus::Complete,
+            best_of: 1,
+            tasks: vec![TaskBracket {
+                task_id: "t1".into(),
+                status: TournamentStatus::Complete,
+                winner: Some(ModelId::new("m0")),
+                matches: vec![TournamentMatch {
+                    round: 1,
+                    model_a: ModelId::new("m0"),
+                    model_b: ModelId::new("m1"),
+                    winner: Some(ModelId::new("m0")),
+                    outcome: MatchOutcome::Winner,
+                    games: vec![
+                        SeriesGame {
+                            winner: None,
+                            outcome: MatchOutcome::Draw,
+                            tiebreak: false,
+                        },
+                        SeriesGame {
+                            winner: Some(ModelId::new("m0")),
+                            outcome: MatchOutcome::Winner,
+                            tiebreak: true,
+                        },
+                    ],
+                }],
+            }],
+        };
+        let mut data = output(
+            run_meta(&["m0", "m1"], Some("judge")).with_judge_coverage(2, 2, 0),
+            vec![task("t1")],
+            Some(vec![]),
+            Some(vec![]),
+            None,
+            None,
+        );
+        data.tournament = Some(tournament);
+        let html = crate::html::render(&from_output(&data));
+        assert!(html.contains("m0 advances (2 games, 1 tie-break)"));
     }
 }

@@ -1027,6 +1027,47 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct DrawThenChoose {
+        draws: usize,
+        fail_after: bool,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ModelProvider for DrawThenChoose {
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> std::result::Result<CompletionResponse, ProviderError> {
+            if request.model != ModelId::new("judge") {
+                return Ok(CompletionResponse {
+                    text: request.model.to_string(),
+                });
+            }
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call < self.draws {
+                return Ok(CompletionResponse {
+                    text: r#"{"winner":"draw","reason":"even"}"#.into(),
+                });
+            }
+            if self.fail_after {
+                return Err(ProviderError::RequestFailed("tie-break failed".into()));
+            }
+            let a = fenced(&request.prompt, "response_a");
+            let b = fenced(&request.prompt, "response_b");
+            let winner = if a < b {
+                "a"
+            } else if b < a {
+                "b"
+            } else {
+                "draw"
+            };
+            Ok(CompletionResponse {
+                text: format!(r#"{{"winner":"{winner}","reason":"lower id"}}"#),
+            })
+        }
+    }
+
+    #[derive(Clone)]
     struct PreferSmallerId;
 
     impl ModelProvider for PreferSmallerId {
@@ -1092,28 +1133,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn single_elimination_draw_does_not_advance_a_candidate() {
-        let mut cfg = config(&["m0", "m1", "m2", "m3"], Some("judge"));
+    async fn single_elimination_tiebreak_advances_after_a_draw() {
+        let mut cfg = config(&["m0", "m1"], Some("judge"));
         cfg.tournament = TournamentFormat::SingleElimination;
-        let (output, failed_pairs) = collect_exec(&OkProvider, &cfg, |_| {}, |_| {}, |_| {})
+        let provider = DrawThenChoose {
+            draws: 2,
+            fail_after: false,
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let (output, failed_pairs) = collect_exec(&provider, &cfg, |_| {}, |_| {}, |_| {})
             .await
             .unwrap();
         assert_eq!(failed_pairs, 0);
         let tournament = output.tournament.as_ref().unwrap();
-        assert_eq!(tournament.status, TournamentStatus::Draw);
+        assert_eq!(tournament.status, TournamentStatus::Complete);
         assert_eq!(tournament.judged_match_count(), 2);
-        assert!(tournament.tasks[0].winner.is_none());
-        assert!(
-            tournament.tasks[0]
-                .matches
-                .iter()
-                .all(|row| row.round == 1 && row.winner.is_none())
-        );
+        let bracket = &tournament.tasks[0];
+        assert_eq!(bracket.winner, Some(ModelId::new("m0")));
+        assert_eq!(bracket.matches.len(), 1);
+        let series = &bracket.matches[0];
+        assert_eq!(series.round, 1);
+        assert_eq!(series.outcome, MatchOutcome::Winner);
+        assert_eq!(series.winner, Some(ModelId::new("m0")));
+        assert_eq!(series.games.len(), 2);
+        assert_eq!(series.games[0].outcome, MatchOutcome::Draw);
+        assert!(!series.games[0].tiebreak);
+        assert!(series.games[1].tiebreak);
+        assert_eq!(series.games[1].winner, Some(ModelId::new("m0")));
         assert_eq!(output.judgments.as_ref().map(Vec::len), Some(2));
         assert_eq!(output.run.expected_pairs, Some(2));
         assert_eq!(output.run.resolved_pairs, Some(2));
         assert_eq!(output.run.failed_pairs, Some(0));
         assert_eq!(output.run.complete, Some(true));
+    }
+
+    #[tokio::test]
+    async fn single_elimination_tiebreak_failure_stops_the_bracket() {
+        let mut cfg = config(&["m0", "m1"], Some("judge"));
+        cfg.tournament = TournamentFormat::SingleElimination;
+        let provider = DrawThenChoose {
+            draws: 2,
+            fail_after: true,
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let (output, failed_pairs) = collect_exec(&provider, &cfg, |_| {}, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(failed_pairs, 1);
+        let tournament = output.tournament.as_ref().unwrap();
+        assert_eq!(tournament.status, TournamentStatus::Incomplete);
+        let series = &tournament.tasks[0].matches[0];
+        assert_eq!(series.round, 1);
+        assert_eq!(series.outcome, MatchOutcome::Incomplete);
+        assert!(series.winner.is_none());
+        assert_eq!(series.games.len(), 2);
+        assert!(!series.games[0].tiebreak);
+        assert!(series.games[1].tiebreak);
+        assert_eq!(series.games[1].outcome, MatchOutcome::JudgmentFailed);
+        assert_eq!(output.judgments.as_ref().map(Vec::len), Some(1));
+        assert_eq!(output.run.complete, Some(false));
+        assert!(tournament.tasks[0].winner.is_none());
     }
 
     #[tokio::test]
@@ -1202,7 +1281,7 @@ mod tests {
             series
                 .games
                 .iter()
-                .all(|game| game.outcome == MatchOutcome::Draw)
+                .all(|game| game.outcome == MatchOutcome::Draw && !game.tiebreak)
         );
         assert_eq!(output.judgments.as_ref().map(Vec::len), Some(2));
         assert_eq!(output.run.complete, Some(true));

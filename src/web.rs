@@ -2128,10 +2128,14 @@ function matchResult(match, elimination) {
   } else if (match.outcome) {
     text = match.outcome;
   }
-  const games = match.games && match.games.length;
-  if (games) {
-    text += " (" + games + (games === 1 ? " game)" : " games)");
+  const games = match.games || [];
+  if (!games.length) return text;
+  text += " (" + games.length + (games.length === 1 ? " game" : " games");
+  const tiebreaks = games.filter((game) => game.tiebreak).length;
+  if (tiebreaks) {
+    text += ", " + tiebreaks + (tiebreaks === 1 ? " tie-break" : " tie-breaks");
   }
+  text += ")";
   return text;
 }
 
