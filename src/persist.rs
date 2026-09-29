@@ -683,6 +683,7 @@ mod tests {
             format: TournamentFormat::RoundRobin,
             candidates: vec![ModelId::new("a"), ModelId::new("b")],
             status: TournamentStatus::Complete,
+            best_of: 1,
             tasks: vec![TaskBracket {
                 task_id: "t1".into(),
                 status: TournamentStatus::Complete,
@@ -693,6 +694,7 @@ mod tests {
                     model_b: ModelId::new("b"),
                     winner: Some(ModelId::new("a")),
                     outcome: MatchOutcome::Winner,
+                    games: Vec::new(),
                 }],
             }],
         };
@@ -711,6 +713,12 @@ mod tests {
         assert_eq!(parsed.tournament, Some(tournament));
 
         let mut value = serde_json::to_value(&output).unwrap();
+        assert!(value["tournament"].get("best_of").is_none());
+        assert!(
+            value["tournament"]["tasks"][0]["matches"][0]
+                .get("games")
+                .is_none()
+        );
         value.as_object_mut().unwrap().remove("tournament");
         let legacy: Output = serde_json::from_value(value).unwrap();
         assert!(legacy.tournament.is_none());

@@ -665,6 +665,7 @@ mod tests {
             format: TournamentFormat::SingleElimination,
             candidates: vec![ModelId::new("m0"), ModelId::new("m1")],
             status: TournamentStatus::Draw,
+            best_of: 1,
             tasks: vec![TaskBracket {
                 task_id: "t1".into(),
                 status: TournamentStatus::Draw,
@@ -675,6 +676,7 @@ mod tests {
                     model_b: ModelId::new("m1"),
                     winner: None,
                     outcome: MatchOutcome::Draw,
+                    games: Vec::new(),
                 }],
             }],
         };
@@ -709,5 +711,55 @@ mod tests {
         assert!(html.contains("Draw"));
         assert!(html.contains("m0"));
         assert!(html.contains("m1"));
+        assert!(html.contains("Best of"));
+    }
+
+    #[test]
+    fn best_of_report_shows_the_series_result_and_game_count() {
+        use crate::tournament::{
+            MatchOutcome, SeriesGame, TaskBracket, Tournament, TournamentFormat, TournamentMatch,
+            TournamentStatus,
+        };
+
+        let tournament = Tournament {
+            format: TournamentFormat::RoundRobin,
+            candidates: vec![ModelId::new("m0"), ModelId::new("m1")],
+            status: TournamentStatus::Complete,
+            best_of: 3,
+            tasks: vec![TaskBracket {
+                task_id: "t1".into(),
+                status: TournamentStatus::Complete,
+                winner: None,
+                matches: vec![TournamentMatch {
+                    round: 1,
+                    model_a: ModelId::new("m0"),
+                    model_b: ModelId::new("m1"),
+                    winner: Some(ModelId::new("m0")),
+                    outcome: MatchOutcome::Winner,
+                    games: vec![
+                        SeriesGame {
+                            winner: Some(ModelId::new("m0")),
+                            outcome: MatchOutcome::Winner,
+                        },
+                        SeriesGame {
+                            winner: Some(ModelId::new("m0")),
+                            outcome: MatchOutcome::Winner,
+                        },
+                    ],
+                }],
+            }],
+        };
+        let mut data = output(
+            run_meta(&["m0", "m1"], Some("judge")).with_judge_coverage(2, 2, 0),
+            vec![task("t1")],
+            Some(vec![]),
+            Some(vec![]),
+            None,
+            None,
+        );
+        data.tournament = Some(tournament);
+        let html = crate::html::render(&from_output(&data));
+        assert!(html.contains("Best of 3"));
+        assert!(html.contains("m0 won (2 games)"));
     }
 }

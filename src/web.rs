@@ -64,6 +64,7 @@ struct RunState {
     pairs: Vec<PairRow>,
     output_path: Option<String>,
     tournament_format: String,
+    best_of: u32,
     tournament: Option<Tournament>,
 }
 
@@ -118,6 +119,7 @@ struct RunSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     output_path: Option<String>,
     tournament_format: String,
+    best_of: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     tournament: Option<Tournament>,
 }
@@ -261,6 +263,8 @@ struct StartRequest {
     seed: String,
     #[serde(default)]
     tournament: TournamentFormat,
+    #[serde(default = "crate::tournament::default_best_of")]
+    best_of: u32,
 }
 
 #[derive(Serialize)]
@@ -311,6 +315,7 @@ impl LiveRun {
         let expected_pairs = if config.judge.is_some() {
             tournament::planned_match_count(config.tournament, candidate_count)
                 .saturating_mul(task_count)
+                .saturating_mul(config.best_of as usize)
         } else {
             0
         };
@@ -339,6 +344,7 @@ impl LiveRun {
                 pairs,
                 output_path: None,
                 tournament_format: config.tournament.as_str().to_string(),
+                best_of: config.best_of,
                 tournament: None,
             }),
             events,
@@ -411,6 +417,7 @@ impl RunState {
                 pairs: self.pairs.clone(),
                 output_path: self.output_path.clone(),
                 tournament_format: self.tournament_format.clone(),
+                best_of: self.best_of,
                 tournament: self.tournament.clone(),
             }),
         }
@@ -702,6 +709,7 @@ async fn start_run(
         resolved.base_url.clone(),
         seed,
         request.tournament,
+        request.best_of,
     ) {
         Ok(config) => config,
         Err(error) => return json_error(StatusCode::BAD_REQUEST, error.to_string()),
@@ -874,6 +882,7 @@ fn build_exec_config(
         base_url,
         seed,
         TournamentFormat::RoundRobin,
+        tournament::DEFAULT_BEST_OF,
     )
 }
 
@@ -884,6 +893,7 @@ pub(crate) fn build_exec_config_with_format(
     base_url: String,
     seed: u64,
     tournament: TournamentFormat,
+    best_of: u32,
 ) -> Result<ExecConfig> {
     let models = exec::unique_models(
         models
@@ -901,11 +911,13 @@ pub(crate) fn build_exec_config_with_format(
         .map(ModelId::new);
     exec::validate_judge(&models, judge.as_ref())?;
     tournament::validate(tournament, models.len())?;
+    tournament::validate_best_of(best_of)?;
     Ok(ExecConfig {
         tasks,
         models,
         judge,
         tournament,
+        best_of,
         seed,
         tasks_path: None,
         started_at: persist::utc_timestamp(),
@@ -1027,7 +1039,7 @@ textarea {
   font-size: .84rem;
   line-height: 1.45;
 }
-#seed { max-width: 8rem; font-family: var(--mono); font-size: .9rem; }
+#seed, #best_of { max-width: 8rem; font-family: var(--mono); font-size: .9rem; }
 button {
   padding: 6px 12px;
   border: 1px solid var(--line);
@@ -1445,6 +1457,10 @@ tr.detail-row td {
         </select>
       </div>
       <div>
+        <label for="best_of">Best of</label>
+        <input id="best_of" type="number" min="1" step="2" value="1">
+      </div>
+      <div>
         <label for="seed">Bootstrap seed</label>
         <input id="seed" type="text" inputmode="numeric" value="0">
       </div>
@@ -1535,7 +1551,7 @@ tr.detail-row td {
     </table>
   </div>
   <div id="bracket" hidden>
-    <h2>Single-elimination</h2>
+    <h2 id="bracket_title">Single-elimination</h2>
     <p id="bracket_status" class="meta"></p>
     <div class="results table-scroll">
       <table class="sheet">
@@ -1770,16 +1786,17 @@ function decisionText(decision, modelA, modelB) {
 }
 
 function compactOutcome(row) {
+  let text = "Waiting";
   if (row.status === "resolved" && row.judgment) {
-    return decisionText(row.judgment.winner, row.judgment.model_a, row.judgment.model_b);
-  }
-  if (row.status === "failed") {
+    text = decisionText(row.judgment.winner, row.judgment.model_a, row.judgment.model_b);
+  } else if (row.status === "failed") {
     const first = row.failure && row.failure.orientations && row.failure.orientations[0];
-    if (first && first.error) return first.kind + ": " + first.error;
-    return "Failed";
+    text = first && first.error ? first.kind + ": " + first.error : "Failed";
+  } else if (row.status === "judging") {
+    text = "Judging";
   }
-  if (row.status === "judging") return "Judging";
-  return "Waiting";
+  if (row.games > 1) text += " · " + row.games + " games";
+  return text;
 }
 
 function statusLabel(status) {
@@ -1833,6 +1850,8 @@ function maybeMarkJudging() {
 function upsertPair(taskId, modelA, modelB, status, judgment, failure) {
   const row = findPair(taskId, modelA, modelB);
   if (row) {
+    const another = row.status === "resolved" || row.status === "failed";
+    row.games = another ? (row.games || 1) + 1 : (row.games || 1);
     row.status = status;
     row.judgment = judgment || null;
     row.failure = failure || null;
@@ -1843,6 +1862,7 @@ function upsertPair(taskId, modelA, modelB, status, judgment, failure) {
     model_a: modelA,
     model_b: modelB,
     status,
+    games: 1,
     judgment: judgment || null,
     failure: failure || null,
   });
@@ -1930,7 +1950,10 @@ function renderDash() {
   document.getElementById("ov_candidates").textContent = String(view.candidate_count || 0);
   document.getElementById("ov_tasks").textContent = String(view.task_count || 0);
   document.getElementById("ov_judge").textContent = view.judge || "None";
-  document.getElementById("ov_format").textContent = view.tournament_format || "—";
+  const format = view.tournament_format || "—";
+  document.getElementById("ov_format").textContent = view.best_of > 1
+    ? format + " · best of " + view.best_of
+    : format;
   const resolved = document.getElementById("ov_resolved");
   resolved.textContent = String(view.resolved_pairs);
   resolved.className = "num" + (view.resolved_pairs > 0 ? " hot" : "");
@@ -1992,21 +2015,39 @@ function renderDash() {
   renderBracket();
 }
 
-function matchResult(match) {
-  if (match.outcome === "winner" && match.winner) return match.winner + " advances";
-  if (match.outcome === "draw") return "Draw";
-  if (match.outcome === "judgment_failed") return "Judgment failed";
-  return match.outcome || "—";
+function matchResult(match, elimination) {
+  let text = "—";
+  if (match.outcome === "winner" && match.winner) {
+    text = match.winner + (elimination ? " advances" : " won");
+  } else if (match.outcome === "draw") {
+    text = "Draw";
+  } else if (match.outcome === "judgment_failed") {
+    text = "Judgment failed";
+  } else if (match.outcome === "incomplete") {
+    text = "Incomplete";
+  } else if (match.outcome) {
+    text = match.outcome;
+  }
+  const games = match.games && match.games.length;
+  if (games) {
+    text += " (" + games + (games === 1 ? " game)" : " games)");
+  }
+  return text;
 }
 
 function renderBracket() {
   const section = document.getElementById("bracket");
   const tournament = view && view.tournament;
-  if (!tournament || tournament.format !== "single_elimination") {
+  const series = tournament && tournament.best_of > 1;
+  const elimination = tournament && tournament.format === "single_elimination";
+  if (!tournament || (!elimination && !series)) {
     section.hidden = true;
     return;
   }
   section.hidden = false;
+  document.getElementById("bracket_title").textContent = elimination
+    ? "Single-elimination"
+    : "Best of " + tournament.best_of;
   const lines = (tournament.tasks || []).map((task) => {
     if (task.winner) return task.task_id + ": " + task.winner + " won";
     if (task.status === "draw") return task.task_id + ": draw, no winner";
@@ -2021,7 +2062,7 @@ function renderBracket() {
   (tournament.tasks || []).forEach((task) => {
     (task.matches || []).forEach((match) => {
       const tr = document.createElement("tr");
-      [task.task_id, String(match.round), match.model_a + "  ↔  " + match.model_b, matchResult(match)].forEach((text, index) => {
+      [task.task_id, String(match.round), match.model_a + "  ↔  " + match.model_b, matchResult(match, elimination)].forEach((text, index) => {
         const td = document.createElement("td");
         if (index < 3) td.className = "mono";
         td.textContent = text;
@@ -2101,6 +2142,7 @@ function showDashboard(runId) {
     error: null,
     output_path: null,
     tournament_format: "",
+    best_of: 1,
     tournament: null,
   };
   seenSeq = 0;
@@ -2205,6 +2247,7 @@ document.getElementById("start").addEventListener("click", async () => {
       tasks,
       seed: document.getElementById("seed").value.trim() || "0",
       tournament: document.getElementById("tournament").value,
+      best_of: Number(document.getElementById("best_of").value),
     }),
   });
   const body = await response.json().catch(() => ({}));
@@ -2756,6 +2799,7 @@ mod tests {
                 pairs: Vec::new(),
                 output_path: None,
                 tournament_format: "round-robin".into(),
+                best_of: 1,
                 tournament: None,
             }),
         };
@@ -3139,6 +3183,7 @@ mod tests {
                 tasks: sample_tasks(),
                 seed: "0".into(),
                 tournament: TournamentFormat::RoundRobin,
+                best_of: 1,
             }),
         )
         .await;
@@ -3155,6 +3200,7 @@ mod tests {
                 tasks: sample_tasks(),
                 seed: "0".into(),
                 tournament: TournamentFormat::RoundRobin,
+                best_of: 1,
             }),
         )
         .await;
@@ -3171,6 +3217,7 @@ mod tests {
                 tasks: sample_tasks(),
                 seed: "0".into(),
                 tournament: TournamentFormat::RoundRobin,
+                best_of: 1,
             }),
         )
         .await;
@@ -3185,6 +3232,7 @@ mod tests {
         .unwrap();
         let seed = parse_seed(&request.seed).unwrap();
         assert_eq!(request.tournament, TournamentFormat::RoundRobin);
+        assert_eq!(request.best_of, 1);
         assert_eq!(seed, 9_007_199_254_740_993);
         assert_eq!(parse_seed(" 9007199254740993 ").unwrap(), seed);
         assert_eq!(parse_seed("").unwrap(), 0);
@@ -3225,6 +3273,7 @@ mod tests {
                 tasks: sample_tasks(),
                 seed: "9007199254740993.0".into(),
                 tournament: TournamentFormat::RoundRobin,
+                best_of: 1,
             }),
         )
         .await;
@@ -3256,6 +3305,7 @@ mod tests {
             "https://example.test/v1".into(),
             0,
             TournamentFormat::SingleElimination,
+            tournament::DEFAULT_BEST_OF,
         )
         .unwrap();
         let live = LiveRun::from_config("se".into(), &elimination);
@@ -3283,10 +3333,51 @@ mod tests {
                 tasks: sample_tasks(),
                 seed: "0".into(),
                 tournament: TournamentFormat::SingleElimination,
+                best_of: 1,
             }),
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn start_run_rejects_an_even_best_of() {
+        let state = Arc::new(AppState::new());
+        let response = start_run(
+            State(state),
+            Json(StartRequest {
+                provider: WebProviderKind::Openai,
+                base_url: String::new(),
+                api_key: "secret".into(),
+                models: vec!["m0".into(), "m1".into()],
+                judge: Some("judge".into()),
+                tasks: sample_tasks(),
+                seed: "0".into(),
+                tournament: TournamentFormat::RoundRobin,
+                best_of: 2,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn best_of_scales_the_dashboard_game_budget() {
+        let config = build_exec_config_with_format(
+            vec!["m0".into(), "m1".into()],
+            Some("judge".into()),
+            vec![task()],
+            "https://example.test/v1".into(),
+            0,
+            TournamentFormat::RoundRobin,
+            3,
+        )
+        .unwrap();
+        let live = LiveRun::from_config("bo3".into(), &config);
+        let state = live.inner.try_lock().expect("lock");
+        assert_eq!(state.best_of, 3);
+        assert_eq!(state.expected_pairs, 3);
+        assert_eq!(state.pairs.len(), 1);
     }
 
     #[tokio::test]

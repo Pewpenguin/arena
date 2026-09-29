@@ -61,6 +61,25 @@ pub enum MatchOutcome {
     Winner,
     Draw,
     JudgmentFailed,
+    Incomplete,
+}
+
+/// One game inside a best-of series.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeriesGame {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub winner: Option<ModelId>,
+    pub outcome: MatchOutcome,
+}
+
+pub const DEFAULT_BEST_OF: u32 = 1;
+
+pub fn default_best_of() -> u32 {
+    DEFAULT_BEST_OF
+}
+
+fn is_default_best_of(value: &u32) -> bool {
+    *value == DEFAULT_BEST_OF
 }
 
 /// One scheduled match and how it resolved.
@@ -72,6 +91,9 @@ pub struct TournamentMatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub winner: Option<ModelId>,
     pub outcome: MatchOutcome,
+    /// Individual games. Empty for a single-game match, which is the v1.3.0 shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub games: Vec<SeriesGame>,
 }
 
 /// Bracket or round-robin result for a single task.
@@ -90,15 +112,40 @@ pub struct Tournament {
     pub format: TournamentFormat,
     pub candidates: Vec<ModelId>,
     pub status: TournamentStatus,
+    #[serde(
+        default = "default_best_of",
+        skip_serializing_if = "is_default_best_of"
+    )]
+    pub best_of: u32,
     pub tasks: Vec<TaskBracket>,
 }
 
-impl Tournament {
-    pub fn judged_match_count(&self) -> usize {
-        self.tasks.iter().map(|task| task.matches.len()).sum()
+impl TournamentMatch {
+    pub fn games_played(&self) -> usize {
+        if self.games.is_empty() {
+            1
+        } else {
+            self.games.len()
+        }
     }
 }
 
+impl Tournament {
+    pub fn series_count(&self) -> usize {
+        self.tasks.iter().map(|task| task.matches.len()).sum()
+    }
+
+    /// Games submitted to the judge. A single-game match counts as one.
+    pub fn judged_match_count(&self) -> usize {
+        self.tasks
+            .iter()
+            .flat_map(|task| &task.matches)
+            .map(TournamentMatch::games_played)
+            .sum()
+    }
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BracketStep {
     Advance(ModelId),
@@ -106,6 +153,7 @@ enum BracketStep {
     JudgmentFailed,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct RoundFold {
     matches: Vec<TournamentMatch>,
@@ -121,6 +169,14 @@ pub fn validate(format: TournamentFormat, candidates: usize) -> Result<()> {
         });
     }
     Ok(())
+}
+
+pub fn validate_best_of(best_of: u32) -> Result<()> {
+    if best_of >= 1 && !best_of.is_multiple_of(2) {
+        Ok(())
+    } else {
+        Err(Error::InvalidBestOf { best_of })
+    }
 }
 
 fn supported_field(candidates: usize) -> bool {
@@ -150,11 +206,16 @@ pub(crate) fn opening_pairs(
     }
 }
 
-pub(crate) fn not_judged(format: TournamentFormat, candidates: &[ModelId]) -> Tournament {
+pub(crate) fn not_judged(
+    format: TournamentFormat,
+    candidates: &[ModelId],
+    best_of: u32,
+) -> Tournament {
     Tournament {
         format,
         candidates: candidates.to_vec(),
         status: TournamentStatus::NotJudged,
+        best_of,
         tasks: Vec::new(),
     }
 }
@@ -167,6 +228,7 @@ pub(crate) async fn play<P, F, R>(
     results: &[EvaluatedResult],
     candidates: &[ModelId],
     format: TournamentFormat,
+    best_of: u32,
     mut on_judgment: F,
     mut on_round: R,
 ) -> Result<Tournament>
@@ -176,6 +238,7 @@ where
     R: FnMut(&[JudgmentFailure]),
 {
     validate(format, candidates.len())?;
+    validate_best_of(best_of)?;
     let mut brackets = Vec::with_capacity(tasks.len());
     for task in tasks {
         let bracket = match format {
@@ -186,6 +249,7 @@ where
                     task,
                     results,
                     candidates,
+                    best_of,
                     &mut on_judgment,
                     &mut on_round,
                 )
@@ -198,6 +262,7 @@ where
                     task,
                     results,
                     candidates,
+                    best_of,
                     &mut on_judgment,
                     &mut on_round,
                 )
@@ -206,15 +271,17 @@ where
         };
         brackets.push(bracket);
     }
-    Ok(assemble(format, candidates, brackets))
+    Ok(assemble(format, candidates, best_of, brackets))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn play_round_robin<P, F, R>(
     provider: &P,
     judge_model: &ModelId,
     task: &Task,
     results: &[EvaluatedResult],
     candidates: &[ModelId],
+    best_of: u32,
     on_judgment: &mut F,
     on_round: &mut R,
 ) -> Result<TaskBracket>
@@ -224,21 +291,24 @@ where
     R: FnMut(&[JudgmentFailure]),
 {
     let pairs = round_robin_pairs(candidates);
-    let listed = listed_pairs(&task.id, results, &pairs)?;
-    let outcome = judge::judge_listed_pairs(
+    let matches = play_series(
         provider,
-        judge_model.clone(),
+        judge_model,
         task,
-        &listed,
+        results,
+        &pairs,
+        1,
+        best_of,
         &mut *on_judgment,
+        &mut *on_round,
     )
     .await?;
-    on_round(&outcome.failures);
-    let matches = round_robin_matches(&pairs, &outcome.judgments, &outcome.failures)?;
-    let status = if matches
-        .iter()
-        .any(|row| row.outcome == MatchOutcome::JudgmentFailed)
-    {
+    let status = if matches.iter().any(|row| {
+        matches!(
+            row.outcome,
+            MatchOutcome::JudgmentFailed | MatchOutcome::Incomplete
+        )
+    }) {
         TournamentStatus::Incomplete
     } else {
         TournamentStatus::Complete
@@ -251,12 +321,14 @@ where
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn play_single_elimination<P, F, R>(
     provider: &P,
     judge_model: &ModelId,
     task: &Task,
     results: &[EvaluatedResult],
     candidates: &[ModelId],
+    best_of: u32,
     on_judgment: &mut F,
     on_round: &mut R,
 ) -> Result<TaskBracket>
@@ -271,27 +343,42 @@ where
     let mut stopped = false;
     while active.len() >= 2 {
         let pairs = plan_round(&active)?;
-        let listed = listed_pairs(&task.id, results, &pairs)?;
-        let outcome = judge::judge_listed_pairs(
+        let played = play_series(
             provider,
-            judge_model.clone(),
+            judge_model,
             task,
-            &listed,
+            results,
+            &pairs,
+            round,
+            best_of,
             &mut *on_judgment,
+            &mut *on_round,
         )
         .await?;
-        on_round(&outcome.failures);
-        let steps = steps_for_pairs(&pairs, &outcome.judgments, &outcome.failures)?;
-        let folded = fold_round(round, &pairs, &steps)?;
-        stopped = folded.stop;
-        matches.extend(folded.matches);
+        let winners = series_winners(&played);
+        stopped = winners.is_empty();
+        matches.extend(played);
         if stopped {
             break;
         }
-        active = folded.winners;
+        active = winners;
         round = round.saturating_add(1);
     }
     Ok(bracket_from_parts(&task.id, matches, stopped, &active))
+}
+
+fn series_winners(matches: &[TournamentMatch]) -> Vec<ModelId> {
+    let mut winners = Vec::with_capacity(matches.len());
+    for row in matches {
+        if row.outcome != MatchOutcome::Winner {
+            return Vec::new();
+        }
+        let Some(winner) = &row.winner else {
+            return Vec::new();
+        };
+        winners.push(winner.clone());
+    }
+    winners
 }
 
 fn round_robin_pairs(candidates: &[ModelId]) -> Vec<(ModelId, ModelId)> {
@@ -353,65 +440,130 @@ fn find_result(
         })
 }
 
-fn round_robin_matches(
+#[allow(clippy::too_many_arguments)]
+async fn play_series<P, F, R>(
+    provider: &P,
+    judge_model: &ModelId,
+    task: &Task,
+    results: &[EvaluatedResult],
     pairs: &[(ModelId, ModelId)],
-    judgments: &[Judgment],
-    failures: &[JudgmentFailure],
-) -> Result<Vec<TournamentMatch>> {
-    let mut matches = Vec::with_capacity(pairs.len());
-    for (model_a, model_b) in pairs {
-        matches.push(match_from_outcome(
-            1, model_a, model_b, judgments, failures,
-        )?);
-    }
-    Ok(matches)
-}
-
-fn steps_for_pairs(
-    pairs: &[(ModelId, ModelId)],
-    judgments: &[Judgment],
-    failures: &[JudgmentFailure],
-) -> Result<Vec<BracketStep>> {
-    let mut steps = Vec::with_capacity(pairs.len());
-    for (model_a, model_b) in pairs {
-        let row = match_from_outcome(1, model_a, model_b, judgments, failures)?;
-        steps.push(match row.outcome {
-            MatchOutcome::JudgmentFailed => BracketStep::JudgmentFailed,
-            MatchOutcome::Draw => BracketStep::Draw,
-            MatchOutcome::Winner => {
-                BracketStep::Advance(row.winner.ok_or_else(|| Error::InvalidTournamentWinner {
-                    model_a: model_a.clone(),
-                    model_b: model_b.clone(),
-                    winner: model_a.clone(),
-                })?)
-            }
-        });
-    }
-    Ok(steps)
-}
-
-fn match_from_outcome(
     round: u32,
-    model_a: &ModelId,
-    model_b: &ModelId,
+    best_of: u32,
+    on_judgment: &mut F,
+    on_round: &mut R,
+) -> Result<Vec<TournamentMatch>>
+where
+    P: ModelProvider + Clone + Send + 'static,
+    F: FnMut(&Judgment),
+    R: FnMut(&[JudgmentFailure]),
+{
+    let mut open: Vec<OpenSeries> = pairs
+        .iter()
+        .map(|(model_a, model_b)| OpenSeries::new(round, model_a.clone(), model_b.clone()))
+        .collect();
+    for _ in 0..best_of {
+        let pending: Vec<(ModelId, ModelId)> = open
+            .iter()
+            .filter(|series| series.outcome.is_none())
+            .map(|series| (series.model_a.clone(), series.model_b.clone()))
+            .collect();
+        if pending.is_empty() {
+            break;
+        }
+        let listed = listed_pairs(&task.id, results, &pending)?;
+        let judged = judge::judge_listed_pairs(
+            provider,
+            judge_model.clone(),
+            task,
+            &listed,
+            &mut *on_judgment,
+        )
+        .await?;
+        on_round(&judged.failures);
+        let mut halt = false;
+        for series in open.iter_mut().filter(|series| series.outcome.is_none()) {
+            apply_game(series, &judged.judgments, &judged.failures, best_of)?;
+            if series.outcome == Some(MatchOutcome::JudgmentFailed) {
+                halt = true;
+            }
+        }
+        if halt {
+            for series in &mut open {
+                if series.outcome.is_none() {
+                    series.outcome = Some(MatchOutcome::Incomplete);
+                }
+            }
+            break;
+        }
+    }
+    Ok(open
+        .into_iter()
+        .map(|series| series.finish(best_of))
+        .collect())
+}
+
+struct OpenSeries {
+    round: u32,
+    model_a: ModelId,
+    model_b: ModelId,
+    wins_a: u32,
+    wins_b: u32,
+    games: Vec<SeriesGame>,
+    outcome: Option<MatchOutcome>,
+    winner: Option<ModelId>,
+}
+
+impl OpenSeries {
+    fn new(round: u32, model_a: ModelId, model_b: ModelId) -> Self {
+        Self {
+            round,
+            model_a,
+            model_b,
+            wins_a: 0,
+            wins_b: 0,
+            games: Vec::new(),
+            outcome: None,
+            winner: None,
+        }
+    }
+
+    fn finish(self, best_of: u32) -> TournamentMatch {
+        TournamentMatch {
+            round: self.round,
+            model_a: self.model_a,
+            model_b: self.model_b,
+            winner: self.winner,
+            outcome: self.outcome.unwrap_or(MatchOutcome::Incomplete),
+            games: if best_of == DEFAULT_BEST_OF {
+                Vec::new()
+            } else {
+                self.games
+            },
+        }
+    }
+}
+
+fn apply_game(
+    series: &mut OpenSeries,
     judgments: &[Judgment],
     failures: &[JudgmentFailure],
-) -> Result<TournamentMatch> {
+    best_of: u32,
+) -> Result<()> {
     if failures
         .iter()
-        .any(|failure| failure.model_a == *model_a && failure.model_b == *model_b)
+        .any(|failure| failure.model_a == series.model_a && failure.model_b == series.model_b)
     {
-        return Ok(TournamentMatch {
-            round,
-            model_a: model_a.clone(),
-            model_b: model_b.clone(),
+        series.games.push(SeriesGame {
             winner: None,
             outcome: MatchOutcome::JudgmentFailed,
         });
+        series.outcome = Some(MatchOutcome::JudgmentFailed);
+        series.winner = None;
+        return Ok(());
     }
     let Some(judgment) = judgments
         .iter()
-        .find(|judgment| judgment.model_a == *model_a && judgment.model_b == *model_b)
+        .find(|judgment| judgment.model_a == series.model_a && judgment.model_b == series.model_b)
     else {
         return Err(Error::InconsistentPairCoverage {
             expected: 1,
@@ -419,20 +571,67 @@ fn match_from_outcome(
             failed: failures.len(),
         });
     };
-    let (winner, outcome) = match judgment.winner {
-        JudgeDecision::A => (Some(model_a.clone()), MatchOutcome::Winner),
-        JudgeDecision::B => (Some(model_b.clone()), MatchOutcome::Winner),
+    let (game_winner, game_outcome) = match judgment.winner {
+        JudgeDecision::A => {
+            series.wins_a = series.wins_a.saturating_add(1);
+            (Some(series.model_a.clone()), MatchOutcome::Winner)
+        }
+        JudgeDecision::B => {
+            series.wins_b = series.wins_b.saturating_add(1);
+            (Some(series.model_b.clone()), MatchOutcome::Winner)
+        }
         JudgeDecision::Draw => (None, MatchOutcome::Draw),
     };
-    Ok(TournamentMatch {
-        round,
-        model_a: model_a.clone(),
-        model_b: model_b.clone(),
-        winner,
-        outcome,
-    })
+    series.games.push(SeriesGame {
+        winner: game_winner,
+        outcome: game_outcome,
+    });
+    if let Some(end) = series_result(
+        series.wins_a,
+        series.wins_b,
+        series.games.len() as u32,
+        best_of,
+    ) {
+        match end {
+            SeriesEnd::WinnerA => {
+                series.outcome = Some(MatchOutcome::Winner);
+                series.winner = Some(series.model_a.clone());
+            }
+            SeriesEnd::WinnerB => {
+                series.outcome = Some(MatchOutcome::Winner);
+                series.winner = Some(series.model_b.clone());
+            }
+            SeriesEnd::Draw => {
+                series.outcome = Some(MatchOutcome::Draw);
+                series.winner = None;
+            }
+        }
+    }
+    Ok(())
 }
 
+enum SeriesEnd {
+    WinnerA,
+    WinnerB,
+    Draw,
+}
+
+/// `None` means another game is still required.
+fn series_result(wins_a: u32, wins_b: u32, played: u32, best_of: u32) -> Option<SeriesEnd> {
+    let need = best_of / 2 + 1;
+    let left = best_of.saturating_sub(played);
+    if wins_a >= need {
+        Some(SeriesEnd::WinnerA)
+    } else if wins_b >= need {
+        Some(SeriesEnd::WinnerB)
+    } else if wins_a.saturating_add(left) < need && wins_b.saturating_add(left) < need {
+        Some(SeriesEnd::Draw)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
 fn fold_round(
     round: u32,
     pairs: &[(ModelId, ModelId)],
@@ -480,6 +679,7 @@ fn fold_round(
             model_b: model_b.clone(),
             winner,
             outcome,
+            games: Vec::new(),
         });
     }
     if stop {
@@ -512,10 +712,12 @@ fn conclude(
     matches: &[TournamentMatch],
     active: &[ModelId],
 ) -> (TournamentStatus, Option<ModelId>) {
-    if matches
-        .iter()
-        .any(|row| row.outcome == MatchOutcome::JudgmentFailed)
-    {
+    if matches.iter().any(|row| {
+        matches!(
+            row.outcome,
+            MatchOutcome::JudgmentFailed | MatchOutcome::Incomplete
+        )
+    }) {
         return (TournamentStatus::Incomplete, None);
     }
     if stopped || matches.iter().any(|row| row.outcome == MatchOutcome::Draw) {
@@ -530,6 +732,7 @@ fn conclude(
 fn assemble(
     format: TournamentFormat,
     candidates: &[ModelId],
+    best_of: u32,
     tasks: Vec<TaskBracket>,
 ) -> Tournament {
     let status = if tasks
@@ -549,6 +752,7 @@ fn assemble(
         format,
         candidates: candidates.to_vec(),
         status,
+        best_of,
         tasks,
     }
 }
@@ -586,6 +790,8 @@ fn replay_single_elimination(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    use crate::judge::{JudgeDecision, Judgment};
 
     fn ids(names: &[&str]) -> Vec<ModelId> {
         names.iter().map(|name| ModelId::new(*name)).collect()
@@ -804,11 +1010,14 @@ mod tests {
         let tournament = assemble(
             TournamentFormat::SingleElimination,
             &ids(&["A", "B", "C", "D"]),
+            DEFAULT_BEST_OF,
             vec![bracket],
         );
         let json = serde_json::to_value(&tournament).unwrap();
         assert_eq!(json["format"], "single_elimination");
         assert_eq!(json["status"], "complete");
+        assert!(json.get("best_of").is_none());
+        assert!(json["tasks"][0]["matches"][0].get("games").is_none());
         assert_eq!(json["candidates"], serde_json::json!(["A", "B", "C", "D"]));
         assert_eq!(json["tasks"][0]["winner"], "A");
         assert_eq!(json["tasks"][0]["matches"][2]["round"], 2);
@@ -820,6 +1029,7 @@ mod tests {
         let drawn = assemble(
             TournamentFormat::SingleElimination,
             &ids(&["A", "B"]),
+            DEFAULT_BEST_OF,
             vec![drawn],
         );
         let value = serde_json::to_value(&drawn).unwrap();
@@ -830,5 +1040,115 @@ mod tests {
         let restored: Tournament = serde_json::from_value(value).unwrap();
         assert_eq!(restored, drawn);
         assert!(restored.tasks[0].winner.is_none());
+        assert_eq!(restored.best_of, DEFAULT_BEST_OF);
+    }
+
+    #[test]
+    fn legacy_tournament_without_best_of_metadata_loads_as_a_single_game() {
+        let legacy = r#"{"format":"round_robin","candidates":["a","b"],"status":"complete","tasks":[{"task_id":"t1","status":"complete","matches":[{"round":1,"model_a":"a","model_b":"b","winner":"a","outcome":"winner"}]}]}"#;
+        let loaded: Tournament = serde_json::from_str(legacy).unwrap();
+        assert_eq!(loaded.best_of, DEFAULT_BEST_OF);
+        assert!(loaded.tasks[0].matches[0].games.is_empty());
+        assert_eq!(loaded.tasks[0].matches[0].games_played(), 1);
+    }
+
+    #[test]
+    fn best_of_series_stops_when_the_majority_is_decided() {
+        let (outcome, winner, played) =
+            replay_games(&[JudgeDecision::A, JudgeDecision::A, JudgeDecision::B], 3);
+        assert_eq!(outcome, MatchOutcome::Winner);
+        assert_eq!(winner, Some(id("A")));
+        assert_eq!(played, 2);
+
+        let (outcome, winner, played) = replay_games(
+            &[
+                JudgeDecision::B,
+                JudgeDecision::B,
+                JudgeDecision::B,
+                JudgeDecision::A,
+            ],
+            5,
+        );
+        assert_eq!(outcome, MatchOutcome::Winner);
+        assert_eq!(winner, Some(id("B")));
+        assert_eq!(played, 3);
+
+        let (outcome, winner, played) = replay_games(&[JudgeDecision::A], 1);
+        assert_eq!(outcome, MatchOutcome::Winner);
+        assert_eq!(winner, Some(id("A")));
+        assert_eq!(played, 1);
+    }
+
+    #[test]
+    fn draws_do_not_count_as_wins_and_can_end_the_series() {
+        let (outcome, winner, played) = replay_games(
+            &[JudgeDecision::A, JudgeDecision::Draw, JudgeDecision::A],
+            3,
+        );
+        assert_eq!(outcome, MatchOutcome::Winner);
+        assert_eq!(winner, Some(id("A")));
+        assert_eq!(played, 3);
+
+        let (outcome, winner, played) = replay_games(
+            &[JudgeDecision::Draw, JudgeDecision::Draw, JudgeDecision::A],
+            3,
+        );
+        assert_eq!(outcome, MatchOutcome::Draw);
+        assert!(winner.is_none());
+        assert_eq!(played, 2);
+
+        let (outcome, winner, played) = replay_games(&[JudgeDecision::Draw], 1);
+        assert_eq!(outcome, MatchOutcome::Draw);
+        assert!(winner.is_none());
+        assert_eq!(played, 1);
+    }
+
+    #[test]
+    fn best_of_rejects_even_and_zero_lengths() {
+        for best_of in [0, 2, 4, 6] {
+            let error = validate_best_of(best_of).unwrap_err();
+            match error {
+                Error::InvalidBestOf { best_of: got } => assert_eq!(got, best_of),
+                other => panic!("unexpected error: {other}"),
+            }
+        }
+        for best_of in [1, 3, 5] {
+            assert!(validate_best_of(best_of).is_ok());
+        }
+    }
+
+    fn replay_games(
+        games: &[JudgeDecision],
+        best_of: u32,
+    ) -> (MatchOutcome, Option<ModelId>, usize) {
+        let mut series = OpenSeries::new(1, id("A"), id("B"));
+        let mut played = 0;
+        for game in games {
+            played += 1;
+            let judgment = Judgment {
+                task_id: "t1".into(),
+                model_a: id("A"),
+                model_b: id("B"),
+                judge_model: id("judge"),
+                winner: game.clone(),
+                reason: String::new(),
+                duration_ms: 1,
+                agreement: true,
+                orientation_ab: None,
+                orientation_ba: None,
+                reason_ab: None,
+                reason_ba: None,
+                raw_ab: None,
+                raw_ba: None,
+                raw: None,
+            };
+            apply_game(&mut series, &[judgment], &[], best_of).unwrap();
+            if series.outcome.is_some() {
+                break;
+            }
+        }
+        let outcome = series.outcome.unwrap_or(MatchOutcome::Incomplete);
+        let winner = series.winner.clone();
+        (outcome, winner, played)
     }
 }

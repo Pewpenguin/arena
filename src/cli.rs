@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use crate::tournament::TournamentFormat;
+use crate::tournament::{DEFAULT_BEST_OF, TournamentFormat};
 
 #[derive(Debug, Parser)]
 #[command(name = "arena", version, about = "Arena")]
@@ -56,6 +56,8 @@ pub enum Command {
         judge: Option<String>,
         #[arg(long, value_enum, default_value_t = TournamentFormat::RoundRobin)]
         tournament: TournamentFormat,
+        #[arg(long, default_value_t = DEFAULT_BEST_OF)]
+        best_of: u32,
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },

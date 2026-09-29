@@ -35,10 +35,11 @@ async fn main() -> Result<()> {
             output,
             judge,
             tournament,
+            best_of,
             seed,
         } => {
             exec_with_provider(
-                provider, tasks_path, models, output, judge, tournament, seed,
+                provider, tasks_path, models, output, judge, tournament, best_of, seed,
             )
             .await?;
         }
@@ -84,6 +85,7 @@ async fn run_prompt(provider: impl ModelProvider, model: String, prompt: String)
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn exec_with_provider(
     choice: ProviderChoice,
     tasks_path: PathBuf,
@@ -91,6 +93,7 @@ async fn exec_with_provider(
     output: Option<PathBuf>,
     judge: Option<String>,
     tournament: TournamentFormat,
+    best_of: u32,
     seed: u64,
 ) -> Result<()> {
     match choice {
@@ -98,7 +101,7 @@ async fn exec_with_provider(
             let provider = OpenAICompatibleProvider::from_env()?;
             let base_url = provider.base_url().to_string();
             run_exec(
-                provider, base_url, tasks_path, models, output, judge, tournament, seed,
+                provider, base_url, tasks_path, models, output, judge, tournament, best_of, seed,
             )
             .await
         }
@@ -106,7 +109,7 @@ async fn exec_with_provider(
             let provider = OpenRouterProvider::from_env()?;
             let base_url = provider.base_url().to_string();
             run_exec(
-                provider, base_url, tasks_path, models, output, judge, tournament, seed,
+                provider, base_url, tasks_path, models, output, judge, tournament, best_of, seed,
             )
             .await
         }
@@ -114,7 +117,7 @@ async fn exec_with_provider(
             let provider = AnthropicProvider::from_env()?;
             let base_url = provider.base_url().to_string();
             run_exec(
-                provider, base_url, tasks_path, models, output, judge, tournament, seed,
+                provider, base_url, tasks_path, models, output, judge, tournament, best_of, seed,
             )
             .await
         }
@@ -122,7 +125,7 @@ async fn exec_with_provider(
             let provider = GeminiProvider::from_env()?;
             let base_url = provider.base_url().to_string();
             run_exec(
-                provider, base_url, tasks_path, models, output, judge, tournament, seed,
+                provider, base_url, tasks_path, models, output, judge, tournament, best_of, seed,
             )
             .await
         }
@@ -138,6 +141,7 @@ async fn run_exec<P>(
     output: Option<PathBuf>,
     judge: Option<String>,
     tournament: TournamentFormat,
+    best_of: u32,
     seed: u64,
 ) -> Result<()>
 where
@@ -149,10 +153,11 @@ where
     let started_at = persist::utc_timestamp();
     let tasks = task::load(&tasks_path)?;
     tournament::validate(tournament, models.len())?;
+    tournament::validate_best_of(best_of)?;
 
     let candidate_total = (tasks.len() * models.len()) as u64;
     let candidates = progress_bar(candidate_total);
-    let pair_total = judge_progress_len(tournament, tasks.len(), models.len());
+    let pair_total = judge_progress_len(tournament, tasks.len(), models.len(), best_of);
     let judges = judge.as_ref().map(|_| progress_bar(pair_total));
 
     let config = ExecConfig {
@@ -160,6 +165,7 @@ where
         models,
         judge,
         tournament,
+        best_of,
         seed,
         tasks_path: Some(tasks_path),
         started_at,
@@ -211,8 +217,10 @@ where
     exec::complete_exec(output_data, failed_pairs, output.as_deref())
 }
 
-fn judge_progress_len(format: TournamentFormat, tasks: usize, models: usize) -> u64 {
-    tournament::planned_match_count(format, models).saturating_mul(tasks) as u64
+fn judge_progress_len(format: TournamentFormat, tasks: usize, models: usize, best_of: u32) -> u64 {
+    tournament::planned_match_count(format, models)
+        .saturating_mul(tasks)
+        .saturating_mul(best_of as usize) as u64
 }
 
 fn progress_bar(len: u64) -> ProgressBar {
@@ -232,16 +240,17 @@ mod tests {
 
     #[test]
     fn judge_progress_length_matches_expected_unordered_pairs() {
-        assert_eq!(judge_progress_len(TournamentFormat::RoundRobin, 1, 2), 1);
-        assert_eq!(judge_progress_len(TournamentFormat::RoundRobin, 2, 3), 6);
-        assert_eq!(judge_progress_len(TournamentFormat::RoundRobin, 0, 4), 0);
+        assert_eq!(judge_progress_len(TournamentFormat::RoundRobin, 1, 2, 1), 1);
+        assert_eq!(judge_progress_len(TournamentFormat::RoundRobin, 2, 3, 1), 6);
+        assert_eq!(judge_progress_len(TournamentFormat::RoundRobin, 0, 4, 1), 0);
         assert_eq!(
-            judge_progress_len(TournamentFormat::RoundRobin, 3, 4),
+            judge_progress_len(TournamentFormat::RoundRobin, 3, 4, 1),
             arena::exec::expected_pairs(3, 4) as u64
         );
         assert_eq!(
-            judge_progress_len(TournamentFormat::SingleElimination, 2, 4),
+            judge_progress_len(TournamentFormat::SingleElimination, 2, 4, 1),
             6
         );
+        assert_eq!(judge_progress_len(TournamentFormat::RoundRobin, 1, 2, 3), 3);
     }
 }

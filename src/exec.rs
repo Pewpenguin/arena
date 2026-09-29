@@ -22,6 +22,7 @@ pub struct ExecConfig {
     pub models: Vec<ModelId>,
     pub judge: Option<ModelId>,
     pub tournament: TournamentFormat,
+    pub best_of: u32,
     pub seed: u64,
     pub tasks_path: Option<PathBuf>,
     pub started_at: String,
@@ -51,23 +52,24 @@ pub fn validate_judge(models: &[ModelId], judge: Option<&ModelId>) -> Result<()>
 fn check_pair_coverage(
     format: TournamentFormat,
     status: TournamentStatus,
-    planned: usize,
-    expected: usize,
+    planned_series: usize,
+    series: usize,
+    games: usize,
     resolved: usize,
     failed: usize,
 ) -> Result<()> {
     if (format == TournamentFormat::RoundRobin || status == TournamentStatus::Complete)
-        && planned != expected
+        && planned_series != series
     {
         return Err(Error::InconsistentPairCoverage {
-            expected: planned,
+            expected: planned_series,
             resolved,
             failed,
         });
     }
-    if expected != resolved + failed {
+    if games != resolved + failed {
         return Err(Error::InconsistentPairCoverage {
-            expected,
+            expected: games,
             resolved,
             failed,
         });
@@ -131,6 +133,7 @@ where
 {
     validate_judge(&config.models, config.judge.as_ref())?;
     tournament::validate(config.tournament, config.models.len())?;
+    tournament::validate_best_of(config.best_of)?;
     let mut results = Vec::new();
     for task in &config.tasks {
         let executed = execute_models(provider, task, &config.models, |result| {
@@ -162,6 +165,7 @@ where
             &results,
             &config.models,
             config.tournament,
+            config.best_of,
             |judgment| {
                 on_judgment(judgment);
                 emit_event(
@@ -193,7 +197,7 @@ where
         )
         .await?
     } else {
-        tournament::not_judged(config.tournament, &config.models)
+        tournament::not_judged(config.tournament, &config.models, config.best_of)
     };
 
     let mut run = RunMetadata::new(
@@ -209,7 +213,8 @@ where
             let (ratings, meta) =
                 bootstrap::rate_with_uncertainty(&judgments, &config.models, config.seed);
             run = run.with_bootstrap(&meta);
-            let expected = tournament_record.judged_match_count();
+            let games = tournament_record.judged_match_count();
+            let series = tournament_record.series_count();
             let resolved = judgments.len();
             let failed = judgment_failures.len();
             let planned = tournament::planned_match_count(config.tournament, config.models.len())
@@ -218,10 +223,12 @@ where
                 config.tournament,
                 tournament_record.status,
                 planned,
-                expected,
+                series,
+                games,
                 resolved,
                 failed,
             )?;
+            let expected = games;
             run = run
                 .with_judge_coverage(expected, resolved, failed)
                 .with_orientation_agreement(stats::pair_agreement(&judgments))
@@ -301,6 +308,7 @@ mod tests {
     use crate::event::ExperimentEvent;
     use crate::judge::JudgeDecision;
     use crate::provider::{CompletionRequest, CompletionResponse, ProviderError};
+    use crate::tournament::MatchOutcome;
 
     fn sample_task() -> Task {
         Task {
@@ -316,6 +324,7 @@ mod tests {
             models: models.iter().map(|id| ModelId::new(*id)).collect(),
             judge: judge.map(ModelId::new),
             tournament: TournamentFormat::RoundRobin,
+            best_of: tournament::DEFAULT_BEST_OF,
             seed: 0,
             tasks_path: Some(PathBuf::from("tasks.json")),
             started_at: "2026-01-02T03:04:05Z".into(),
@@ -543,6 +552,7 @@ mod tests {
         assert_eq!(parsed["judgment_failures"].as_array().unwrap().len(), 0);
         assert_eq!(parsed["tournament"]["format"], "round_robin");
         assert_eq!(parsed["tournament"]["status"], "complete");
+        assert!(parsed["tournament"].get("best_of").is_none());
         assert_eq!(
             parsed["tournament"]["candidates"],
             serde_json::json!(["m0", "m1"])
@@ -574,6 +584,7 @@ mod tests {
         assert!(parsed.get("ratings").is_none());
         assert_eq!(parsed["tournament"]["format"], "round_robin");
         assert_eq!(parsed["tournament"]["status"], "not_judged");
+        assert!(parsed["tournament"].get("best_of").is_none());
         assert_eq!(
             parsed["tournament"]["candidates"],
             serde_json::json!(["m0"])
@@ -607,6 +618,7 @@ mod tests {
             models: ["m0", "m1", "m2"].into_iter().map(ModelId::new).collect(),
             judge: Some(ModelId::new("judge")),
             tournament: TournamentFormat::RoundRobin,
+            best_of: tournament::DEFAULT_BEST_OF,
             seed: 0,
             tasks_path: Some(PathBuf::from("tasks.json")),
             started_at: "2026-01-02T03:04:05Z".into(),
@@ -1125,5 +1137,112 @@ mod tests {
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
         assert!(!path.exists());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn round_robin_best_of_three_stops_each_series_at_two_wins() {
+        let mut cfg = config(&["m0", "m1", "m2"], Some("judge"));
+        cfg.best_of = 3;
+        let (output, failed_pairs) = collect_exec(&PreferSmallerId, &cfg, |_| {}, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(failed_pairs, 0);
+        let tournament = output.tournament.as_ref().unwrap();
+        assert_eq!(tournament.format, TournamentFormat::RoundRobin);
+        assert_eq!(tournament.best_of, 3);
+        assert_eq!(tournament.status, TournamentStatus::Complete);
+        assert_eq!(tournament.series_count(), 3);
+        assert_eq!(tournament.judged_match_count(), 6);
+        assert_eq!(output.judgments.as_ref().map(Vec::len), Some(6));
+        assert_eq!(output.run.expected_pairs, Some(6));
+        assert!(tournament.tasks[0].matches.iter().all(|row| {
+            row.games.len() == 2
+                && row.outcome == MatchOutcome::Winner
+                && row.winner.as_ref() == Some(&row.model_a)
+        }));
+    }
+
+    #[tokio::test]
+    async fn single_elimination_best_of_three_advances_series_winners() {
+        let mut cfg = config(&["m0", "m1", "m2", "m3"], Some("judge"));
+        cfg.tournament = TournamentFormat::SingleElimination;
+        cfg.best_of = 3;
+        let (output, failed_pairs) = collect_exec(&PreferSmallerId, &cfg, |_| {}, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(failed_pairs, 0);
+        let tournament = output.tournament.as_ref().unwrap();
+        assert_eq!(tournament.status, TournamentStatus::Complete);
+        assert_eq!(tournament.best_of, 3);
+        let bracket = &tournament.tasks[0];
+        assert_eq!(bracket.winner, Some(ModelId::new("m0")));
+        assert_eq!(bracket.matches.len(), 3);
+        assert!(bracket.matches.iter().all(|row| row.games.len() == 2));
+        assert_eq!(bracket.matches[2].round, 2);
+        assert_eq!(bracket.matches[2].model_a, ModelId::new("m0"));
+        assert_eq!(bracket.matches[2].model_b, ModelId::new("m2"));
+        assert_eq!(output.judgments.as_ref().map(Vec::len), Some(6));
+    }
+
+    #[tokio::test]
+    async fn best_of_three_draw_stops_when_a_majority_is_impossible() {
+        let mut cfg = config(&["m0", "m1"], Some("judge"));
+        cfg.best_of = 3;
+        let (output, failed_pairs) = collect_exec(&OkProvider, &cfg, |_| {}, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(failed_pairs, 0);
+        let tournament = output.tournament.as_ref().unwrap();
+        assert_eq!(tournament.status, TournamentStatus::Complete);
+        let series = &tournament.tasks[0].matches[0];
+        assert_eq!(series.outcome, MatchOutcome::Draw);
+        assert!(series.winner.is_none());
+        assert_eq!(series.games.len(), 2);
+        assert!(
+            series
+                .games
+                .iter()
+                .all(|game| game.outcome == MatchOutcome::Draw)
+        );
+        assert_eq!(output.judgments.as_ref().map(Vec::len), Some(2));
+        assert_eq!(output.run.complete, Some(true));
+    }
+
+    #[tokio::test]
+    async fn judgment_failure_makes_the_best_of_series_incomplete() {
+        let mut cfg = config(&["m0", "m1"], Some("judge"));
+        cfg.best_of = 3;
+        let (output, failed_pairs) = collect_exec(&FailJudge, &cfg, |_| {}, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(failed_pairs, 1);
+        let tournament = output.tournament.as_ref().unwrap();
+        assert_eq!(tournament.status, TournamentStatus::Incomplete);
+        let series = &tournament.tasks[0].matches[0];
+        assert_eq!(series.outcome, MatchOutcome::JudgmentFailed);
+        assert!(series.winner.is_none());
+        assert_eq!(series.games.len(), 1);
+        assert_eq!(output.judgments.as_ref().map(Vec::len), Some(0));
+        assert_eq!(output.run.complete, Some(false));
+    }
+
+    #[tokio::test]
+    async fn invalid_best_of_is_rejected_before_execution() {
+        for best_of in [0, 2] {
+            let path = temp_path(&format!("bad-best-of-{best_of}"));
+            let _ = std::fs::remove_file(&path);
+            let mut cfg = config(&["m0", "m1"], None);
+            cfg.best_of = best_of;
+            let provider = FailCandidates {
+                calls: Arc::new(AtomicUsize::new(0)),
+            };
+            let error = run_exec(&provider, &cfg, Some(&path)).await.unwrap_err();
+            match error {
+                Error::InvalidBestOf { best_of: got } => assert_eq!(got, best_of),
+                other => panic!("unexpected error: {other}"),
+            }
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            assert!(!path.exists());
+        }
     }
 }

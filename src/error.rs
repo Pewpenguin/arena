@@ -45,6 +45,8 @@ pub enum Error {
     },
     #[error("missing execution result for candidate {model} on task {task_id}")]
     MissingCandidateResult { task_id: String, model: ModelId },
+    #[error("best-of must be an odd number of games (1, 3, 5, ...), got {best_of}")]
+    InvalidBestOf { best_of: u32 },
     #[error("single-elimination cannot advance {winner} from {model_a} vs {model_b}")]
     InvalidTournamentWinner {
         model_a: ModelId,

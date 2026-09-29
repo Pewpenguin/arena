@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 use crate::judge::Judgment;
@@ -60,7 +60,7 @@ pub fn rate_with_uncertainty(
 
     for _ in 0..BOOTSTRAP_REPLICATES {
         let draws: Vec<usize> = (0..n_clusters)
-            .map(|_| rng.gen_range(0..n_clusters))
+            .map(|_| rng.random_range(0..n_clusters))
             .collect();
         let sampled = build_replicate(&clusters, &draws);
         if let Some(values) = finite_for_all(&ratings, &rating::rate(&sampled, models)) {

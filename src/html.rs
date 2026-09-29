@@ -412,13 +412,26 @@ fn push_results(html: &mut String, results: &[CandidateRow<'_>]) {
 }
 
 fn push_tournament(html: &mut String, tournament: &Tournament) {
-    if tournament.format != TournamentFormat::SingleElimination {
+    let elimination = tournament.format == TournamentFormat::SingleElimination;
+    let series = tournament.best_of > 1;
+    if !elimination && !series {
         return;
     }
-    html.push_str("<section>\n<h2>Single-elimination</h2>\n");
-    html.push_str(
-        "<p class=\"note\">Match winners advance. A draw does not advance a candidate.</p>\n",
-    );
+    html.push_str("<section>\n<h2>");
+    if elimination {
+        html.push_str("Single-elimination");
+    } else {
+        html.push_str(&format!("Best of {}", tournament.best_of));
+    }
+    html.push_str("</h2>\n<p class=\"note\">");
+    html.push_str(if elimination && series {
+        "Each match is a best-of series. The winner advances. A draw does not advance a candidate."
+    } else if elimination {
+        "Match winners advance. A draw does not advance a candidate."
+    } else {
+        "Each pair plays one series. Draws do not count as wins."
+    });
+    html.push_str("</p>\n");
     if tournament.tasks.iter().all(|task| task.matches.is_empty()) {
         html.push_str("<p>No matches were played.</p>\n</section>\n");
         return;
@@ -442,7 +455,7 @@ fn push_tournament(html: &mut String, tournament: &Tournament) {
             html.push_str("</td><td class=\"model-id\">");
             html.push_str(&escape(&row.model_b.to_string()));
             html.push_str("</td><td>");
-            html.push_str(&escape(&match_result(row)));
+            html.push_str(&escape(&match_result(row, elimination)));
             html.push_str("</td></tr>\n");
         }
     }
@@ -461,15 +474,23 @@ fn task_result(task: &TaskBracket) -> String {
     }
 }
 
-fn match_result(row: &crate::tournament::TournamentMatch) -> String {
-    match row.outcome {
-        MatchOutcome::Winner => row
-            .winner
-            .as_ref()
-            .map(|winner| format!("{winner} advances"))
-            .unwrap_or_else(|| "Winner".to_string()),
+fn match_result(row: &crate::tournament::TournamentMatch, elimination: bool) -> String {
+    let text = match row.outcome {
+        MatchOutcome::Winner => match &row.winner {
+            Some(winner) if elimination => format!("{winner} advances"),
+            Some(winner) => format!("{winner} won"),
+            None => "Winner".to_string(),
+        },
         MatchOutcome::Draw => "Draw".to_string(),
         MatchOutcome::JudgmentFailed => "Judgment failed".to_string(),
+        MatchOutcome::Incomplete => "Incomplete".to_string(),
+    };
+    if row.games.is_empty() {
+        text
+    } else {
+        let games = row.games.len();
+        let label = if games == 1 { "game" } else { "games" };
+        format!("{text} ({games} {label})")
     }
 }
 
@@ -708,6 +729,7 @@ fn push_config(html: &mut String, config: &RunConfig<'_>, tournament: Option<&To
     if let Some(tournament) = tournament {
         dt_dd(html, "Tournament", tournament.format.as_str());
         dt_dd(html, "Tournament status", tournament.status.as_str());
+        dt_dd(html, "Best of", &tournament.best_of.to_string());
     }
     dt_dd(
         html,
