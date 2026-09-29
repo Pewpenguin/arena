@@ -1019,7 +1019,7 @@ body {
 .tasks { grid-area: tasks; }
 .controls { grid-area: controls; }
 .workspace > .region { min-width: 0; }
-.region h2, label.region-title, .section-line h2, .experiment > h2 {
+.region h2, label.region-title, .section-line h2, .experiment > h2, #elim_section > h2, .elim-round h3 {
   display: block;
   margin: 0 0 8px;
   padding: 0;
@@ -1372,6 +1372,30 @@ input[type=checkbox] { width: auto; margin: 0; accent-color: var(--accent); }
 #dashboard.is-incomplete .bar > span { background: var(--warn); }
 #dashboard.is-failed .bar > span { background: var(--bad); }
 .results { margin-top: 8px; }
+#elim_section { margin: 0 0 24px; }
+#elim_status, #bracket_status { margin: 0 0 8px; color: var(--muted); font-family: var(--mono); font-size: .82rem; letter-spacing: 0; text-transform: none; }
+#elim_status:empty, #bracket_status:empty { display: none; }
+#elim_section[hidden], .elim-board[hidden], #bracket_table[hidden] { display: none; }
+.elim-board { display: flex; flex-direction: column; gap: 16px; }
+.elim-task { margin: 0 0 8px; color: var(--muted); font-family: var(--mono); font-size: .82rem; }
+.elim-columns { display: flex; align-items: stretch; gap: 16px; overflow-x: auto; }
+.elim-round { flex: 1 0 12.5rem; min-width: 12.5rem; max-width: 20rem; display: flex; flex-direction: column; }
+.elim-round h3 { margin: 0 0 8px; }
+.elim-matches { flex: 1; display: flex; flex-direction: column; justify-content: space-around; gap: 8px; }
+.elim-match { min-width: 0; padding: 6px 8px; border: 1px solid var(--line); background: var(--field); }
+.elim-match.is-active { border-color: var(--accent); }
+.elim-match.is-draw { border-color: var(--warn); }
+.elim-match.is-incomplete { border-color: var(--bad); }
+.elim-slot { margin: 0; color: var(--ink); font-family: var(--mono); font-size: .82rem; line-height: 1.35; overflow-wrap: anywhere; }
+.elim-slot + .elim-slot { margin-top: 2px; }
+.elim-slot.is-winner { font-weight: 600; }
+.elim-slot.is-out, .elim-slot.is-open { color: var(--muted); }
+.elim-detail { margin: 4px 0 0; color: var(--muted); font-size: .72rem; line-height: 1.35; overflow-wrap: anywhere; }
+.elim-match.is-active .elim-detail { color: var(--accent); }
+.elim-match.is-draw .elim-detail { color: var(--warn); }
+.elim-match.is-incomplete .elim-detail { color: var(--bad); }
+.elim-champion { margin: 8px 0 0; color: var(--muted); font-size: .68rem; font-weight: 600; letter-spacing: .12em; text-transform: uppercase; }
+.elim-champion strong { display: block; margin-top: 4px; color: var(--ink); font-family: var(--mono); font-size: .82rem; font-weight: 600; letter-spacing: 0; text-transform: none; overflow-wrap: anywhere; }
 table.pairs { min-width: 42rem; }
 table.pairs th { border-top: 1px solid var(--line); }
 table.pairs td { padding: 8px 16px 8px 0; }
@@ -1643,6 +1667,11 @@ tr.detail-row td {
       <div class="bar"><span id="pair_bar"></span></div>
     </div>
   </div>
+  <div id="elim_section" hidden>
+    <h2>Single-elimination</h2>
+    <p id="elim_status" class="meta"></p>
+    <div id="elim_board" class="elim-board"></div>
+  </div>
   <h2 class="results-title">Pairwise evaluation</h2>
   <div class="results table-scroll">
     <table class="sheet pairs">
@@ -1664,9 +1693,9 @@ tr.detail-row td {
     </table>
   </div>
   <div id="bracket" hidden>
-    <h2 id="bracket_title">Single-elimination</h2>
+    <h2 id="bracket_title">Best of</h2>
     <p id="bracket_status" class="meta"></p>
-    <div class="results table-scroll">
+    <div id="bracket_table" class="results table-scroll">
       <table class="sheet">
         <thead>
           <tr>
@@ -2267,6 +2296,251 @@ function renderDash() {
   renderBracket();
 }
 
+function isSingleElimination() {
+  const format = (view && view.tournament_format) || "";
+  if (format === "single-elimination" || format === "single_elimination") return true;
+  const tournament = view && view.tournament;
+  return !!(tournament && tournament.format === "single_elimination");
+}
+
+function roundHeading(matchCount) {
+  if (matchCount === 1) return "Final";
+  if (matchCount === 2) return "Semifinals";
+  if (matchCount === 4) return "Quarterfinals";
+  return "Round of " + (matchCount * 2);
+}
+
+function isPowerOfTwo(count) {
+  return count >= 2 && (count & (count - 1)) === 0;
+}
+
+function pairsByTask() {
+  const tasks = [];
+  const index = new Map();
+  (view.pairs || []).forEach((row) => {
+    if (!index.has(row.task_id)) {
+      index.set(row.task_id, tasks.length);
+      tasks.push({ task_id: row.task_id, pairs: [] });
+    }
+    tasks[index.get(row.task_id)].pairs.push(row);
+  });
+  return tasks;
+}
+
+function liveSeriesWinner(row) {
+  if (!row || view.best_of > 1 || row.status !== "resolved" || !row.judgment) return null;
+  if (row.judgment.winner === "a") return row.model_a;
+  if (row.judgment.winner === "b") return row.model_b;
+  return null;
+}
+
+function liveState(row) {
+  if (!row || row.status === "waiting") return "pending";
+  if (row.status === "judging") return "active";
+  if (row.status === "failed") return "incomplete";
+  if (row.status === "resolved" && view.best_of > 1 && view.status === "running") return "active";
+  if (row.status === "resolved" && row.judgment && row.judgment.winner === "draw") return "draw";
+  if (row.status === "resolved") return "complete";
+  return "pending";
+}
+
+function liveDetail(row, state) {
+  if (!row || state === "pending") return "Pending";
+  if (state === "active") return "Judging";
+  if (state === "incomplete") return "Judgment failed";
+  if (state === "draw") return "Draw";
+  const winner = liveSeriesWinner(row);
+  if (!winner) return "Pending";
+  const games = row.games || 1;
+  if (games > 1) return winner + " advances (" + games + " games)";
+  return winner + " advances";
+}
+
+function liveCard(row, projected) {
+  if (!row) {
+    const modelA = projected && projected.modelA;
+    const modelB = projected && projected.modelB;
+    return {
+      modelA: modelA || "Pending",
+      modelB: modelB || "Pending",
+      winner: null,
+      state: "pending",
+      detail: "Pending",
+      openA: !modelA,
+      openB: !modelB,
+    };
+  }
+  const state = liveState(row);
+  return {
+    modelA: row.model_a,
+    modelB: row.model_b,
+    winner: state === "complete" ? liveSeriesWinner(row) : null,
+    state: state,
+    detail: liveDetail(row, state),
+    openA: false,
+    openB: false,
+  };
+}
+
+function liveRounds(pairs, field) {
+  if (!isPowerOfTwo(field)) {
+    return [pairs.map((row) => liveCard(row))];
+  }
+  const slots = [];
+  let cursor = 0;
+  let count = field / 2;
+  while (count >= 1) {
+    const round = [];
+    for (let i = 0; i < count; i += 1) {
+      round.push(cursor < pairs.length ? pairs[cursor++] : null);
+    }
+    slots.push(round);
+    count /= 2;
+  }
+  return slots.map((round, roundIndex) => round.map((row, index) => {
+    if (row) return liveCard(row);
+    const prev = roundIndex > 0 ? slots[roundIndex - 1] : null;
+    const modelA = prev ? liveSeriesWinner(prev[index * 2]) : null;
+    const modelB = prev ? liveSeriesWinner(prev[index * 2 + 1]) : null;
+    return liveCard(null, { modelA: modelA, modelB: modelB });
+  }));
+}
+
+function liveChampion(rounds) {
+  const finalRound = rounds[rounds.length - 1];
+  if (!finalRound || finalRound.length !== 1) return null;
+  return finalRound[0].winner || null;
+}
+
+function recordedState(match) {
+  if (match.outcome === "winner") return "complete";
+  if (match.outcome === "draw") return "draw";
+  if (match.outcome === "judgment_failed" || match.outcome === "incomplete") return "incomplete";
+  return "pending";
+}
+
+function recordedRounds(task) {
+  const byRound = new Map();
+  (task.matches || []).forEach((match) => {
+    const round = match.round || 1;
+    if (!byRound.has(round)) byRound.set(round, []);
+    byRound.get(round).push(match);
+  });
+  return [...byRound.keys()].sort((a, b) => a - b).map((round) => byRound.get(round).map((match) => ({
+    modelA: match.model_a,
+    modelB: match.model_b,
+    winner: match.outcome === "winner" ? match.winner : null,
+    state: recordedState(match),
+    detail: matchResult(match, true),
+    openA: false,
+    openB: false,
+  })));
+}
+
+function elimSlot(name, winner, open) {
+  const slot = document.createElement("p");
+  slot.className = "elim-slot";
+  const text = name || "Pending";
+  slot.textContent = text;
+  slot.title = text;
+  if (open || text === "Pending") slot.classList.add("is-open");
+  else if (winner && winner === text) slot.classList.add("is-winner");
+  else if (winner) slot.classList.add("is-out");
+  return slot;
+}
+
+function elimCard(card) {
+  const match = document.createElement("div");
+  match.className = "elim-match is-" + card.state;
+  match.append(
+    elimSlot(card.modelA, card.winner, card.openA),
+    elimSlot(card.modelB, card.winner, card.openB),
+  );
+  const detail = document.createElement("p");
+  detail.className = "elim-detail";
+  detail.textContent = card.detail;
+  match.append(detail);
+  return match;
+}
+
+function championLine(name) {
+  const line = document.createElement("p");
+  line.className = "elim-champion";
+  line.append("Champion");
+  const model = document.createElement("strong");
+  model.textContent = name;
+  model.title = name;
+  line.append(model);
+  return line;
+}
+
+function appendElimBoard(taskId, rounds, champion, multi) {
+  const board = document.getElementById("elim_board");
+  const block = document.createElement("div");
+  if (multi) {
+    const label = document.createElement("p");
+    label.className = "elim-task";
+    label.textContent = taskId;
+    block.append(label);
+  }
+  const columns = document.createElement("div");
+  columns.className = "elim-columns";
+  rounds.forEach((matches, roundIndex) => {
+    const column = document.createElement("section");
+    column.className = "elim-round";
+    const heading = document.createElement("h3");
+    heading.textContent = roundHeading(matches.length);
+    const list = document.createElement("div");
+    list.className = "elim-matches";
+    matches.forEach((card) => list.append(elimCard(card)));
+    column.append(heading, list);
+    if (champion && roundIndex === rounds.length - 1) column.append(championLine(champion));
+    columns.append(column);
+  });
+  block.append(columns);
+  board.append(block);
+}
+
+function renderElimSection() {
+  const section = document.getElementById("elim_section");
+  const board = document.getElementById("elim_board");
+  if (!isSingleElimination()) {
+    section.hidden = true;
+    board.replaceChildren();
+    return;
+  }
+  section.hidden = false;
+  board.replaceChildren();
+  const tournament = view.tournament;
+  const recorded = tournament && tournament.format === "single_elimination" && (tournament.tasks || []).some((task) => (task.matches || []).length);
+  const lines = recorded ? (tournament.tasks || []).map((task) => {
+    if (task.winner) return task.task_id + ": " + task.winner + " won";
+    if (task.status === "draw") return task.task_id + ": draw, no winner";
+    if (task.status === "incomplete") return task.task_id + ": no winner";
+    return task.task_id + ": " + (task.status || "");
+  }) : [];
+  document.getElementById("elim_status").textContent = lines.length ? lines.join(" · ") : "";
+  if (recorded) {
+    const multi = tournament.tasks.length > 1;
+    tournament.tasks.forEach((task) => {
+      if (!(task.matches || []).length) return;
+      appendElimBoard(task.task_id, recordedRounds(task), task.winner || null, multi);
+    });
+    return;
+  }
+  const groups = pairsByTask();
+  if (!groups.length) {
+    document.getElementById("elim_status").textContent = view.status === "running" ? "" : "No matches were played.";
+    return;
+  }
+  const field = view.candidate_count || candidateModels().length;
+  const multi = groups.length > 1;
+  groups.forEach((group) => {
+    const rounds = liveRounds(group.pairs, field);
+    appendElimBoard(group.task_id, rounds, liveChampion(rounds), multi);
+  });
+}
+
 function matchResult(match, elimination) {
   let text = "—";
   if (match.outcome === "winner" && match.winner) {
@@ -2294,18 +2568,16 @@ function matchResult(match, elimination) {
 }
 
 function renderBracket() {
+  renderElimSection();
   const section = document.getElementById("bracket");
   const tournament = view && view.tournament;
   const series = tournament && tournament.best_of > 1;
-  const elimination = tournament && tournament.format === "single_elimination";
-  if (!tournament || (!elimination && !series)) {
+  if (isSingleElimination() || !tournament || !series) {
     section.hidden = true;
     return;
   }
   section.hidden = false;
-  document.getElementById("bracket_title").textContent = elimination
-    ? "Single-elimination"
-    : "Best of " + tournament.best_of;
+  document.getElementById("bracket_title").textContent = "Best of " + tournament.best_of;
   const lines = (tournament.tasks || []).map((task) => {
     if (task.winner) return task.task_id + ": " + task.winner + " won";
     if (task.status === "draw") return task.task_id + ": draw, no winner";
@@ -2320,7 +2592,7 @@ function renderBracket() {
   (tournament.tasks || []).forEach((task) => {
     (task.matches || []).forEach((match) => {
       const tr = document.createElement("tr");
-      [task.task_id, String(match.round), match.model_a + "  ↔  " + match.model_b, matchResult(match, elimination)].forEach((text, index) => {
+      [task.task_id, String(match.round), match.model_a + "  ↔  " + match.model_b, matchResult(match, false)].forEach((text, index) => {
         const td = document.createElement("td");
         if (index < 3) td.className = "mono";
         td.textContent = text;
@@ -3616,6 +3888,328 @@ mod tests {
         assert_eq!(state.pairs[1].model_a, "m1");
         assert_eq!(state.pairs[1].model_b, "m3");
         assert!(config.opening_matchups.is_some());
+    }
+
+    fn elim_match(
+        round: u32,
+        model_a: &str,
+        model_b: &str,
+        winner: Option<&str>,
+        outcome: tournament::MatchOutcome,
+        games: Vec<tournament::SeriesGame>,
+        seeded_fallback: bool,
+    ) -> tournament::TournamentMatch {
+        tournament::TournamentMatch {
+            round,
+            model_a: ModelId::new(model_a),
+            model_b: ModelId::new(model_b),
+            winner: winner.map(ModelId::new),
+            outcome,
+            games,
+            seeded_fallback,
+        }
+    }
+
+    fn round_title(matches: usize) -> String {
+        match matches {
+            1 => "Final".to_string(),
+            2 => "Semifinals".to_string(),
+            4 => "Quarterfinals".to_string(),
+            other => format!("Round of {}", other * 2),
+        }
+    }
+
+    fn card_detail(row: &tournament::TournamentMatch) -> String {
+        let mut text = match row.outcome {
+            tournament::MatchOutcome::Winner => match &row.winner {
+                Some(winner) => format!("{winner} advances"),
+                None => "—".to_string(),
+            },
+            tournament::MatchOutcome::Draw => "Draw".to_string(),
+            tournament::MatchOutcome::JudgmentFailed => "Judgment failed".to_string(),
+            tournament::MatchOutcome::Incomplete => "Incomplete".to_string(),
+        };
+        if row.games.is_empty() && !row.seeded_fallback {
+            return text;
+        }
+        if row.games.is_empty() {
+            return format!("{text} (seeded fallback)");
+        }
+        let games = row.games.len();
+        let game_label = if games == 1 { "game" } else { "games" };
+        text.push_str(&format!(" ({games} {game_label}"));
+        let tiebreaks = row.games.iter().filter(|game| game.tiebreak).count();
+        if tiebreaks > 0 {
+            let tie_label = if tiebreaks == 1 {
+                "tie-break"
+            } else {
+                "tie-breaks"
+            };
+            text.push_str(&format!(", {tiebreaks} {tie_label}"));
+        }
+        if row.seeded_fallback {
+            text.push_str(", seeded fallback");
+        }
+        text.push(')');
+        text
+    }
+
+    fn board_text(tournament: &Tournament) -> String {
+        let mut text = String::new();
+        for task in &tournament.tasks {
+            let mut rounds: Vec<(u32, Vec<&tournament::TournamentMatch>)> = Vec::new();
+            for row in &task.matches {
+                if let Some((_, matches)) = rounds.iter_mut().find(|(round, _)| *round == row.round)
+                {
+                    matches.push(row);
+                } else {
+                    rounds.push((row.round, vec![row]));
+                }
+            }
+            for (_, matches) in &rounds {
+                text.push_str(&round_title(matches.len()));
+                text.push('\n');
+                for row in matches {
+                    text.push_str(&format!(
+                        "{} vs {}\n{}\n",
+                        row.model_a,
+                        row.model_b,
+                        card_detail(row)
+                    ));
+                }
+            }
+            if let Some(winner) = &task.winner {
+                text.push_str(&format!("Champion {winner}\n"));
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn elimination_board_shows_opening_rounds_advancement_and_fallback() {
+        let workbench = PAGE.split("<div id=\"dashboard\"").next().unwrap();
+        assert!(!workbench.contains("elim_board"));
+        assert!(PAGE.contains("id=\"elim_board\""));
+        assert!(PAGE.contains("id=\"elim_section\""));
+        assert!(PAGE.contains("return \"Final\""));
+        assert!(PAGE.contains("return \"Semifinals\""));
+        assert!(PAGE.contains("return \"Quarterfinals\""));
+        assert!(PAGE.contains("Champion"));
+        assert!(PAGE.contains("Pending"));
+        assert!(PAGE.contains("Judging"));
+        assert!(PAGE.contains("seeded fallback"));
+        assert!(PAGE.contains("tie-break"));
+
+        let models = [
+            ModelId::new("m0"),
+            ModelId::new("m1"),
+            ModelId::new("m2"),
+            ModelId::new("m3"),
+        ];
+        let automatic = waiting_pairs(
+            &[task()],
+            &models,
+            TournamentFormat::SingleElimination,
+            None,
+        );
+        assert_eq!(automatic[0].model_a, "m0");
+        assert_eq!(automatic[0].model_b, "m1");
+        assert_eq!(automatic[1].model_a, "m2");
+        assert_eq!(automatic[1].model_b, "m3");
+        let automatic_board = Tournament {
+            format: TournamentFormat::SingleElimination,
+            candidates: models.to_vec(),
+            status: tournament::TournamentStatus::Complete,
+            best_of: 1,
+            tasks: vec![tournament::TaskBracket {
+                task_id: "t1".into(),
+                status: tournament::TournamentStatus::Complete,
+                winner: Some(ModelId::new("m0")),
+                matches: vec![
+                    elim_match(
+                        1,
+                        "m0",
+                        "m1",
+                        Some("m0"),
+                        tournament::MatchOutcome::Winner,
+                        Vec::new(),
+                        false,
+                    ),
+                    elim_match(
+                        1,
+                        "m2",
+                        "m3",
+                        Some("m2"),
+                        tournament::MatchOutcome::Winner,
+                        Vec::new(),
+                        false,
+                    ),
+                    elim_match(
+                        2,
+                        "m0",
+                        "m2",
+                        Some("m0"),
+                        tournament::MatchOutcome::Winner,
+                        Vec::new(),
+                        false,
+                    ),
+                ],
+            }],
+            opening_matchups: None,
+        };
+        let automatic_text = board_text(&automatic_board);
+        assert!(
+            automatic_text.contains("Semifinals\nm0 vs m1\nm0 advances\nm2 vs m3\nm2 advances\n")
+        );
+        assert!(automatic_text.contains("Final\nm0 vs m2\nm0 advances\nChampion m0\n"));
+
+        let custom = waiting_pairs(
+            &[task()],
+            &models,
+            TournamentFormat::SingleElimination,
+            Some(&[
+                OpeningMatchup {
+                    model_a: ModelId::new("m0"),
+                    model_b: ModelId::new("m2"),
+                },
+                OpeningMatchup {
+                    model_a: ModelId::new("m1"),
+                    model_b: ModelId::new("m3"),
+                },
+            ]),
+        );
+        assert_eq!(custom[0].model_a, "m0");
+        assert_eq!(custom[0].model_b, "m2");
+        assert_eq!(custom[1].model_a, "m1");
+        assert_eq!(custom[1].model_b, "m3");
+        let drawn_game = |tiebreak| tournament::SeriesGame {
+            winner: None,
+            outcome: tournament::MatchOutcome::Draw,
+            tiebreak,
+        };
+        let custom_board = Tournament {
+            format: TournamentFormat::SingleElimination,
+            candidates: models.to_vec(),
+            status: tournament::TournamentStatus::Complete,
+            best_of: 1,
+            tasks: vec![tournament::TaskBracket {
+                task_id: "t1".into(),
+                status: tournament::TournamentStatus::Complete,
+                winner: Some(ModelId::new("m0")),
+                matches: vec![
+                    elim_match(
+                        1,
+                        "m0",
+                        "m2",
+                        Some("m0"),
+                        tournament::MatchOutcome::Winner,
+                        Vec::new(),
+                        false,
+                    ),
+                    elim_match(
+                        1,
+                        "m1",
+                        "m3",
+                        Some("m1"),
+                        tournament::MatchOutcome::Winner,
+                        Vec::new(),
+                        false,
+                    ),
+                    elim_match(
+                        2,
+                        "m0",
+                        "m1",
+                        Some("m0"),
+                        tournament::MatchOutcome::Winner,
+                        vec![
+                            drawn_game(false),
+                            drawn_game(true),
+                            drawn_game(true),
+                            drawn_game(true),
+                        ],
+                        true,
+                    ),
+                ],
+            }],
+            opening_matchups: Some(vec![
+                OpeningMatchup {
+                    model_a: ModelId::new("m0"),
+                    model_b: ModelId::new("m2"),
+                },
+                OpeningMatchup {
+                    model_a: ModelId::new("m1"),
+                    model_b: ModelId::new("m3"),
+                },
+            ]),
+        };
+        let custom_text = board_text(&custom_board);
+        assert!(custom_text.contains("Semifinals\nm0 vs m2\nm0 advances\nm1 vs m3\nm1 advances\n"));
+        assert!(custom_text.contains(
+            "Final\nm0 vs m1\nm0 advances (4 games, 3 tie-breaks, seeded fallback)\nChampion m0\n"
+        ));
+        let json = serde_json::to_value(&custom_board).unwrap();
+        assert_eq!(json["tasks"][0]["matches"][0]["model_b"], "m2");
+        assert_eq!(json["tasks"][0]["matches"][2]["round"], 2);
+        assert_eq!(json["tasks"][0]["matches"][2]["seeded_fallback"], true);
+        assert_eq!(json["tasks"][0]["matches"][2]["games"][1]["tiebreak"], true);
+        assert!(
+            json["tasks"][0]["matches"][2]["games"][0]
+                .get("tiebreak")
+                .is_none()
+        );
+        assert_eq!(json["tasks"][0]["winner"], "m0");
+
+        let drawn = Tournament {
+            format: TournamentFormat::SingleElimination,
+            candidates: vec![ModelId::new("m0"), ModelId::new("m1")],
+            status: tournament::TournamentStatus::Draw,
+            best_of: 1,
+            tasks: vec![tournament::TaskBracket {
+                task_id: "t1".into(),
+                status: tournament::TournamentStatus::Draw,
+                winner: None,
+                matches: vec![elim_match(
+                    1,
+                    "m0",
+                    "m1",
+                    None,
+                    tournament::MatchOutcome::Draw,
+                    Vec::new(),
+                    false,
+                )],
+            }],
+            opening_matchups: None,
+        };
+        let drawn_text = board_text(&drawn);
+        assert!(drawn_text.contains("Final\nm0 vs m1\nDraw\n"));
+        assert!(!drawn_text.contains("Champion"));
+        assert!(!drawn_text.contains("advances"));
+
+        let stopped = Tournament {
+            format: TournamentFormat::SingleElimination,
+            candidates: vec![ModelId::new("m0"), ModelId::new("m1")],
+            status: tournament::TournamentStatus::Incomplete,
+            best_of: 1,
+            tasks: vec![tournament::TaskBracket {
+                task_id: "t1".into(),
+                status: tournament::TournamentStatus::Incomplete,
+                winner: None,
+                matches: vec![elim_match(
+                    1,
+                    "m0",
+                    "m1",
+                    None,
+                    tournament::MatchOutcome::Incomplete,
+                    Vec::new(),
+                    false,
+                )],
+            }],
+            opening_matchups: None,
+        };
+        let stopped_text = board_text(&stopped);
+        assert!(stopped_text.contains("Incomplete"));
+        assert!(!stopped_text.contains("Champion"));
+        assert!(!stopped_text.contains("advances"));
     }
 
     #[tokio::test]
