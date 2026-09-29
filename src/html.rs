@@ -432,6 +432,18 @@ fn push_tournament(html: &mut String, tournament: &Tournament) {
         "Each pair plays one series. Draws do not count as wins."
     });
     html.push_str("</p>\n");
+    if let Some(opening) = &tournament.opening_matchups {
+        html.push_str("<p class=\"note\">Opening matchups: ");
+        for (index, pair) in opening.iter().enumerate() {
+            if index > 0 {
+                html.push_str(" · ");
+            }
+            html.push_str(&escape(&pair.model_a.to_string()));
+            html.push_str(" vs ");
+            html.push_str(&escape(&pair.model_b.to_string()));
+        }
+        html.push_str("</p>\n");
+    }
     if tournament.tasks.iter().all(|task| task.matches.is_empty()) {
         html.push_str("<p>No matches were played.</p>\n</section>\n");
         return;

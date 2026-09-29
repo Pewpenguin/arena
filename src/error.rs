@@ -53,6 +53,16 @@ pub enum Error {
         model_b: ModelId,
         winner: ModelId,
     },
+    #[error("opening matchups are only available for single-elimination")]
+    OpeningMatchupsRequireElimination,
+    #[error("opening matchups must assign every candidate to exactly one slot")]
+    IncompleteOpeningMatchups,
+    #[error("opening matchups repeat candidate {0}")]
+    DuplicateOpeningMatchup(ModelId),
+    #[error("opening matchups include {0}, which is not a selected candidate")]
+    InvalidOpeningMatchup(ModelId),
+    #[error("opening matchups omit candidate {0}")]
+    MissingOpeningMatchup(ModelId),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]

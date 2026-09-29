@@ -166,6 +166,7 @@ where
         judge,
         tournament,
         best_of,
+        opening_matchups: None,
         seed,
         tasks_path: Some(tasks_path),
         started_at,

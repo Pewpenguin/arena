@@ -666,6 +666,7 @@ mod tests {
             candidates: vec![ModelId::new("m0"), ModelId::new("m1")],
             status: TournamentStatus::Draw,
             best_of: 1,
+            opening_matchups: None,
             tasks: vec![TaskBracket {
                 task_id: "t1".into(),
                 status: TournamentStatus::Draw,
@@ -727,6 +728,7 @@ mod tests {
             candidates: vec![ModelId::new("m0"), ModelId::new("m1")],
             status: TournamentStatus::Complete,
             best_of: 3,
+            opening_matchups: None,
             tasks: vec![TaskBracket {
                 task_id: "t1".into(),
                 status: TournamentStatus::Complete,
@@ -780,6 +782,7 @@ mod tests {
             candidates: vec![ModelId::new("m0"), ModelId::new("m1")],
             status: TournamentStatus::Complete,
             best_of: 1,
+            opening_matchups: None,
             tasks: vec![TaskBracket {
                 task_id: "t1".into(),
                 status: TournamentStatus::Complete,
@@ -837,6 +840,7 @@ mod tests {
             candidates: vec![ModelId::new("m0"), ModelId::new("m1")],
             status: TournamentStatus::Complete,
             best_of: 1,
+            opening_matchups: None,
             tasks: vec![TaskBracket {
                 task_id: "t1".into(),
                 status: TournamentStatus::Complete,

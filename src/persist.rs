@@ -684,6 +684,7 @@ mod tests {
             candidates: vec![ModelId::new("a"), ModelId::new("b")],
             status: TournamentStatus::Complete,
             best_of: 1,
+            opening_matchups: None,
             tasks: vec![TaskBracket {
                 task_id: "t1".into(),
                 status: TournamentStatus::Complete,

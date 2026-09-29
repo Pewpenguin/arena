@@ -24,7 +24,7 @@ use crate::provider::{
     AnthropicProvider, GeminiProvider, ModelId, ModelProvider, OpenAICompatibleProvider,
 };
 use crate::task::{self, Task};
-use crate::tournament::{self, Tournament, TournamentFormat};
+use crate::tournament::{self, OpeningMatchup, Tournament, TournamentFormat};
 
 const BIND_HOST: [u8; 4] = [127, 0, 0, 1];
 const WEB_OUTPUT_DIR: &str = "arena-web";
@@ -265,6 +265,8 @@ struct StartRequest {
     tournament: TournamentFormat,
     #[serde(default = "crate::tournament::default_best_of")]
     best_of: u32,
+    #[serde(default)]
+    opening_matchups: Option<Vec<OpeningMatchup>>,
 }
 
 #[derive(Serialize)]
@@ -320,7 +322,12 @@ impl LiveRun {
             0
         };
         let pairs = if config.judge.is_some() {
-            waiting_pairs(&config.tasks, &config.models, config.tournament)
+            waiting_pairs(
+                &config.tasks,
+                &config.models,
+                config.tournament,
+                config.opening_matchups.as_deref(),
+            )
         } else {
             Vec::new()
         };
@@ -569,10 +576,15 @@ fn upsert_pair(
     });
 }
 
-fn waiting_pairs(tasks: &[Task], models: &[ModelId], format: TournamentFormat) -> Vec<PairRow> {
+fn waiting_pairs(
+    tasks: &[Task],
+    models: &[ModelId],
+    format: TournamentFormat,
+    opening: Option<&[OpeningMatchup]>,
+) -> Vec<PairRow> {
     let mut pairs = Vec::new();
     for task in tasks {
-        for (model_a, model_b) in tournament::opening_pairs(format, models) {
+        for (model_a, model_b) in tournament::opening_pairs(format, models, opening) {
             pairs.push(PairRow {
                 task_id: task.id.clone(),
                 model_a: model_a.to_string(),
@@ -710,6 +722,7 @@ async fn start_run(
         seed,
         request.tournament,
         request.best_of,
+        request.opening_matchups,
     ) {
         Ok(config) => config,
         Err(error) => return json_error(StatusCode::BAD_REQUEST, error.to_string()),
@@ -883,9 +896,11 @@ fn build_exec_config(
         seed,
         TournamentFormat::RoundRobin,
         tournament::DEFAULT_BEST_OF,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_exec_config_with_format(
     models: Vec<String>,
     judge: Option<String>,
@@ -894,6 +909,7 @@ pub(crate) fn build_exec_config_with_format(
     seed: u64,
     tournament: TournamentFormat,
     best_of: u32,
+    opening_matchups: Option<Vec<OpeningMatchup>>,
 ) -> Result<ExecConfig> {
     let models = exec::unique_models(
         models
@@ -912,12 +928,14 @@ pub(crate) fn build_exec_config_with_format(
     exec::validate_judge(&models, judge.as_ref())?;
     tournament::validate(tournament, models.len())?;
     tournament::validate_best_of(best_of)?;
+    tournament::validate_opening_matchups(tournament, &models, opening_matchups.as_deref())?;
     Ok(ExecConfig {
         tasks,
         models,
         judge,
         tournament,
         best_of,
+        opening_matchups,
         seed,
         tasks_path: None,
         started_at: persist::utc_timestamp(),
@@ -1407,6 +1425,22 @@ tr.detail-row td {
 }
 .launch-fields { display: flex; flex-wrap: wrap; gap: 16px 24px; align-items: end; }
 .launch-fields select { width: 14rem; }
+.launch-main { flex: 1; min-width: 0; }
+.matchup-board { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
+.matchup-board[hidden], #matchup_field[hidden] { display: none; }
+.matchup-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.matchup-row select {
+  width: 11rem;
+  padding: 3px 8px;
+  font: .82rem/1.4 var(--mono);
+}
+.matchup-vs { color: var(--muted); font: .82rem/1.4 var(--mono); }
+.matchup-name {
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  background: var(--field);
+  font: .82rem/1.4 var(--mono);
+}
 .launch-action { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
 .launch-action .status { margin: 0; text-align: right; }
 :focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; }
@@ -1512,6 +1546,7 @@ tr.detail-row td {
 
 <section class="region controls">
   <div class="launch">
+    <div class="launch-main">
     <div class="launch-fields">
       <div>
         <label for="tournament">Tournament</label>
@@ -1528,6 +1563,15 @@ tr.detail-row td {
         <label for="seed">Bootstrap seed</label>
         <input id="seed" type="text" inputmode="numeric" value="0">
       </div>
+      <div id="matchup_field" hidden>
+        <label for="matchups">Opening</label>
+        <select id="matchups">
+          <option value="automatic" selected>Automatic</option>
+          <option value="custom">Custom</option>
+        </select>
+      </div>
+    </div>
+    <div id="opening_board" class="matchup-board" hidden></div>
     </div>
     <div class="launch-action">
       <button id="start" class="primary" type="button">Run Tournament →</button>
@@ -1643,6 +1687,7 @@ tr.detail-row td {
 <script>
 const models = [];
 const selected = new Set();
+const openingSlots = [];
 let provider = "openai";
 let candidateQuery = "";
 let judgeQuery = "";
@@ -1717,6 +1762,101 @@ function setMenu(name) {
     placeMenu(menu, document.getElementById("judge_toggle"));
     document.getElementById("judge_search").focus();
   }
+}
+
+function powerOfTwo(count) {
+  return count >= 2 && (count & (count - 1)) === 0;
+}
+
+function syncOpeningSlots() {
+  const kept = openingSlots.filter((id) => selected.has(id));
+  selected.forEach((id) => {
+    if (!kept.includes(id)) kept.push(id);
+  });
+  openingSlots.length = 0;
+  openingSlots.push(...kept);
+}
+
+function setOpeningSlot(index, next) {
+  const current = openingSlots[index];
+  const other = openingSlots.indexOf(next);
+  openingSlots[index] = next;
+  if (other !== -1 && other !== index) openingSlots[other] = current;
+  renderMatchups();
+}
+
+function openingSelect(index) {
+  const select = document.createElement("select");
+  openingSlots.forEach((id) => {
+    const option = document.createElement("option");
+    option.value = id;
+    option.textContent = id;
+    option.selected = id === openingSlots[index];
+    select.append(option);
+  });
+  select.addEventListener("change", () => setOpeningSlot(index, select.value));
+  return select;
+}
+
+function renderMatchups() {
+  const field = document.getElementById("matchup_field");
+  const board = document.getElementById("opening_board");
+  const mode = document.getElementById("matchups");
+  const elimination = document.getElementById("tournament").value === "single_elimination";
+  field.hidden = !elimination;
+  board.replaceChildren();
+  if (!elimination) {
+    mode.value = "automatic";
+    board.hidden = true;
+    return;
+  }
+  const custom = mode.value === "custom";
+  if (custom) syncOpeningSlots();
+  const ids = custom ? openingSlots : [...selected];
+  if (!powerOfTwo(ids.length)) {
+    board.hidden = !custom;
+    if (!custom) return;
+    const note = document.createElement("p");
+    note.className = "meta";
+    note.textContent = "Select 2, 4, 8, or 16 candidates to assign opening matchups.";
+    board.append(note);
+    return;
+  }
+  board.hidden = false;
+  for (let pair = 0; pair < ids.length; pair += 2) {
+    const row = document.createElement("div");
+    row.className = "matchup-row";
+    const versus = document.createElement("span");
+    versus.className = "matchup-vs";
+    versus.textContent = "vs";
+    if (custom) {
+      row.append(openingSelect(pair), versus, openingSelect(pair + 1));
+    } else {
+      row.append(openingName(ids[pair]), versus, openingName(ids[pair + 1]));
+    }
+    board.append(row);
+  }
+}
+
+function openingName(id) {
+  const name = document.createElement("span");
+  name.className = "matchup-name";
+  name.textContent = id;
+  return name;
+}
+
+function openingPayload() {
+  const elimination = document.getElementById("tournament").value === "single_elimination";
+  if (!elimination || document.getElementById("matchups").value !== "custom") return null;
+  syncOpeningSlots();
+  const pairs = [];
+  for (let index = 0; index < openingSlots.length; index += 2) {
+    pairs.push({
+      model_a: openingSlots[index] || "",
+      model_b: openingSlots[index + 1] || "",
+    });
+  }
+  return pairs;
 }
 
 function render() {
@@ -1805,6 +1945,7 @@ function render() {
     });
     judgeOptions.append(button);
   });
+  renderMatchups();
 }
 
 function applyProvider(next) {
@@ -2343,6 +2484,9 @@ document.getElementById("load").addEventListener("click", async () => {
   render();
 });
 
+document.getElementById("tournament").addEventListener("change", renderMatchups);
+document.getElementById("matchups").addEventListener("change", renderMatchups);
+
 document.getElementById("start").addEventListener("click", async () => {
   status("run_status", "", true);
   let tasks;
@@ -2365,6 +2509,7 @@ document.getElementById("start").addEventListener("click", async () => {
       seed: document.getElementById("seed").value.trim() || "0",
       tournament: document.getElementById("tournament").value,
       best_of: Number(document.getElementById("best_of").value),
+      opening_matchups: openingPayload(),
     }),
   });
   const body = await response.json().catch(() => ({}));
@@ -2933,7 +3078,7 @@ mod tests {
     #[test]
     fn unordered_pair_count_does_not_include_orientations() {
         let models = [ModelId::new("m0"), ModelId::new("m1"), ModelId::new("m2")];
-        let pairs = waiting_pairs(&[task()], &models, TournamentFormat::RoundRobin);
+        let pairs = waiting_pairs(&[task()], &models, TournamentFormat::RoundRobin, None);
         assert_eq!(pairs.len(), 3);
         assert_eq!(exec::expected_pairs(1, 3), 3);
         assert_eq!(exec::expected_pairs(2, 3), 6);
@@ -3301,6 +3446,7 @@ mod tests {
                 seed: "0".into(),
                 tournament: TournamentFormat::RoundRobin,
                 best_of: 1,
+                opening_matchups: None,
             }),
         )
         .await;
@@ -3318,6 +3464,7 @@ mod tests {
                 seed: "0".into(),
                 tournament: TournamentFormat::RoundRobin,
                 best_of: 1,
+                opening_matchups: None,
             }),
         )
         .await;
@@ -3335,6 +3482,7 @@ mod tests {
                 seed: "0".into(),
                 tournament: TournamentFormat::RoundRobin,
                 best_of: 1,
+                opening_matchups: None,
             }),
         )
         .await;
@@ -3391,6 +3539,7 @@ mod tests {
                 seed: "9007199254740993.0".into(),
                 tournament: TournamentFormat::RoundRobin,
                 best_of: 1,
+                opening_matchups: None,
             }),
         )
         .await;
@@ -3423,6 +3572,7 @@ mod tests {
             0,
             TournamentFormat::SingleElimination,
             tournament::DEFAULT_BEST_OF,
+            None,
         )
         .unwrap();
         let live = LiveRun::from_config("se".into(), &elimination);
@@ -3434,6 +3584,38 @@ mod tests {
         assert_eq!(state.pairs[0].model_b, "m1");
         assert_eq!(state.pairs[1].model_a, "m2");
         assert_eq!(state.pairs[1].model_b, "m3");
+    }
+
+    #[test]
+    fn custom_opening_matchups_preview_the_requested_pairs() {
+        let config = build_exec_config_with_format(
+            vec!["m0".into(), "m1".into(), "m2".into(), "m3".into()],
+            Some("judge".into()),
+            vec![task()],
+            "https://example.test/v1".into(),
+            0,
+            TournamentFormat::SingleElimination,
+            tournament::DEFAULT_BEST_OF,
+            Some(vec![
+                OpeningMatchup {
+                    model_a: ModelId::new("m0"),
+                    model_b: ModelId::new("m2"),
+                },
+                OpeningMatchup {
+                    model_a: ModelId::new("m1"),
+                    model_b: ModelId::new("m3"),
+                },
+            ]),
+        )
+        .unwrap();
+        let live = LiveRun::from_config("custom".into(), &config);
+        let state = live.inner.try_lock().expect("lock");
+        assert_eq!(state.pairs.len(), 2);
+        assert_eq!(state.pairs[0].model_a, "m0");
+        assert_eq!(state.pairs[0].model_b, "m2");
+        assert_eq!(state.pairs[1].model_a, "m1");
+        assert_eq!(state.pairs[1].model_b, "m3");
+        assert!(config.opening_matchups.is_some());
     }
 
     #[tokio::test]
@@ -3451,6 +3633,7 @@ mod tests {
                 seed: "0".into(),
                 tournament: TournamentFormat::SingleElimination,
                 best_of: 1,
+                opening_matchups: None,
             }),
         )
         .await;
@@ -3472,6 +3655,38 @@ mod tests {
                 seed: "0".into(),
                 tournament: TournamentFormat::RoundRobin,
                 best_of: 2,
+                opening_matchups: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn start_run_rejects_duplicate_opening_matchups() {
+        let state = Arc::new(AppState::new());
+        let response = start_run(
+            State(state),
+            Json(StartRequest {
+                provider: WebProviderKind::Openai,
+                base_url: String::new(),
+                api_key: "secret".into(),
+                models: vec!["m0".into(), "m1".into(), "m2".into(), "m3".into()],
+                judge: Some("judge".into()),
+                tasks: sample_tasks(),
+                seed: "0".into(),
+                tournament: TournamentFormat::SingleElimination,
+                best_of: 1,
+                opening_matchups: Some(vec![
+                    OpeningMatchup {
+                        model_a: ModelId::new("m0"),
+                        model_b: ModelId::new("m1"),
+                    },
+                    OpeningMatchup {
+                        model_a: ModelId::new("m0"),
+                        model_b: ModelId::new("m2"),
+                    },
+                ]),
             }),
         )
         .await;
@@ -3488,6 +3703,7 @@ mod tests {
             0,
             TournamentFormat::RoundRobin,
             3,
+            None,
         )
         .unwrap();
         let live = LiveRun::from_config("bo3".into(), &config);

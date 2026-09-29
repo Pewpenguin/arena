@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt;
 
 use clap::ValueEnum;
@@ -167,6 +168,16 @@ pub struct Tournament {
     )]
     pub best_of: u32,
     pub tasks: Vec<TaskBracket>,
+    /// Requested first-round pairs. Absent when Arena pairs candidates automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opening_matchups: Option<Vec<OpeningMatchup>>,
+}
+
+/// One requested first-round pairing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpeningMatchup {
+    pub model_a: ModelId,
+    pub model_b: ModelId,
 }
 
 impl TournamentMatch {
@@ -228,6 +239,47 @@ pub fn validate_best_of(best_of: u32) -> Result<()> {
     }
 }
 
+pub fn validate_opening_matchups(
+    format: TournamentFormat,
+    candidates: &[ModelId],
+    opening: Option<&[OpeningMatchup]>,
+) -> Result<()> {
+    let Some(opening) = opening else {
+        return Ok(());
+    };
+    if format != TournamentFormat::SingleElimination {
+        return Err(Error::OpeningMatchupsRequireElimination);
+    }
+    if opening
+        .iter()
+        .any(|pair| pair.model_a.to_string().is_empty() || pair.model_b.to_string().is_empty())
+    {
+        return Err(Error::IncompleteOpeningMatchups);
+    }
+    let field: HashSet<&ModelId> = candidates.iter().collect();
+    let mut seen = HashSet::new();
+    for pair in opening {
+        for model in [&pair.model_a, &pair.model_b] {
+            if !field.contains(model) {
+                return Err(Error::InvalidOpeningMatchup(model.clone()));
+            }
+            if !seen.insert(model) {
+                return Err(Error::DuplicateOpeningMatchup(model.clone()));
+            }
+        }
+    }
+    if let Some(missing) = candidates
+        .iter()
+        .find(|candidate| !seen.contains(candidate))
+    {
+        return Err(Error::MissingOpeningMatchup(missing.clone()));
+    }
+    if opening.len() * 2 != candidates.len() {
+        return Err(Error::IncompleteOpeningMatchups);
+    }
+    Ok(())
+}
+
 fn supported_field(candidates: usize) -> bool {
     candidates >= 2 && candidates.is_power_of_two()
 }
@@ -242,11 +294,17 @@ pub fn planned_match_count(format: TournamentFormat, candidates: usize) -> usize
 pub(crate) fn opening_pairs(
     format: TournamentFormat,
     candidates: &[ModelId],
+    opening: Option<&[OpeningMatchup]>,
 ) -> Vec<(ModelId, ModelId)> {
     match format {
         TournamentFormat::RoundRobin => round_robin_pairs(candidates),
         TournamentFormat::SingleElimination => {
-            if supported_field(candidates.len()) {
+            if let Some(opening) = opening {
+                opening
+                    .iter()
+                    .map(|pair| (pair.model_a.clone(), pair.model_b.clone()))
+                    .collect()
+            } else if supported_field(candidates.len()) {
                 plan_round(candidates).unwrap_or_default()
             } else {
                 Vec::new()
@@ -259,6 +317,7 @@ pub(crate) fn not_judged(
     format: TournamentFormat,
     candidates: &[ModelId],
     best_of: u32,
+    opening_matchups: Option<Vec<OpeningMatchup>>,
 ) -> Tournament {
     Tournament {
         format,
@@ -266,6 +325,7 @@ pub(crate) fn not_judged(
         status: TournamentStatus::NotJudged,
         best_of,
         tasks: Vec::new(),
+        opening_matchups,
     }
 }
 
@@ -279,6 +339,7 @@ pub(crate) async fn play<P, F, R>(
     format: TournamentFormat,
     best_of: u32,
     seed: u64,
+    opening: Option<&[OpeningMatchup]>,
     mut on_judgment: F,
     mut on_round: R,
 ) -> Result<Tournament>
@@ -289,6 +350,7 @@ where
 {
     validate(format, candidates.len())?;
     validate_best_of(best_of)?;
+    validate_opening_matchups(format, candidates, opening)?;
     let mut brackets = Vec::with_capacity(tasks.len());
     for task in tasks {
         let bracket = match format {
@@ -314,6 +376,7 @@ where
                     candidates,
                     best_of,
                     seed,
+                    opening,
                     &mut on_judgment,
                     &mut on_round,
                 )
@@ -322,7 +385,13 @@ where
         };
         brackets.push(bracket);
     }
-    Ok(assemble(format, candidates, best_of, brackets))
+    Ok(assemble(
+        format,
+        candidates,
+        best_of,
+        brackets,
+        opening.map(|pairs| pairs.to_vec()),
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -382,6 +451,7 @@ async fn play_single_elimination<P, F, R>(
     candidates: &[ModelId],
     best_of: u32,
     seed: u64,
+    opening: Option<&[OpeningMatchup]>,
     on_judgment: &mut F,
     on_round: &mut R,
 ) -> Result<TaskBracket>
@@ -395,7 +465,16 @@ where
     let mut round = 1u32;
     let mut stopped = false;
     while active.len() >= 2 {
-        let pairs = plan_round(&active)?;
+        let pairs = if round == 1
+            && let Some(opening) = opening
+        {
+            opening
+                .iter()
+                .map(|pair| (pair.model_a.clone(), pair.model_b.clone()))
+                .collect()
+        } else {
+            plan_round(&active)?
+        };
         let played = play_series(
             provider,
             judge_model,
@@ -874,6 +953,7 @@ fn assemble(
     candidates: &[ModelId],
     best_of: u32,
     tasks: Vec<TaskBracket>,
+    opening_matchups: Option<Vec<OpeningMatchup>>,
 ) -> Tournament {
     let status = if tasks
         .iter()
@@ -894,6 +974,7 @@ fn assemble(
         status,
         best_of,
         tasks,
+        opening_matchups,
     }
 }
 
@@ -1152,11 +1233,13 @@ mod tests {
             &ids(&["A", "B", "C", "D"]),
             DEFAULT_BEST_OF,
             vec![bracket],
+            None,
         );
         let json = serde_json::to_value(&tournament).unwrap();
         assert_eq!(json["format"], "single_elimination");
         assert_eq!(json["status"], "complete");
         assert!(json.get("best_of").is_none());
+        assert!(json.get("opening_matchups").is_none());
         assert!(json["tasks"][0]["matches"][0].get("games").is_none());
         assert_eq!(json["candidates"], serde_json::json!(["A", "B", "C", "D"]));
         assert_eq!(json["tasks"][0]["winner"], "A");
@@ -1171,6 +1254,7 @@ mod tests {
             &ids(&["A", "B"]),
             DEFAULT_BEST_OF,
             vec![drawn],
+            None,
         );
         let value = serde_json::to_value(&drawn).unwrap();
         assert!(value["tasks"][0].get("winner").is_none());
@@ -1191,6 +1275,117 @@ mod tests {
         assert!(loaded.tasks[0].matches[0].games.is_empty());
         assert_eq!(loaded.tasks[0].matches[0].games_played(), 1);
         assert!(!loaded.tasks[0].matches[0].seeded_fallback);
+        assert!(loaded.opening_matchups.is_none());
+    }
+
+    #[test]
+    fn custom_opening_matchups_must_name_each_candidate_once() {
+        let field = ids(&["m0", "m1", "m2", "m3"]);
+        let valid = vec![
+            OpeningMatchup {
+                model_a: id("m0"),
+                model_b: id("m2"),
+            },
+            OpeningMatchup {
+                model_a: id("m1"),
+                model_b: id("m3"),
+            },
+        ];
+        validate_opening_matchups(TournamentFormat::SingleElimination, &field, Some(&valid))
+            .unwrap();
+        let pairs = opening_pairs(TournamentFormat::SingleElimination, &field, Some(&valid));
+        assert_eq!(pairs, vec![(id("m0"), id("m2")), (id("m1"), id("m3")),]);
+        let automatic = opening_pairs(TournamentFormat::SingleElimination, &field, None);
+        assert_eq!(automatic, vec![(id("m0"), id("m1")), (id("m2"), id("m3"))]);
+
+        let duplicate = vec![
+            OpeningMatchup {
+                model_a: id("m0"),
+                model_b: id("m1"),
+            },
+            OpeningMatchup {
+                model_a: id("m0"),
+                model_b: id("m2"),
+            },
+        ];
+        assert!(matches!(
+            validate_opening_matchups(
+                TournamentFormat::SingleElimination,
+                &field,
+                Some(&duplicate),
+            ),
+            Err(Error::DuplicateOpeningMatchup(model)) if model == id("m0")
+        ));
+
+        let missing = vec![OpeningMatchup {
+            model_a: id("m0"),
+            model_b: id("m1"),
+        }];
+        assert!(matches!(
+            validate_opening_matchups(TournamentFormat::SingleElimination, &field, Some(&missing)),
+            Err(Error::MissingOpeningMatchup(model)) if model == id("m2")
+        ));
+
+        let invalid = vec![
+            OpeningMatchup {
+                model_a: id("m0"),
+                model_b: id("m1"),
+            },
+            OpeningMatchup {
+                model_a: id("ghost"),
+                model_b: id("m2"),
+            },
+        ];
+        assert!(matches!(
+            validate_opening_matchups(TournamentFormat::SingleElimination, &field, Some(&invalid)),
+            Err(Error::InvalidOpeningMatchup(model)) if model == id("ghost")
+        ));
+
+        let blank = vec![
+            OpeningMatchup {
+                model_a: id("m0"),
+                model_b: ModelId::new(""),
+            },
+            OpeningMatchup {
+                model_a: id("m2"),
+                model_b: id("m3"),
+            },
+        ];
+        assert!(matches!(
+            validate_opening_matchups(TournamentFormat::SingleElimination, &field, Some(&blank)),
+            Err(Error::IncompleteOpeningMatchups)
+        ));
+
+        assert!(matches!(
+            validate_opening_matchups(TournamentFormat::RoundRobin, &field, Some(&valid)),
+            Err(Error::OpeningMatchupsRequireElimination)
+        ));
+        validate_opening_matchups(TournamentFormat::RoundRobin, &field, None).unwrap();
+        assert_eq!(
+            opening_pairs(TournamentFormat::RoundRobin, &field, Some(&valid)),
+            opening_pairs(TournamentFormat::RoundRobin, &field, None),
+        );
+
+        let three = ids(&["m0", "m1", "m2"]);
+        assert!(matches!(
+            validate(TournamentFormat::SingleElimination, three.len()),
+            Err(Error::UnsupportedTournament { candidates: 3, .. })
+        ));
+
+        let recorded = Tournament {
+            format: TournamentFormat::SingleElimination,
+            candidates: field.clone(),
+            status: TournamentStatus::NotJudged,
+            best_of: DEFAULT_BEST_OF,
+            tasks: Vec::new(),
+            opening_matchups: Some(valid.clone()),
+        };
+        let json = serde_json::to_value(&recorded).unwrap();
+        assert_eq!(json["opening_matchups"][0]["model_a"], "m0");
+        assert_eq!(json["opening_matchups"][0]["model_b"], "m2");
+        assert_eq!(json["opening_matchups"][1]["model_b"], "m3");
+        let restored: Tournament = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.opening_matchups, Some(valid));
     }
 
     #[test]

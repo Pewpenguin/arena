@@ -23,6 +23,7 @@ pub struct ExecConfig {
     pub judge: Option<ModelId>,
     pub tournament: TournamentFormat,
     pub best_of: u32,
+    pub opening_matchups: Option<Vec<tournament::OpeningMatchup>>,
     pub seed: u64,
     pub tasks_path: Option<PathBuf>,
     pub started_at: String,
@@ -134,6 +135,11 @@ where
     validate_judge(&config.models, config.judge.as_ref())?;
     tournament::validate(config.tournament, config.models.len())?;
     tournament::validate_best_of(config.best_of)?;
+    tournament::validate_opening_matchups(
+        config.tournament,
+        &config.models,
+        config.opening_matchups.as_deref(),
+    )?;
     let mut results = Vec::new();
     for task in &config.tasks {
         let executed = execute_models(provider, task, &config.models, |result| {
@@ -167,6 +173,7 @@ where
             config.tournament,
             config.best_of,
             config.seed,
+            config.opening_matchups.as_deref(),
             |judgment| {
                 on_judgment(judgment);
                 emit_event(
@@ -198,7 +205,12 @@ where
         )
         .await?
     } else {
-        tournament::not_judged(config.tournament, &config.models, config.best_of)
+        tournament::not_judged(
+            config.tournament,
+            &config.models,
+            config.best_of,
+            config.opening_matchups.clone(),
+        )
     };
 
     let mut run = RunMetadata::new(
@@ -326,11 +338,22 @@ mod tests {
             judge: judge.map(ModelId::new),
             tournament: TournamentFormat::RoundRobin,
             best_of: tournament::DEFAULT_BEST_OF,
+            opening_matchups: None,
             seed: 0,
             tasks_path: Some(PathBuf::from("tasks.json")),
             started_at: "2026-01-02T03:04:05Z".into(),
             base_url: "https://example.test/v1".into(),
         }
+    }
+
+    fn opening(pairs: &[(&str, &str)]) -> Vec<tournament::OpeningMatchup> {
+        pairs
+            .iter()
+            .map(|(model_a, model_b)| tournament::OpeningMatchup {
+                model_a: ModelId::new(*model_a),
+                model_b: ModelId::new(*model_b),
+            })
+            .collect()
     }
 
     fn temp_path(name: &str) -> PathBuf {
@@ -620,6 +643,7 @@ mod tests {
             judge: Some(ModelId::new("judge")),
             tournament: TournamentFormat::RoundRobin,
             best_of: tournament::DEFAULT_BEST_OF,
+            opening_matchups: None,
             seed: 0,
             tasks_path: Some(PathBuf::from("tasks.json")),
             started_at: "2026-01-02T03:04:05Z".into(),
@@ -1126,11 +1150,166 @@ mod tests {
         assert_eq!(bracket.winner, Some(ModelId::new("m0")));
         assert_eq!(bracket.matches.len(), 3);
         assert_eq!(bracket.matches[0].round, 1);
-        assert_eq!(bracket.matches[1].round, 1);
+        assert_eq!(bracket.matches[0].model_a, ModelId::new("m0"));
+        assert_eq!(bracket.matches[0].model_b, ModelId::new("m1"));
+        assert_eq!(bracket.matches[1].model_a, ModelId::new("m2"));
+        assert_eq!(bracket.matches[1].model_b, ModelId::new("m3"));
         assert_eq!(bracket.matches[2].round, 2);
         assert_eq!(bracket.matches[2].model_a, ModelId::new("m0"));
         assert_eq!(bracket.matches[2].model_b, ModelId::new("m2"));
         assert_eq!(bracket.matches[2].winner, Some(ModelId::new("m0")));
+        assert!(tournament.opening_matchups.is_none());
+        assert!(
+            serde_json::to_value(tournament)
+                .unwrap()
+                .get("opening_matchups")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_opening_matchups_decide_the_first_round() {
+        let mut cfg = config(&["m0", "m1", "m2", "m3"], Some("judge"));
+        cfg.tournament = TournamentFormat::SingleElimination;
+        cfg.opening_matchups = Some(opening(&[("m0", "m2"), ("m1", "m3")]));
+        let (output, failed_pairs) = collect_exec(&PreferSmallerId, &cfg, |_| {}, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(failed_pairs, 0);
+        let tournament = output.tournament.as_ref().unwrap();
+        assert_eq!(tournament.status, TournamentStatus::Complete);
+        assert_eq!(tournament.opening_matchups, cfg.opening_matchups);
+        assert_eq!(
+            tournament.candidates,
+            vec![
+                ModelId::new("m0"),
+                ModelId::new("m1"),
+                ModelId::new("m2"),
+                ModelId::new("m3"),
+            ]
+        );
+        let bracket = &tournament.tasks[0];
+        assert_eq!(bracket.matches.len(), 3);
+        assert_eq!(bracket.matches[0].model_a, ModelId::new("m0"));
+        assert_eq!(bracket.matches[0].model_b, ModelId::new("m2"));
+        assert_eq!(bracket.matches[0].winner, Some(ModelId::new("m0")));
+        assert_eq!(bracket.matches[1].model_a, ModelId::new("m1"));
+        assert_eq!(bracket.matches[1].model_b, ModelId::new("m3"));
+        assert_eq!(bracket.matches[1].winner, Some(ModelId::new("m1")));
+        assert_eq!(bracket.matches[2].round, 2);
+        assert_eq!(bracket.matches[2].model_a, ModelId::new("m0"));
+        assert_eq!(bracket.matches[2].model_b, ModelId::new("m1"));
+        assert_eq!(bracket.matches[2].winner, Some(ModelId::new("m0")));
+        assert_eq!(bracket.winner, Some(ModelId::new("m0")));
+    }
+
+    #[tokio::test]
+    async fn custom_opening_matchups_keep_best_of_n() {
+        let mut cfg = config(&["m0", "m1", "m2", "m3"], Some("judge"));
+        cfg.tournament = TournamentFormat::SingleElimination;
+        cfg.best_of = 3;
+        cfg.opening_matchups = Some(opening(&[("m0", "m2"), ("m1", "m3")]));
+        let (output, failed_pairs) = collect_exec(&PreferSmallerId, &cfg, |_| {}, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(failed_pairs, 0);
+        let tournament = output.tournament.unwrap();
+        assert_eq!(tournament.best_of, 3);
+        assert_eq!(tournament.status, TournamentStatus::Complete);
+        let first = &tournament.tasks[0].matches[0];
+        assert_eq!(first.model_a, ModelId::new("m0"));
+        assert_eq!(first.model_b, ModelId::new("m2"));
+        assert_eq!(first.games.len(), 2);
+        assert!(first.games.iter().all(|game| !game.tiebreak));
+        assert_eq!(tournament.tasks[0].matches[2].round, 2);
+        assert_eq!(tournament.tasks[0].matches[2].model_a, ModelId::new("m0"));
+        assert_eq!(tournament.tasks[0].matches[2].model_b, ModelId::new("m1"));
+        assert_eq!(tournament.judged_match_count(), 6);
+    }
+
+    #[tokio::test]
+    async fn custom_opening_matchups_keep_seeded_tiebreak_fallback() {
+        let mut cfg = config(&["m0", "m1", "m2", "m3"], Some("judge"));
+        cfg.tournament = TournamentFormat::SingleElimination;
+        cfg.seed = 11;
+        cfg.opening_matchups = Some(opening(&[("m0", "m2"), ("m1", "m3")]));
+        let (output, failed_pairs) = collect_exec(&OkProvider, &cfg, |_| {}, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(failed_pairs, 0);
+        let tournament = output.tournament.unwrap();
+        assert_eq!(tournament.status, TournamentStatus::Complete);
+        assert_eq!(tournament.tasks[0].matches.len(), 3);
+        for series in &tournament.tasks[0].matches[..2] {
+            assert_eq!(series.round, 1);
+            assert_eq!(series.games.len(), 4);
+            assert_eq!(series.games.iter().filter(|game| game.tiebreak).count(), 3);
+            assert!(
+                series
+                    .games
+                    .iter()
+                    .all(|game| { game.outcome == MatchOutcome::Draw && game.winner.is_none() })
+            );
+            assert!(series.seeded_fallback);
+            assert_eq!(
+                series.winner.as_ref(),
+                Some(&tournament::seeded_fallback_winner(
+                    11,
+                    &series.model_a,
+                    &series.model_b
+                ))
+            );
+        }
+        assert_eq!(tournament.tasks[0].matches[0].model_a, ModelId::new("m0"));
+        assert_eq!(tournament.tasks[0].matches[0].model_b, ModelId::new("m2"));
+        assert_eq!(tournament.tasks[0].matches[1].model_a, ModelId::new("m1"));
+        assert_eq!(tournament.tasks[0].matches[1].model_b, ModelId::new("m3"));
+        let final_match = &tournament.tasks[0].matches[2];
+        assert_eq!(final_match.round, 2);
+        assert!(final_match.seeded_fallback);
+        assert_eq!(
+            tournament.tasks[0].winner.as_ref(),
+            final_match.winner.as_ref()
+        );
+    }
+
+    #[tokio::test]
+    async fn round_robin_rejects_opening_matchups_before_execution() {
+        let path = temp_path("round-robin-opening");
+        let _ = std::fs::remove_file(&path);
+        let mut cfg = config(&["m0", "m1"], Some("judge"));
+        cfg.opening_matchups = Some(opening(&[("m0", "m1")]));
+        let provider = FailCandidates {
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let error = run_exec(&provider, &cfg, Some(&path)).await.unwrap_err();
+        assert!(matches!(error, Error::OpeningMatchupsRequireElimination));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert!(!path.exists());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn custom_opening_matchups_do_not_bypass_the_field_size_rule() {
+        let path = temp_path("custom-opening-field");
+        let _ = std::fs::remove_file(&path);
+        let mut cfg = config(&["m0", "m1", "m2"], None);
+        cfg.tournament = TournamentFormat::SingleElimination;
+        cfg.opening_matchups = Some(opening(&[("m0", "m1")]));
+        let provider = FailCandidates {
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let error = run_exec(&provider, &cfg, Some(&path)).await.unwrap_err();
+        match error {
+            Error::UnsupportedTournament { format, candidates } => {
+                assert_eq!(format, "single-elimination");
+                assert_eq!(candidates, 3);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert!(!path.exists());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
