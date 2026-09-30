@@ -868,4 +868,65 @@ mod tests {
         let html = crate::html::render(&from_output(&data));
         assert!(html.contains("m0 advances (4 games, 3 tie-breaks, seeded fallback)"));
     }
+
+    #[test]
+    fn king_of_the_hill_report_keeps_challenge_order_and_champion() {
+        use crate::tournament::{
+            MatchOutcome, TaskBracket, Tournament, TournamentFormat, TournamentMatch,
+            TournamentStatus,
+        };
+
+        let tournament = Tournament {
+            format: TournamentFormat::KingOfTheHill,
+            candidates: vec![ModelId::new("m0"), ModelId::new("m1"), ModelId::new("m2")],
+            status: TournamentStatus::Complete,
+            best_of: 1,
+            opening_matchups: None,
+            tasks: vec![TaskBracket {
+                task_id: "t1".into(),
+                status: TournamentStatus::Complete,
+                winner: Some(ModelId::new("m0")),
+                matches: vec![
+                    TournamentMatch {
+                        round: 1,
+                        model_a: ModelId::new("m0"),
+                        model_b: ModelId::new("m1"),
+                        winner: Some(ModelId::new("m0")),
+                        outcome: MatchOutcome::Winner,
+                        games: Vec::new(),
+                        seeded_fallback: false,
+                    },
+                    TournamentMatch {
+                        round: 2,
+                        model_a: ModelId::new("m0"),
+                        model_b: ModelId::new("m2"),
+                        winner: Some(ModelId::new("m0")),
+                        outcome: MatchOutcome::Winner,
+                        games: Vec::new(),
+                        seeded_fallback: false,
+                    },
+                ],
+            }],
+        };
+        let mut data = output(
+            run_meta(&["m0", "m1", "m2"], Some("judge")).with_judge_coverage(2, 2, 0),
+            vec![task("t1")],
+            Some(vec![]),
+            Some(vec![]),
+            None,
+            None,
+        );
+        data.tournament = Some(tournament);
+        let report = from_output(&data);
+        let recorded = report.tournament.expect("tournament");
+        assert_eq!(recorded.format, TournamentFormat::KingOfTheHill);
+        assert_eq!(recorded.tasks[0].winner, Some(ModelId::new("m0")));
+
+        let html = crate::html::render(&report);
+        assert!(html.contains("king-of-the-hill"));
+        assert!(html.contains("King of the Hill"));
+        assert!(html.contains("t1: m0 won"));
+        assert!(html.contains("m0 remains"));
+        assert!(html.contains("configured order"));
+    }
 }

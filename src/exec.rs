@@ -1551,4 +1551,121 @@ mod tests {
             assert!(!path.exists());
         }
     }
+
+    #[tokio::test]
+    async fn king_of_the_hill_follows_candidate_order_and_names_the_champion() {
+        let mut cfg = config(&["m2", "m0", "m1"], Some("judge"));
+        cfg.tournament = TournamentFormat::KingOfTheHill;
+        let (output, failed_pairs) = collect_exec(&PreferSmallerId, &cfg, |_| {}, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(failed_pairs, 0);
+        let tournament = output.tournament.as_ref().unwrap();
+        assert_eq!(tournament.format, TournamentFormat::KingOfTheHill);
+        assert_eq!(tournament.status, TournamentStatus::Complete);
+        assert_eq!(
+            tournament.candidates,
+            vec![ModelId::new("m2"), ModelId::new("m0"), ModelId::new("m1"),]
+        );
+        assert_eq!(tournament.judged_match_count(), 2);
+        assert_eq!(output.run.expected_pairs, Some(2));
+        let bracket = &tournament.tasks[0];
+        assert_eq!(bracket.matches[0].model_a, ModelId::new("m2"));
+        assert_eq!(bracket.matches[0].model_b, ModelId::new("m0"));
+        assert_eq!(bracket.matches[0].winner, Some(ModelId::new("m0")));
+        assert_eq!(bracket.matches[1].model_a, ModelId::new("m0"));
+        assert_eq!(bracket.matches[1].model_b, ModelId::new("m1"));
+        assert_eq!(bracket.matches[1].winner, Some(ModelId::new("m0")));
+        assert_eq!(bracket.winner, Some(ModelId::new("m0")));
+        assert!(tournament.opening_matchups.is_none());
+    }
+
+    #[tokio::test]
+    async fn king_of_the_hill_best_of_three_keeps_the_holder_across_series() {
+        let mut cfg = config(&["m0", "m1", "m2"], Some("judge"));
+        cfg.tournament = TournamentFormat::KingOfTheHill;
+        cfg.best_of = 3;
+        let (output, failed_pairs) = collect_exec(&PreferSmallerId, &cfg, |_| {}, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(failed_pairs, 0);
+        let tournament = output.tournament.as_ref().unwrap();
+        assert_eq!(tournament.status, TournamentStatus::Complete);
+        assert_eq!(tournament.best_of, 3);
+        let bracket = &tournament.tasks[0];
+        assert_eq!(bracket.winner, Some(ModelId::new("m0")));
+        assert_eq!(bracket.matches.len(), 2);
+        assert!(bracket.matches.iter().all(|row| row.games.len() == 2));
+        assert_eq!(bracket.matches[1].model_a, ModelId::new("m0"));
+        assert_eq!(bracket.matches[1].model_b, ModelId::new("m2"));
+        assert_eq!(output.judgments.as_ref().map(Vec::len), Some(4));
+    }
+
+    #[tokio::test]
+    async fn king_of_the_hill_allows_non_power_of_two_fields() {
+        let mut cfg = config(&["m0", "m1", "m2"], Some("judge"));
+        cfg.tournament = TournamentFormat::KingOfTheHill;
+        let (output, failed_pairs) = collect_exec(&PreferSmallerId, &cfg, |_| {}, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(failed_pairs, 0);
+        let tournament = output.tournament.as_ref().unwrap();
+        assert_eq!(tournament.status, TournamentStatus::Complete);
+        assert_eq!(tournament.tasks[0].winner, Some(ModelId::new("m0")));
+        assert_eq!(tournament.series_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn king_of_the_hill_uses_elimination_tiebreaks_and_seeded_fallback() {
+        let mut cfg = config(&["m0", "m1", "m2"], Some("judge"));
+        cfg.tournament = TournamentFormat::KingOfTheHill;
+        cfg.seed = 11;
+        let (output, failed_pairs) = collect_exec(&OkProvider, &cfg, |_| {}, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(failed_pairs, 0);
+        let tournament = output.tournament.as_ref().unwrap();
+        assert_eq!(tournament.status, TournamentStatus::Complete);
+        assert_eq!(tournament.series_count(), 2);
+        for series in &tournament.tasks[0].matches {
+            assert!(series.seeded_fallback);
+            assert_eq!(series.outcome, MatchOutcome::Winner);
+            assert_eq!(
+                series.winner,
+                Some(tournament::seeded_fallback_winner(
+                    11,
+                    &series.model_a,
+                    &series.model_b
+                ))
+            );
+            assert_eq!(series.games.iter().filter(|game| game.tiebreak).count(), 3);
+        }
+        assert_eq!(
+            tournament.tasks[0].winner,
+            tournament.tasks[0]
+                .matches
+                .last()
+                .and_then(|row| row.winner.clone())
+        );
+    }
+
+    #[tokio::test]
+    async fn king_of_the_hill_judgment_failure_stops_before_later_challengers() {
+        let mut cfg = config(&["m0", "m1", "m2"], Some("judge"));
+        cfg.tournament = TournamentFormat::KingOfTheHill;
+        let (output, failed_pairs) = collect_exec(&FailJudge, &cfg, |_| {}, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(failed_pairs, 1);
+        let tournament = output.tournament.as_ref().unwrap();
+        assert_eq!(tournament.status, TournamentStatus::Incomplete);
+        assert!(tournament.tasks[0].winner.is_none());
+        assert_eq!(tournament.tasks[0].matches.len(), 1);
+        assert_eq!(
+            tournament.tasks[0].matches[0].outcome,
+            MatchOutcome::JudgmentFailed
+        );
+        assert_eq!(tournament.tasks[0].matches[0].model_a, ModelId::new("m0"));
+        assert_eq!(tournament.tasks[0].matches[0].model_b, ModelId::new("m1"));
+    }
 }

@@ -252,6 +252,10 @@ mod tests {
             judge_progress_len(TournamentFormat::SingleElimination, 2, 4, 1),
             6
         );
+        assert_eq!(
+            judge_progress_len(TournamentFormat::KingOfTheHill, 2, 3, 1),
+            4
+        );
         assert_eq!(judge_progress_len(TournamentFormat::RoundRobin, 1, 2, 3), 3);
     }
 }

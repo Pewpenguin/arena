@@ -413,13 +413,16 @@ fn push_results(html: &mut String, results: &[CandidateRow<'_>]) {
 
 fn push_tournament(html: &mut String, tournament: &Tournament) {
     let elimination = tournament.format == TournamentFormat::SingleElimination;
+    let hill = tournament.format == TournamentFormat::KingOfTheHill;
     let series = tournament.best_of > 1;
-    if !elimination && !series {
+    if !elimination && !hill && !series {
         return;
     }
     html.push_str("<section>\n<h2>");
     if elimination {
         html.push_str("Single-elimination");
+    } else if hill {
+        html.push_str("King of the Hill");
     } else {
         html.push_str(&format!("Best of {}", tournament.best_of));
     }
@@ -428,6 +431,10 @@ fn push_tournament(html: &mut String, tournament: &Tournament) {
         "Each match is a best-of series. The winner advances. A drawn series plays up to three tie-breaks, then a seeded fallback."
     } else if elimination {
         "Match winners advance. A drawn series plays up to three tie-breaks, then a seeded fallback."
+    } else if hill && series {
+        "Candidates challenge in configured order. Each match is a best-of series. The winner remains on the hill. A drawn series plays up to three tie-breaks, then a seeded fallback."
+    } else if hill {
+        "Candidates challenge in configured order. The winner remains on the hill. A drawn series plays up to three tie-breaks, then a seeded fallback."
     } else {
         "Each pair plays one series. Draws do not count as wins."
     });
@@ -467,7 +474,7 @@ fn push_tournament(html: &mut String, tournament: &Tournament) {
             html.push_str("</td><td class=\"model-id\">");
             html.push_str(&escape(&row.model_b.to_string()));
             html.push_str("</td><td>");
-            html.push_str(&escape(&match_result(row, elimination)));
+            html.push_str(&escape(&match_result(row, tournament.format)));
             html.push_str("</td></tr>\n");
         }
     }
@@ -486,10 +493,15 @@ fn task_result(task: &TaskBracket) -> String {
     }
 }
 
-fn match_result(row: &crate::tournament::TournamentMatch, elimination: bool) -> String {
+fn match_result(row: &crate::tournament::TournamentMatch, format: TournamentFormat) -> String {
     let text = match row.outcome {
         MatchOutcome::Winner => match &row.winner {
-            Some(winner) if elimination => format!("{winner} advances"),
+            Some(winner) if format == TournamentFormat::SingleElimination => {
+                format!("{winner} advances")
+            }
+            Some(winner) if format == TournamentFormat::KingOfTheHill => {
+                format!("{winner} remains")
+            }
             Some(winner) => format!("{winner} won"),
             None => "Winner".to_string(),
         },

@@ -13,12 +13,15 @@ use crate::task::Task;
 /// Which candidate pairs a run schedules.
 ///
 /// Round-robin is the historical `exec` behavior: every unordered pair once.
+/// Single-elimination advances winners through a bracket.
+/// King-of-the-hill keeps one holder and challenges the remaining field in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum TournamentFormat {
     #[default]
     RoundRobin,
     SingleElimination,
+    KingOfTheHill,
 }
 
 impl TournamentFormat {
@@ -26,6 +29,7 @@ impl TournamentFormat {
         match self {
             Self::RoundRobin => "round-robin",
             Self::SingleElimination => "single-elimination",
+            Self::KingOfTheHill => "king-of-the-hill",
         }
     }
 }
@@ -287,7 +291,9 @@ fn supported_field(candidates: usize) -> bool {
 pub fn planned_match_count(format: TournamentFormat, candidates: usize) -> usize {
     match format {
         TournamentFormat::RoundRobin => candidates.saturating_sub(1).saturating_mul(candidates) / 2,
-        TournamentFormat::SingleElimination => candidates.saturating_sub(1),
+        TournamentFormat::SingleElimination | TournamentFormat::KingOfTheHill => {
+            candidates.saturating_sub(1)
+        }
     }
 }
 
@@ -310,6 +316,7 @@ pub(crate) fn opening_pairs(
                 Vec::new()
             }
         }
+        TournamentFormat::KingOfTheHill => king_of_the_hill_opening(candidates),
     }
 }
 
@@ -377,6 +384,20 @@ where
                     best_of,
                     seed,
                     opening,
+                    &mut on_judgment,
+                    &mut on_round,
+                )
+                .await?
+            }
+            TournamentFormat::KingOfTheHill => {
+                play_king_of_the_hill(
+                    provider,
+                    judge_model,
+                    task,
+                    results,
+                    candidates,
+                    best_of,
+                    seed,
                     &mut on_judgment,
                     &mut on_round,
                 )
@@ -500,6 +521,65 @@ where
     Ok(bracket_from_parts(&task.id, matches, stopped, &active))
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn play_king_of_the_hill<P, F, R>(
+    provider: &P,
+    judge_model: &ModelId,
+    task: &Task,
+    results: &[EvaluatedResult],
+    candidates: &[ModelId],
+    best_of: u32,
+    seed: u64,
+    on_judgment: &mut F,
+    on_round: &mut R,
+) -> Result<TaskBracket>
+where
+    P: ModelProvider + Clone + Send + 'static,
+    F: FnMut(&Judgment),
+    R: FnMut(&[JudgmentFailure]),
+{
+    let Some(mut holder) = candidates.first().cloned() else {
+        return Ok(TaskBracket {
+            task_id: task.id.clone(),
+            status: TournamentStatus::Complete,
+            winner: None,
+            matches: Vec::new(),
+        });
+    };
+    let mut matches = Vec::new();
+    let mut round = 1u32;
+    let mut stopped = false;
+    for challenger in candidates.iter().skip(1) {
+        let pairs = [(holder.clone(), challenger.clone())];
+        let played = play_series(
+            provider,
+            judge_model,
+            task,
+            results,
+            &pairs,
+            round,
+            best_of,
+            Some(seed),
+            &mut *on_judgment,
+            &mut *on_round,
+        )
+        .await?;
+        let winners = series_winners(&played);
+        stopped = winners.is_empty();
+        matches.extend(played);
+        if stopped {
+            break;
+        }
+        holder = winners
+            .into_iter()
+            .next()
+            .expect("series_winners returns one winner per match");
+        round = round.saturating_add(1);
+    }
+    let active = if stopped { Vec::new() } else { vec![holder] };
+    Ok(bracket_from_parts(&task.id, matches, stopped, &active))
+}
+
 fn series_winners(matches: &[TournamentMatch]) -> Vec<ModelId> {
     let mut winners = Vec::with_capacity(matches.len());
     for row in matches {
@@ -525,6 +605,13 @@ fn round_robin_pairs(candidates: &[ModelId]) -> Vec<(ModelId, ModelId)> {
                 .map(move |model_b| (model_a.clone(), model_b.clone()))
         })
         .collect()
+}
+
+fn king_of_the_hill_opening(candidates: &[ModelId]) -> Vec<(ModelId, ModelId)> {
+    match candidates {
+        [model_a, model_b, ..] => vec![(model_a.clone(), model_b.clone())],
+        _ => Vec::new(),
+    }
 }
 
 fn plan_round(active: &[ModelId]) -> Result<Vec<(ModelId, ModelId)>> {
@@ -1008,6 +1095,44 @@ fn replay_single_elimination(
 }
 
 #[cfg(test)]
+fn replay_king_of_the_hill(
+    task_id: &str,
+    candidates: &[ModelId],
+    mut play_match: impl FnMut(u32, &ModelId, &ModelId) -> BracketStep,
+) -> Result<TaskBracket> {
+    validate(TournamentFormat::KingOfTheHill, candidates.len())?;
+    let Some(mut holder) = candidates.first().cloned() else {
+        return Ok(TaskBracket {
+            task_id: task_id.to_string(),
+            status: TournamentStatus::Complete,
+            winner: None,
+            matches: Vec::new(),
+        });
+    };
+    let mut matches = Vec::new();
+    let mut round = 1u32;
+    let mut stopped = false;
+    for challenger in candidates.iter().skip(1) {
+        let pairs = [(holder.clone(), challenger.clone())];
+        let steps = [play_match(round, &holder, challenger)];
+        let folded = fold_round(round, &pairs, &steps)?;
+        stopped = folded.stop;
+        matches.extend(folded.matches);
+        if stopped {
+            break;
+        }
+        holder = folded
+            .winners
+            .into_iter()
+            .next()
+            .expect("a completed king-of-the-hill match advances one winner");
+        round = round.saturating_add(1);
+    }
+    let active = if stopped { Vec::new() } else { vec![holder] };
+    Ok(bracket_from_parts(task_id, matches, stopped, &active))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
@@ -1069,6 +1194,11 @@ mod tests {
             planned_match_count(TournamentFormat::SingleElimination, 8),
             7
         );
+        assert_eq!(planned_match_count(TournamentFormat::KingOfTheHill, 0), 0);
+        assert_eq!(planned_match_count(TournamentFormat::KingOfTheHill, 1), 0);
+        assert_eq!(planned_match_count(TournamentFormat::KingOfTheHill, 2), 1);
+        assert_eq!(planned_match_count(TournamentFormat::KingOfTheHill, 3), 2);
+        assert_eq!(planned_match_count(TournamentFormat::KingOfTheHill, 5), 4);
     }
 
     #[test]
@@ -1219,6 +1349,7 @@ mod tests {
         }
         for candidates in [0, 1, 3, 6] {
             assert!(validate(TournamentFormat::RoundRobin, candidates).is_ok());
+            assert!(validate(TournamentFormat::KingOfTheHill, candidates).is_ok());
         }
     }
 
@@ -1360,17 +1491,32 @@ mod tests {
             validate_opening_matchups(TournamentFormat::RoundRobin, &field, Some(&valid)),
             Err(Error::OpeningMatchupsRequireElimination)
         ));
+        assert!(matches!(
+            validate_opening_matchups(TournamentFormat::KingOfTheHill, &field, Some(&valid)),
+            Err(Error::OpeningMatchupsRequireElimination)
+        ));
         validate_opening_matchups(TournamentFormat::RoundRobin, &field, None).unwrap();
+        validate_opening_matchups(TournamentFormat::KingOfTheHill, &field, None).unwrap();
         assert_eq!(
             opening_pairs(TournamentFormat::RoundRobin, &field, Some(&valid)),
             opening_pairs(TournamentFormat::RoundRobin, &field, None),
         );
+        assert_eq!(
+            opening_pairs(
+                TournamentFormat::KingOfTheHill,
+                &ids(&["A", "B", "C"]),
+                None
+            ),
+            vec![(id("A"), id("B"))]
+        );
+        assert!(opening_pairs(TournamentFormat::KingOfTheHill, &ids(&["A"]), None).is_empty());
 
         let three = ids(&["m0", "m1", "m2"]);
         assert!(matches!(
             validate(TournamentFormat::SingleElimination, three.len()),
             Err(Error::UnsupportedTournament { candidates: 3, .. })
         ));
+        assert!(validate(TournamentFormat::KingOfTheHill, three.len()).is_ok());
 
         let recorded = Tournament {
             format: TournamentFormat::SingleElimination,
@@ -1680,6 +1826,185 @@ mod tests {
         for best_of in [1, 3, 5] {
             assert!(validate_best_of(best_of).is_ok());
         }
+    }
+
+    #[test]
+    fn king_of_the_hill_preserves_candidate_order_for_the_first_matchup() {
+        let bracket = replay_king_of_the_hill("t1", &ids(&["C", "A", "B"]), |round, a, b| {
+            match round {
+                1 => assert_eq!((a, b), (&id("C"), &id("A"))),
+                2 => assert_eq!((a, b), (&id("C"), &id("B"))),
+                _ => panic!("unexpected round {round}"),
+            }
+            BracketStep::Advance(a.clone())
+        })
+        .unwrap();
+        assert_eq!(bracket.matches[0].model_a, id("C"));
+        assert_eq!(bracket.matches[0].model_b, id("A"));
+        assert_eq!(
+            opening_pairs(
+                TournamentFormat::KingOfTheHill,
+                &ids(&["C", "A", "B"]),
+                None
+            ),
+            vec![(id("C"), id("A"))]
+        );
+    }
+
+    #[test]
+    fn king_of_the_hill_winner_faces_the_next_candidate() {
+        let bracket =
+            replay_king_of_the_hill(
+                "t1",
+                &ids(&["A", "B", "C", "D"]),
+                |round, a, b| match round {
+                    1 => {
+                        assert_eq!((a, b), (&id("A"), &id("B")));
+                        BracketStep::Advance(b.clone())
+                    }
+                    2 => {
+                        assert_eq!((a, b), (&id("B"), &id("C")));
+                        BracketStep::Advance(a.clone())
+                    }
+                    3 => {
+                        assert_eq!((a, b), (&id("B"), &id("D")));
+                        BracketStep::Advance(a.clone())
+                    }
+                    _ => panic!("unexpected round {round}"),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(bracket.matches.len(), 3);
+        assert_eq!(bracket.matches[0].winner, Some(id("B")));
+        assert_eq!(bracket.matches[1].model_a, id("B"));
+        assert_eq!(bracket.matches[1].model_b, id("C"));
+        assert_eq!(bracket.matches[1].winner, Some(id("B")));
+        assert_eq!(bracket.matches[2].model_a, id("B"));
+        assert_eq!(bracket.matches[2].model_b, id("D"));
+        assert_eq!(bracket.status, TournamentStatus::Complete);
+        assert_eq!(bracket.winner, Some(id("B")));
+    }
+
+    #[test]
+    fn king_of_the_hill_loser_never_returns() {
+        let mut seen_losers = HashSet::new();
+        let bracket = replay_king_of_the_hill("t1", &ids(&["A", "B", "C"]), |_, a, b| {
+            let winner = a.clone();
+            let loser = if a == &id("A") && b == &id("B") {
+                id("B")
+            } else {
+                b.clone()
+            };
+            assert!(seen_losers.insert(loser), "a loser returned to the hill");
+            BracketStep::Advance(winner)
+        })
+        .unwrap();
+        assert_eq!(bracket.winner, Some(id("A")));
+        assert_eq!(seen_losers, HashSet::from([id("B"), id("C")]));
+        assert!(
+            bracket
+                .matches
+                .iter()
+                .all(|row| row.winner.as_ref() == Some(&id("A")))
+        );
+    }
+
+    #[test]
+    fn king_of_the_hill_final_survivor_is_the_champion() {
+        let bracket = replay_king_of_the_hill("t1", &ids(&["A", "B", "C"]), |round, a, b| {
+            if round == 1 {
+                assert_eq!((a, b), (&id("A"), &id("B")));
+                BracketStep::Advance(a.clone())
+            } else {
+                assert_eq!((a, b), (&id("A"), &id("C")));
+                BracketStep::Advance(b.clone())
+            }
+        })
+        .unwrap();
+        assert_eq!(bracket.status, TournamentStatus::Complete);
+        assert_eq!(bracket.winner, Some(id("C")));
+        assert_eq!(bracket.matches[1].winner, Some(id("C")));
+    }
+
+    #[test]
+    fn king_of_the_hill_draw_stops_without_a_champion() {
+        let bracket = replay_king_of_the_hill("t1", &ids(&["A", "B", "C"]), |round, a, b| {
+            assert_eq!(round, 1, "a draw must not invite the next challenger");
+            assert_eq!((a, b), (&id("A"), &id("B")));
+            BracketStep::Draw
+        })
+        .unwrap();
+        assert_eq!(bracket.status, TournamentStatus::Draw);
+        assert!(bracket.winner.is_none());
+        assert_eq!(bracket.matches.len(), 1);
+        assert_eq!(bracket.matches[0].outcome, MatchOutcome::Draw);
+    }
+
+    #[test]
+    fn king_of_the_hill_judgment_failure_stops_the_tournament() {
+        let bracket = replay_king_of_the_hill("t1", &ids(&["A", "B", "C"]), |round, _, _| {
+            assert_eq!(round, 1);
+            BracketStep::JudgmentFailed
+        })
+        .unwrap();
+        assert_eq!(bracket.status, TournamentStatus::Incomplete);
+        assert!(bracket.winner.is_none());
+        assert_eq!(bracket.matches.len(), 1);
+        assert_eq!(bracket.matches[0].outcome, MatchOutcome::JudgmentFailed);
+    }
+
+    #[test]
+    fn king_of_the_hill_handles_one_and_two_candidate_fields() {
+        let one = replay_king_of_the_hill("t1", &ids(&["A"]), |_, _, _| {
+            panic!("a single candidate must not play a match")
+        })
+        .unwrap();
+        assert_eq!(one.status, TournamentStatus::Complete);
+        assert_eq!(one.winner, Some(id("A")));
+        assert!(one.matches.is_empty());
+
+        let two = replay_king_of_the_hill("t1", &ids(&["A", "B"]), |_, a, b| {
+            assert_eq!((a, b), (&id("A"), &id("B")));
+            BracketStep::Advance(b.clone())
+        })
+        .unwrap();
+        assert_eq!(two.status, TournamentStatus::Complete);
+        assert_eq!(two.winner, Some(id("B")));
+        assert_eq!(two.matches.len(), 1);
+
+        let empty = replay_king_of_the_hill("t1", &[], |_, _, _| {
+            panic!("an empty field must not play a match")
+        })
+        .unwrap();
+        assert_eq!(empty.status, TournamentStatus::Complete);
+        assert!(empty.winner.is_none());
+        assert!(empty.matches.is_empty());
+    }
+
+    #[test]
+    fn king_of_the_hill_record_round_trips() {
+        let bracket = replay_king_of_the_hill("t1", &ids(&["A", "B", "C"]), |_, a, _| {
+            BracketStep::Advance(a.clone())
+        })
+        .unwrap();
+        let tournament = assemble(
+            TournamentFormat::KingOfTheHill,
+            &ids(&["A", "B", "C"]),
+            DEFAULT_BEST_OF,
+            vec![bracket],
+            None,
+        );
+        let json = serde_json::to_value(&tournament).unwrap();
+        assert_eq!(json["format"], "king_of_the_hill");
+        assert_eq!(json["status"], "complete");
+        assert!(json.get("best_of").is_none());
+        assert!(json.get("opening_matchups").is_none());
+        assert_eq!(json["candidates"], serde_json::json!(["A", "B", "C"]));
+        assert_eq!(json["tasks"][0]["winner"], "A");
+        assert_eq!(json["tasks"][0]["matches"].as_array().unwrap().len(), 2);
+        let restored: Tournament = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, tournament);
     }
 
     fn replay_games(

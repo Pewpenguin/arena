@@ -1019,7 +1019,7 @@ body {
 .tasks { grid-area: tasks; }
 .controls { grid-area: controls; }
 .workspace > .region { min-width: 0; }
-.region h2, label.region-title, .section-line h2, .experiment > h2, #elim_section > h2, .elim-round h3 {
+.region h2, label.region-title, .section-line h2, .experiment > h2, #elim_section > h2, #hill_section > h2, .elim-round h3 {
   display: block;
   margin: 0 0 8px;
   padding: 0;
@@ -1372,10 +1372,10 @@ input[type=checkbox] { width: auto; margin: 0; accent-color: var(--accent); }
 #dashboard.is-incomplete .bar > span { background: var(--warn); }
 #dashboard.is-failed .bar > span { background: var(--bad); }
 .results { margin-top: 8px; }
-#elim_section { margin: 0 0 24px; }
-#elim_status, #bracket_status { margin: 0 0 8px; color: var(--muted); font-family: var(--mono); font-size: .82rem; letter-spacing: 0; text-transform: none; }
-#elim_status:empty, #bracket_status:empty { display: none; }
-#elim_section[hidden], .elim-board[hidden], #bracket_table[hidden] { display: none; }
+#elim_section, #hill_section { margin: 0 0 24px; }
+#elim_status, #hill_status, #bracket_status { margin: 0 0 8px; color: var(--muted); font-family: var(--mono); font-size: .82rem; letter-spacing: 0; text-transform: none; }
+#elim_status:empty, #hill_status:empty, #bracket_status:empty { display: none; }
+#elim_section[hidden], #hill_section[hidden], .elim-board[hidden], #bracket_table[hidden] { display: none; }
 .elim-board { display: flex; flex-direction: column; gap: 16px; }
 .elim-task { margin: 0 0 8px; color: var(--muted); font-family: var(--mono); font-size: .82rem; }
 .elim-columns { display: flex; align-items: stretch; gap: 16px; overflow-x: auto; }
@@ -1396,6 +1396,67 @@ input[type=checkbox] { width: auto; margin: 0; accent-color: var(--accent); }
 .elim-match.is-incomplete .elim-detail { color: var(--bad); }
 .elim-champion { margin: 8px 0 0; color: var(--muted); font-size: .68rem; font-weight: 600; letter-spacing: .12em; text-transform: uppercase; }
 .elim-champion strong { display: block; margin-top: 4px; color: var(--ink); font-family: var(--mono); font-size: .82rem; font-weight: 600; letter-spacing: 0; text-transform: none; overflow-wrap: anywhere; }
+.hill-board { display: flex; flex-direction: column; gap: 16px; }
+.hill-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  gap: 12px;
+  align-items: stretch;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  background: var(--field);
+}
+.hill-card.is-active { border-color: var(--accent); }
+.hill-card.is-draw { border-color: var(--warn); }
+.hill-card.is-incomplete { border-color: var(--bad); }
+.hill-card.is-complete { border-color: var(--ok); }
+.hill-side { min-width: 0; }
+.hill-label {
+  margin: 0 0 4px;
+  color: var(--muted);
+  font-size: .68rem;
+  font-weight: 600;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+.hill-vs {
+  align-self: center;
+  color: var(--muted);
+  font: .82rem/1.4 var(--mono);
+}
+.order-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.order-index {
+  width: 1.5rem;
+  color: var(--muted);
+  font: .82rem/1.4 var(--mono);
+}
+.order-name {
+  flex: 1;
+  min-width: 8rem;
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  background: var(--field);
+  font: .82rem/1.4 var(--mono);
+}
+.order-actions { display: flex; gap: 4px; }
+.order-actions button {
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--ink);
+  font: .72rem/1.4 var(--mono);
+  cursor: pointer;
+}
+.order-actions button:disabled {
+  color: var(--muted);
+  cursor: default;
+}
 table.pairs { min-width: 42rem; }
 table.pairs th { border-top: 1px solid var(--line); }
 table.pairs td { padding: 8px 16px 8px 0; }
@@ -1451,7 +1512,7 @@ tr.detail-row td {
 .launch-fields select { width: 14rem; }
 .launch-main { flex: 1; min-width: 0; }
 .matchup-board { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
-.matchup-board[hidden], #matchup_field[hidden] { display: none; }
+.matchup-board[hidden], #matchup_field[hidden], #order_board[hidden] { display: none; }
 .matchup-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .matchup-row select {
   width: 11rem;
@@ -1577,6 +1638,7 @@ tr.detail-row td {
         <select id="tournament">
           <option value="round_robin" selected>Round-robin</option>
           <option value="single_elimination">Single-elimination</option>
+          <option value="king_of_the_hill">King of the Hill</option>
         </select>
       </div>
       <div>
@@ -1596,6 +1658,7 @@ tr.detail-row td {
       </div>
     </div>
     <div id="opening_board" class="matchup-board" hidden></div>
+    <div id="order_board" class="matchup-board" hidden></div>
     </div>
     <div class="launch-action">
       <button id="start" class="primary" type="button">Run Tournament →</button>
@@ -1672,6 +1735,11 @@ tr.detail-row td {
     <p id="elim_status" class="meta"></p>
     <div id="elim_board" class="elim-board"></div>
   </div>
+  <div id="hill_section" hidden>
+    <h2>King of the Hill</h2>
+    <p id="hill_status" class="meta"></p>
+    <div id="hill_board" class="hill-board"></div>
+  </div>
   <h2 class="results-title">Pairwise evaluation</h2>
   <div class="results table-scroll">
     <table class="sheet pairs">
@@ -1717,6 +1785,8 @@ tr.detail-row td {
 const models = [];
 const selected = new Set();
 const openingSlots = [];
+const kothOrder = [];
+let launchCandidates = [];
 let provider = "openai";
 let candidateQuery = "";
 let judgeQuery = "";
@@ -1806,6 +1876,24 @@ function syncOpeningSlots() {
   openingSlots.push(...kept);
 }
 
+function syncKothOrder() {
+  const kept = kothOrder.filter((id) => selected.has(id));
+  selected.forEach((id) => {
+    if (!kept.includes(id)) kept.push(id);
+  });
+  kothOrder.length = 0;
+  kothOrder.push(...kept);
+}
+
+function moveKothOrder(index, delta) {
+  const next = index + delta;
+  if (next < 0 || next >= kothOrder.length) return;
+  const swap = kothOrder[index];
+  kothOrder[index] = kothOrder[next];
+  kothOrder[next] = swap;
+  renderMatchups();
+}
+
 function setOpeningSlot(index, next) {
   const current = openingSlots[index];
   const other = openingSlots.indexOf(next);
@@ -1830,15 +1918,57 @@ function openingSelect(index) {
 function renderMatchups() {
   const field = document.getElementById("matchup_field");
   const board = document.getElementById("opening_board");
+  const orderBoard = document.getElementById("order_board");
   const mode = document.getElementById("matchups");
-  const elimination = document.getElementById("tournament").value === "single_elimination";
+  const format = document.getElementById("tournament").value;
+  const elimination = format === "single_elimination";
+  const hill = format === "king_of_the_hill";
   field.hidden = !elimination;
   board.replaceChildren();
+  orderBoard.replaceChildren();
   if (!elimination) {
     mode.value = "automatic";
     board.hidden = true;
+  }
+  if (hill) {
+    syncKothOrder();
+    orderBoard.hidden = false;
+    if (!kothOrder.length) {
+      const note = document.createElement("p");
+      note.className = "meta";
+      note.textContent = "Select candidates in the order they should challenge the hill.";
+      orderBoard.append(note);
+      return;
+    }
+    kothOrder.forEach((id, index) => {
+      const row = document.createElement("div");
+      row.className = "order-row";
+      const rank = document.createElement("span");
+      rank.className = "order-index";
+      rank.textContent = String(index + 1);
+      const name = document.createElement("span");
+      name.className = "order-name";
+      name.textContent = id;
+      const actions = document.createElement("div");
+      actions.className = "order-actions";
+      const up = document.createElement("button");
+      up.type = "button";
+      up.textContent = "Up";
+      up.disabled = index === 0;
+      up.addEventListener("click", () => moveKothOrder(index, -1));
+      const down = document.createElement("button");
+      down.type = "button";
+      down.textContent = "Down";
+      down.disabled = index === kothOrder.length - 1;
+      down.addEventListener("click", () => moveKothOrder(index, 1));
+      actions.append(up, down);
+      row.append(rank, name, actions);
+      orderBoard.append(row);
+    });
     return;
   }
+  orderBoard.hidden = true;
+  if (!elimination) return;
   const custom = mode.value === "custom";
   if (custom) syncOpeningSlots();
   const ids = custom ? openingSlots : [...selected];
@@ -1981,6 +2111,8 @@ function applyProvider(next) {
   provider = next;
   models.length = 0;
   selected.clear();
+  kothOrder.length = 0;
+  openingSlots.length = 0;
   judgeValue = "";
   document.getElementById("judge").value = "";
   candidateQuery = "";
@@ -2179,6 +2311,7 @@ function candidateModels() {
   if (tournament && tournament.candidates && tournament.candidates.length) {
     return tournament.candidates;
   }
+  if (launchCandidates.length) return launchCandidates.slice();
   const ids = [];
   const seen = new Set();
   (view.pairs || []).forEach((row) => {
@@ -2301,6 +2434,13 @@ function isSingleElimination() {
   if (format === "single-elimination" || format === "single_elimination") return true;
   const tournament = view && view.tournament;
   return !!(tournament && tournament.format === "single_elimination");
+}
+
+function isKingOfTheHill() {
+  const format = (view && view.tournament_format) || "";
+  if (format === "king-of-the-hill" || format === "king_of_the_hill") return true;
+  const tournament = view && view.tournament;
+  return !!(tournament && tournament.format === "king_of_the_hill");
 }
 
 function roundHeading(matchCount) {
@@ -2541,10 +2681,12 @@ function renderElimSection() {
   });
 }
 
-function matchResult(match, elimination) {
+function matchResult(match, format) {
   let text = "—";
+  const elimination = format === true || format === "single_elimination" || format === "single-elimination";
+  const hill = format === "king_of_the_hill" || format === "king-of-the-hill";
   if (match.outcome === "winner" && match.winner) {
-    text = match.winner + (elimination ? " advances" : " won");
+    text = match.winner + (elimination ? " advances" : hill ? " remains" : " won");
   } else if (match.outcome === "draw") {
     text = "Draw";
   } else if (match.outcome === "judgment_failed") {
@@ -2567,12 +2709,255 @@ function matchResult(match, elimination) {
   return text;
 }
 
+function findTaskPair(pairs, modelA, modelB) {
+  return (pairs || []).find((row) =>
+    (row.model_a === modelA && row.model_b === modelB) ||
+    (row.model_a === modelB && row.model_b === modelA)
+  );
+}
+
+function hillFromMatches(candidates, matches) {
+  if (!candidates.length) {
+    return { holder: null, challenger: null, champion: null, state: "pending", detail: "Pending", openChallenger: true };
+  }
+  if (candidates.length === 1) {
+    return {
+      holder: candidates[0],
+      challenger: null,
+      champion: candidates[0],
+      state: "complete",
+      detail: "Champion",
+      openChallenger: false,
+    };
+  }
+  let holder = candidates[0];
+  let next = 1;
+  for (const match of matches || []) {
+    const challenger = candidates[next];
+    if (!challenger) break;
+    const state = recordedState(match);
+    if (state === "complete" && match.winner) {
+      holder = match.winner;
+      next += 1;
+      continue;
+    }
+    return {
+      holder,
+      challenger,
+      champion: null,
+      state,
+      detail: matchResult(match, "king_of_the_hill"),
+      openChallenger: false,
+    };
+  }
+  if (next >= candidates.length) {
+    return {
+      holder,
+      challenger: null,
+      champion: holder,
+      state: "complete",
+      detail: "Champion",
+      openChallenger: false,
+    };
+  }
+  return {
+    holder,
+    challenger: candidates[next],
+    champion: null,
+    state: "pending",
+    detail: "Pending",
+    openChallenger: true,
+  };
+}
+
+function hillFromPairs(candidates, pairs) {
+  if (!candidates.length) {
+    return { holder: null, challenger: null, champion: null, state: "pending", detail: "Pending", openChallenger: true };
+  }
+  if (candidates.length === 1) {
+    return {
+      holder: candidates[0],
+      challenger: null,
+      champion: candidates[0],
+      state: "complete",
+      detail: "Champion",
+      openChallenger: false,
+    };
+  }
+  let holder = candidates[0];
+  let next = 1;
+  while (next < candidates.length) {
+    const challenger = candidates[next];
+    const row = findTaskPair(pairs, holder, challenger);
+    if (!row || row.status === "waiting") {
+      return {
+        holder,
+        challenger,
+        champion: null,
+        state: "pending",
+        detail: "Pending",
+        openChallenger: !row,
+      };
+    }
+    if (row.status === "judging") {
+      return {
+        holder,
+        challenger,
+        champion: null,
+        state: "active",
+        detail: "Judging",
+        openChallenger: false,
+      };
+    }
+    if (row.status === "failed") {
+      return {
+        holder,
+        challenger,
+        champion: null,
+        state: "incomplete",
+        detail: "Judgment failed",
+        openChallenger: false,
+      };
+    }
+    if (view.best_of > 1 && view.status === "running") {
+      const following = candidates[next + 1];
+      const advanced = following
+        ? (pairs || []).find((pair) =>
+            pair.model_b === following &&
+            (pair.model_a === holder || pair.model_a === challenger)
+          )
+        : null;
+      if (advanced) {
+        holder = advanced.model_a;
+        next += 1;
+        continue;
+      }
+      return {
+        holder,
+        challenger,
+        champion: null,
+        state: "active",
+        detail: "Judging",
+        openChallenger: false,
+      };
+    }
+    const winner = liveSeriesWinner(row);
+    if (!winner) {
+      return {
+        holder,
+        challenger,
+        champion: null,
+        state: "draw",
+        detail: "Draw",
+        openChallenger: false,
+      };
+    }
+    holder = winner;
+    next += 1;
+  }
+  return {
+    holder,
+    challenger: null,
+    champion: holder,
+    state: "complete",
+    detail: "Champion",
+    openChallenger: false,
+  };
+}
+
+function appendHillBoard(taskId, hill, multi) {
+  const board = document.getElementById("hill_board");
+  const block = document.createElement("div");
+  if (multi) {
+    const label = document.createElement("p");
+    label.className = "elim-task";
+    label.textContent = taskId;
+    block.append(label);
+  }
+  if (hill.champion) {
+    block.append(championLine(hill.champion));
+    board.append(block);
+    return;
+  }
+  const card = document.createElement("div");
+  card.className = "hill-card is-" + hill.state;
+  const holder = document.createElement("div");
+  holder.className = "hill-side";
+  const holderLabel = document.createElement("p");
+  holderLabel.className = "hill-label";
+  holderLabel.textContent = "Hill holder";
+  holder.append(holderLabel, elimSlot(hill.holder, hill.holder, !hill.holder));
+  const versus = document.createElement("span");
+  versus.className = "hill-vs";
+  versus.textContent = "vs";
+  const challenger = document.createElement("div");
+  challenger.className = "hill-side";
+  const challengerLabel = document.createElement("p");
+  challengerLabel.className = "hill-label";
+  challengerLabel.textContent = "Challenger";
+  challenger.append(
+    challengerLabel,
+    elimSlot(hill.challenger, null, hill.openChallenger || !hill.challenger)
+  );
+  card.append(holder, versus, challenger);
+  const detail = document.createElement("p");
+  detail.className = "elim-detail";
+  detail.style.gridColumn = "1 / -1";
+  detail.textContent = hill.detail;
+  card.append(detail);
+  block.append(card);
+  board.append(block);
+}
+
+function renderHillSection() {
+  const section = document.getElementById("hill_section");
+  const board = document.getElementById("hill_board");
+  if (!isKingOfTheHill()) {
+    section.hidden = true;
+    board.replaceChildren();
+    return;
+  }
+  section.hidden = false;
+  board.replaceChildren();
+  const tournament = view.tournament;
+  const recorded = tournament && tournament.format === "king_of_the_hill" && (tournament.tasks || []).some((task) => (task.matches || []).length || task.winner);
+  const lines = recorded ? (tournament.tasks || []).map((task) => {
+    if (task.winner) return task.task_id + ": " + task.winner + " won";
+    if (task.status === "draw") return task.task_id + ": draw, no winner";
+    if (task.status === "incomplete") return task.task_id + ": no winner";
+    return task.task_id + ": " + (task.status || "");
+  }) : [];
+  document.getElementById("hill_status").textContent = lines.length ? lines.join(" · ") : "";
+  if (recorded) {
+    const multi = tournament.tasks.length > 1;
+    tournament.tasks.forEach((task) => {
+      appendHillBoard(task.task_id, hillFromMatches(tournament.candidates || [], task.matches || []), multi);
+    });
+    return;
+  }
+  const groups = pairsByTask();
+  const candidates = candidateModels();
+  if (!groups.length) {
+    if (candidates.length) {
+      appendHillBoard("t1", hillFromPairs(candidates, []), false);
+      return;
+    }
+    document.getElementById("hill_status").textContent = view.status === "running" ? "" : "No matches were played.";
+    return;
+  }
+  const multi = groups.length > 1;
+  groups.forEach((group) => {
+    appendHillBoard(group.task_id, hillFromPairs(candidates, group.pairs), multi);
+  });
+}
+
 function renderBracket() {
   renderElimSection();
+  renderHillSection();
   const section = document.getElementById("bracket");
   const tournament = view && view.tournament;
   const series = tournament && tournament.best_of > 1;
-  if (isSingleElimination() || !tournament || !series) {
+  if (isSingleElimination() || isKingOfTheHill() || !tournament || !series) {
     section.hidden = true;
     return;
   }
@@ -2768,6 +3153,9 @@ document.getElementById("start").addEventListener("click", async () => {
     status("run_status", "Tasks JSON is invalid", false);
     return;
   }
+  const format = document.getElementById("tournament").value;
+  if (format === "king_of_the_hill") syncKothOrder();
+  const modelsPayload = format === "king_of_the_hill" ? kothOrder.slice() : [...selected];
   const response = await fetch("/api/runs", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -2775,11 +3163,11 @@ document.getElementById("start").addEventListener("click", async () => {
       provider,
       base_url: provider === "compatible" ? baseUrl() : "",
       api_key: apiKey(),
-      models: [...selected],
+      models: modelsPayload,
       judge: document.getElementById("judge").value || null,
       tasks,
       seed: document.getElementById("seed").value.trim() || "0",
-      tournament: document.getElementById("tournament").value,
+      tournament: format,
       best_of: Number(document.getElementById("best_of").value),
       opening_matchups: openingPayload(),
     }),
@@ -2789,6 +3177,7 @@ document.getElementById("start").addEventListener("click", async () => {
     status("run_status", body.error || "Failed to start", false);
     return;
   }
+  launchCandidates = modelsPayload.slice();
   showDashboard(body.run_id);
 });
 
@@ -3859,6 +4248,28 @@ mod tests {
     }
 
     #[test]
+    fn king_of_the_hill_preview_uses_the_first_ordered_matchup() {
+        let config = build_exec_config_with_format(
+            vec!["m2".into(), "m0".into(), "m1".into()],
+            Some("judge".into()),
+            vec![task()],
+            "https://example.test/v1".into(),
+            0,
+            TournamentFormat::KingOfTheHill,
+            tournament::DEFAULT_BEST_OF,
+            None,
+        )
+        .unwrap();
+        let live = LiveRun::from_config("koth".into(), &config);
+        let state = live.inner.try_lock().expect("lock");
+        assert_eq!(state.tournament_format, "king-of-the-hill");
+        assert_eq!(state.expected_pairs, 2);
+        assert_eq!(state.pairs.len(), 1);
+        assert_eq!(state.pairs[0].model_a, "m2");
+        assert_eq!(state.pairs[0].model_b, "m0");
+    }
+
+    #[test]
     fn custom_opening_matchups_preview_the_requested_pairs() {
         let config = build_exec_config_with_format(
             vec!["m0".into(), "m1".into(), "m2".into(), "m3".into()],
@@ -3991,14 +4402,22 @@ mod tests {
         assert!(!workbench.contains("elim_board"));
         assert!(PAGE.contains("id=\"elim_board\""));
         assert!(PAGE.contains("id=\"elim_section\""));
+        assert!(PAGE.contains("id=\"hill_board\""));
+        assert!(PAGE.contains("id=\"hill_section\""));
+        assert!(PAGE.contains("id=\"order_board\""));
+        assert!(PAGE.contains("king_of_the_hill"));
+        assert!(PAGE.contains("King of the Hill"));
         assert!(PAGE.contains("return \"Final\""));
         assert!(PAGE.contains("return \"Semifinals\""));
         assert!(PAGE.contains("return \"Quarterfinals\""));
         assert!(PAGE.contains("Champion"));
+        assert!(PAGE.contains("Hill holder"));
+        assert!(PAGE.contains("Challenger"));
         assert!(PAGE.contains("Pending"));
         assert!(PAGE.contains("Judging"));
         assert!(PAGE.contains("seeded fallback"));
         assert!(PAGE.contains("tie-break"));
+        assert!(PAGE.contains("remains"));
 
         let models = [
             ModelId::new("m0"),
@@ -4212,6 +4631,99 @@ mod tests {
         assert!(!stopped_text.contains("advances"));
     }
 
+    fn hill_board_text(tournament: &Tournament) -> String {
+        let mut text = String::new();
+        for task in &tournament.tasks {
+            let mut holder = tournament
+                .candidates
+                .first()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            let mut next = 1usize;
+            for row in &task.matches {
+                let challenger = tournament
+                    .candidates
+                    .get(next)
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "Pending".into());
+                let detail = match row.outcome {
+                    tournament::MatchOutcome::Winner => match &row.winner {
+                        Some(winner) => format!("{winner} remains"),
+                        None => "—".into(),
+                    },
+                    tournament::MatchOutcome::Draw => "Draw".into(),
+                    tournament::MatchOutcome::JudgmentFailed => "Judgment failed".into(),
+                    tournament::MatchOutcome::Incomplete => "Incomplete".into(),
+                };
+                text.push_str(&format!(
+                    "Hill holder {holder}\nChallenger {challenger}\n{detail}\n"
+                ));
+                if row.outcome == tournament::MatchOutcome::Winner
+                    && let Some(winner) = &row.winner
+                {
+                    holder = winner.to_string();
+                    next = next.saturating_add(1);
+                    continue;
+                }
+                break;
+            }
+            if let Some(winner) = &task.winner {
+                text.push_str(&format!("Champion {winner}\n"));
+            } else if next >= tournament.candidates.len() && !holder.is_empty() {
+                text.push_str(&format!("Champion {holder}\n"));
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn king_of_the_hill_board_shows_holder_challenger_and_champion() {
+        let models = [ModelId::new("m0"), ModelId::new("m1"), ModelId::new("m2")];
+        let preview = waiting_pairs(&[task()], &models, TournamentFormat::KingOfTheHill, None);
+        assert_eq!(preview.len(), 1);
+        assert_eq!(preview[0].model_a, "m0");
+        assert_eq!(preview[0].model_b, "m1");
+
+        let board = Tournament {
+            format: TournamentFormat::KingOfTheHill,
+            candidates: models.to_vec(),
+            status: tournament::TournamentStatus::Complete,
+            best_of: 1,
+            tasks: vec![tournament::TaskBracket {
+                task_id: "t1".into(),
+                status: tournament::TournamentStatus::Complete,
+                winner: Some(ModelId::new("m1")),
+                matches: vec![
+                    elim_match(
+                        1,
+                        "m0",
+                        "m1",
+                        Some("m1"),
+                        tournament::MatchOutcome::Winner,
+                        Vec::new(),
+                        false,
+                    ),
+                    elim_match(
+                        2,
+                        "m1",
+                        "m2",
+                        Some("m1"),
+                        tournament::MatchOutcome::Winner,
+                        Vec::new(),
+                        false,
+                    ),
+                ],
+            }],
+            opening_matchups: None,
+        };
+        let text = hill_board_text(&board);
+        assert!(text.contains("Hill holder m0\nChallenger m1\nm1 remains\n"));
+        assert!(text.contains("Hill holder m1\nChallenger m2\nm1 remains\n"));
+        assert!(text.contains("Champion m1\n"));
+        assert!(!text.contains("Semifinals"));
+        assert!(!text.contains("advances"));
+    }
+
     #[tokio::test]
     async fn start_run_rejects_single_elimination_without_a_power_of_two_field() {
         let state = Arc::new(AppState::new());
@@ -4232,6 +4744,32 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn king_of_the_hill_accepts_a_non_power_of_two_field() {
+        let config = build_exec_config_with_format(
+            vec!["m0".into(), "m1".into(), "m2".into()],
+            Some("judge".into()),
+            vec![task()],
+            "https://example.test/v1".into(),
+            0,
+            TournamentFormat::KingOfTheHill,
+            tournament::DEFAULT_BEST_OF,
+            None,
+        );
+        assert!(config.is_ok());
+        let rejected = build_exec_config_with_format(
+            vec!["m0".into(), "m1".into(), "m2".into()],
+            Some("judge".into()),
+            vec![task()],
+            "https://example.test/v1".into(),
+            0,
+            TournamentFormat::SingleElimination,
+            tournament::DEFAULT_BEST_OF,
+            None,
+        );
+        assert!(rejected.is_err());
     }
 
     #[tokio::test]
