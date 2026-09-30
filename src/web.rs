@@ -1702,11 +1702,11 @@ tr.detail-row td {
       <dd id="ov_format">—</dd>
     </div>
     <div>
-      <dt>Resolved</dt>
+      <dt>Resolved games</dt>
       <dd id="ov_resolved" class="num">0</dd>
     </div>
     <div>
-      <dt>Failed</dt>
+      <dt>Failed games</dt>
       <dd id="ov_failed" class="num">0</dd>
     </div>
   </dl>
@@ -1724,8 +1724,8 @@ tr.detail-row td {
     </div>
     <div>
       <div class="section-line">
-        <h2>Pairs</h2>
-        <p id="pair_label" class="meta">0 / 0 pairs</p>
+        <h2>Games</h2>
+        <p id="pair_label" class="meta">0 / 0 games</p>
       </div>
       <div class="bar"><span id="pair_bar"></span></div>
     </div>
@@ -1740,7 +1740,7 @@ tr.detail-row td {
     <p id="hill_status" class="meta"></p>
     <div id="hill_board" class="hill-board"></div>
   </div>
-  <h2 class="results-title">Pairwise evaluation</h2>
+  <h2 class="results-title">Judged games</h2>
   <div class="results table-scroll">
     <table class="sheet pairs">
       <colgroup>
@@ -1754,7 +1754,7 @@ tr.detail-row td {
           <th>Status</th>
           <th>Task</th>
           <th>Models</th>
-          <th>Outcome</th>
+          <th>Latest game</th>
         </tr>
       </thead>
       <tbody id="pair_list"></tbody>
@@ -1769,7 +1769,7 @@ tr.detail-row td {
           <tr>
             <th>Task</th>
             <th>Round</th>
-            <th>Match</th>
+            <th>Series</th>
             <th>Result</th>
           </tr>
         </thead>
@@ -2159,7 +2159,7 @@ function findPair(taskId, modelA, modelB) {
 function decisionText(decision, modelA, modelB) {
   if (decision === "a") return modelA + " wins";
   if (decision === "b") return modelB + " wins";
-  if (decision === "draw") return "Draw";
+  if (decision === "draw") return "Game draw";
   return decision || "—";
 }
 
@@ -2173,7 +2173,7 @@ function compactOutcome(row) {
   } else if (row.status === "judging") {
     text = "Judging";
   }
-  if (row.games > 1) text += " · " + row.games + " games";
+  if (row.games > 1) text += " · " + row.games + " games judged";
   return text;
 }
 
@@ -2276,7 +2276,7 @@ function pairDetail(row) {
   appendField(dl, "Model B", row.model_b, true);
   if (row.judgment) {
     const j = row.judgment;
-    appendField(dl, "Final winner", decisionText(j.winner, j.model_a, j.model_b), true);
+    appendField(dl, "Game winner", decisionText(j.winner, j.model_a, j.model_b), true);
     appendField(dl, "Agreement", j.agreement ? "agree" : "disagree", false);
     appendField(dl, "Duration", j.duration_ms + " ms", true);
     appendField(dl, "Judge", j.judge_model, true);
@@ -2382,7 +2382,7 @@ function renderDash() {
   const pairDone = view.resolved_pairs + view.failed_pairs;
   const pairTotal = view.expected_pairs;
   document.getElementById("pair_bar").style.width = pairTotal ? (100 * pairDone / pairTotal) + "%" : "0%";
-  document.getElementById("pair_label").textContent = pairDone + " / " + pairTotal + " pairs";
+  document.getElementById("pair_label").textContent = pairDone + " / " + pairTotal + " games";
   const list = document.getElementById("pair_list");
   list.replaceChildren();
   view.pairs.forEach((row) => {
@@ -2488,7 +2488,7 @@ function liveDetail(row, state) {
   if (!row || state === "pending") return "Pending";
   if (state === "active") return "Judging";
   if (state === "incomplete") return "Judgment failed";
-  if (state === "draw") return "Draw";
+  if (state === "draw") return "Series draw";
   const winner = liveSeriesWinner(row);
   if (!winner) return "Pending";
   const games = row.games || 1;
@@ -2653,12 +2653,7 @@ function renderElimSection() {
   board.replaceChildren();
   const tournament = view.tournament;
   const recorded = tournament && tournament.format === "single_elimination" && (tournament.tasks || []).some((task) => (task.matches || []).length);
-  const lines = recorded ? (tournament.tasks || []).map((task) => {
-    if (task.winner) return task.task_id + ": " + task.winner + " won";
-    if (task.status === "draw") return task.task_id + ": draw, no winner";
-    if (task.status === "incomplete") return task.task_id + ": no winner";
-    return task.task_id + ": " + (task.status || "");
-  }) : [];
+  const lines = recorded ? (tournament.tasks || []).map((task) => taskStatusLine(task, "single_elimination")) : [];
   document.getElementById("elim_status").textContent = lines.length ? lines.join(" · ") : "";
   if (recorded) {
     const multi = tournament.tasks.length > 1;
@@ -2681,6 +2676,18 @@ function renderElimSection() {
   });
 }
 
+function taskStatusLine(task, format) {
+  if (task.winner) {
+    if (format === "king_of_the_hill" || format === "king-of-the-hill") {
+      return task.task_id + ": " + task.winner + " holds the hill";
+    }
+    return task.task_id + ": " + task.winner + " won";
+  }
+  if (task.status === "draw") return task.task_id + ": series draw, no winner";
+  if (task.status === "incomplete") return task.task_id + ": no winner";
+  return task.task_id + ": " + (task.status || "");
+}
+
 function matchResult(match, format) {
   let text = "—";
   const elimination = format === true || format === "single_elimination" || format === "single-elimination";
@@ -2688,7 +2695,7 @@ function matchResult(match, format) {
   if (match.outcome === "winner" && match.winner) {
     text = match.winner + (elimination ? " advances" : hill ? " remains" : " won");
   } else if (match.outcome === "draw") {
-    text = "Draw";
+    text = "Series draw";
   } else if (match.outcome === "judgment_failed") {
     text = "Judgment failed";
   } else if (match.outcome === "incomplete") {
@@ -2848,7 +2855,7 @@ function hillFromPairs(candidates, pairs) {
         challenger,
         champion: null,
         state: "draw",
-        detail: "Draw",
+        detail: "Series draw",
         openChallenger: false,
       };
     }
@@ -2921,12 +2928,7 @@ function renderHillSection() {
   board.replaceChildren();
   const tournament = view.tournament;
   const recorded = tournament && tournament.format === "king_of_the_hill" && (tournament.tasks || []).some((task) => (task.matches || []).length || task.winner);
-  const lines = recorded ? (tournament.tasks || []).map((task) => {
-    if (task.winner) return task.task_id + ": " + task.winner + " won";
-    if (task.status === "draw") return task.task_id + ": draw, no winner";
-    if (task.status === "incomplete") return task.task_id + ": no winner";
-    return task.task_id + ": " + (task.status || "");
-  }) : [];
+  const lines = recorded ? (tournament.tasks || []).map((task) => taskStatusLine(task, "king_of_the_hill")) : [];
   document.getElementById("hill_status").textContent = lines.length ? lines.join(" · ") : "";
   if (recorded) {
     const multi = tournament.tasks.length > 1;
@@ -2963,15 +2965,10 @@ function renderBracket() {
   }
   section.hidden = false;
   document.getElementById("bracket_title").textContent = "Best of " + tournament.best_of;
-  const lines = (tournament.tasks || []).map((task) => {
-    if (task.winner) return task.task_id + ": " + task.winner + " won";
-    if (task.status === "draw") return task.task_id + ": draw, no winner";
-    if (task.status === "incomplete") return task.task_id + ": no winner";
-    return task.task_id + ": " + (task.status || "");
-  });
+  const lines = (tournament.tasks || []).map((task) => taskStatusLine(task, tournament.format));
   document.getElementById("bracket_status").textContent = lines.length
     ? lines.join(" · ")
-    : "No matches were played.";
+    : "No series were played.";
   const body = document.getElementById("bracket_list");
   body.replaceChildren();
   (tournament.tasks || []).forEach((task) => {
@@ -4336,7 +4333,7 @@ mod tests {
                 Some(winner) => format!("{winner} advances"),
                 None => "—".to_string(),
             },
-            tournament::MatchOutcome::Draw => "Draw".to_string(),
+            tournament::MatchOutcome::Draw => "Series draw".to_string(),
             tournament::MatchOutcome::JudgmentFailed => "Judgment failed".to_string(),
             tournament::MatchOutcome::Incomplete => "Incomplete".to_string(),
         };
@@ -4600,7 +4597,7 @@ mod tests {
             opening_matchups: None,
         };
         let drawn_text = board_text(&drawn);
-        assert!(drawn_text.contains("Final\nm0 vs m1\nDraw\n"));
+        assert!(drawn_text.contains("Final\nm0 vs m1\nSeries draw\n"));
         assert!(!drawn_text.contains("Champion"));
         assert!(!drawn_text.contains("advances"));
 
@@ -4651,7 +4648,7 @@ mod tests {
                         Some(winner) => format!("{winner} remains"),
                         None => "—".into(),
                     },
-                    tournament::MatchOutcome::Draw => "Draw".into(),
+                    tournament::MatchOutcome::Draw => "Series draw".into(),
                     tournament::MatchOutcome::JudgmentFailed => "Judgment failed".into(),
                     tournament::MatchOutcome::Incomplete => "Incomplete".into(),
                 };

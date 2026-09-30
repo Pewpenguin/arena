@@ -24,7 +24,7 @@ pub enum Error {
     DuplicateModel(ModelId),
     #[error("judge model is also a candidate: {0}")]
     JudgeIsCandidate(ModelId),
-    #[error("incomplete run: {0} judgment pair(s) failed")]
+    #[error("incomplete run: {0} judgment(s) failed")]
     IncompleteJudgments(usize),
     #[error(
         "inconsistent pair coverage: expected {expected}, resolved {resolved}, failed {failed}"

@@ -185,7 +185,7 @@ where
         },
         |judgment| {
             if let Some(judges) = &judges {
-                judges.set_message(format!("task {}  judge", judgment.task_id));
+                judges.set_message(format!("task {}  judge game", judgment.task_id));
                 judges.println(format!(
                     "judge  {}  {} vs {}  {}ms",
                     judgment.task_id, judgment.model_a, judgment.model_b, judgment.duration_ms

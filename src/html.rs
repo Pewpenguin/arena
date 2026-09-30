@@ -177,7 +177,7 @@ fn decision(value: &JudgeDecision) -> &'static str {
     match value {
         JudgeDecision::A => "A",
         JudgeDecision::B => "B",
-        JudgeDecision::Draw => "Draw",
+        JudgeDecision::Draw => "Game draw",
     }
 }
 
@@ -307,9 +307,9 @@ fn push_header(
             (Some(resolved), Some(expected)) => format!("{resolved} / {expected}"),
             _ => String::new(),
         };
-        metric(html, "Pairs", &pairs);
+        metric(html, "Games", &pairs);
         if let Some(failed) = summary.failed_pairs {
-            metric(html, "Failed pairs", &failed.to_string());
+            metric(html, "Failed games", &failed.to_string());
         }
         let agreement = match (summary.orientation_agreeing_pairs, summary.resolved_pairs) {
             (Some(agreeing), Some(resolved)) => format!("{agreeing} / {resolved}"),
@@ -340,7 +340,7 @@ fn push_models(html: &mut String, models: &[ModelReport<'_>], judge_used: bool) 
     html.push_str("<section>\n<h2>Models</h2>\n");
     if judge_used {
         html.push_str(
-            "<p class=\"note\">Bradley–Terry rating · derived from resolved pairwise judgments</p>\n",
+            "<p class=\"note\">Bradley–Terry rating · derived from resolved judged games (W/L/D are per game)</p>\n",
         );
         html.push_str("<div class=\"scroll\"><table>\n<thead><tr>");
         html.push_str(
@@ -428,15 +428,15 @@ fn push_tournament(html: &mut String, tournament: &Tournament) {
     }
     html.push_str("</h2>\n<p class=\"note\">");
     html.push_str(if elimination && series {
-        "Each match is a best-of series. The winner advances. A drawn series plays up to three tie-breaks, then a seeded fallback."
+        "Each match is a best-of series. The winner advances. A drawn series plays up to three tie-break games, then a seeded fallback (not a judged win)."
     } else if elimination {
-        "Match winners advance. A drawn series plays up to three tie-breaks, then a seeded fallback."
+        "Match winners advance. A drawn series plays up to three tie-break games, then a seeded fallback (not a judged win)."
     } else if hill && series {
-        "Candidates challenge in configured order. Each match is a best-of series. The winner remains on the hill. A drawn series plays up to three tie-breaks, then a seeded fallback."
+        "Candidates challenge in configured order. Each match is a best-of series. The winner remains on the hill. A drawn series plays up to three tie-break games, then a seeded fallback (not a judged win)."
     } else if hill {
-        "Candidates challenge in configured order. The winner remains on the hill. A drawn series plays up to three tie-breaks, then a seeded fallback."
+        "Candidates challenge in configured order. The winner remains on the hill. A drawn series plays up to three tie-break games, then a seeded fallback (not a judged win)."
     } else {
-        "Each pair plays one series. Draws do not count as wins."
+        "Each pairing plays one best-of series. Series draws do not count as wins."
     });
     html.push_str("</p>\n");
     if let Some(opening) = &tournament.opening_matchups {
@@ -457,7 +457,7 @@ fn push_tournament(html: &mut String, tournament: &Tournament) {
     }
     for task in &tournament.tasks {
         html.push_str("<p>");
-        html.push_str(&escape(&task_result(task)));
+        html.push_str(&escape(&task_result(task, tournament.format)));
         html.push_str("</p>\n");
     }
     html.push_str("<div class=\"scroll\"><table>\n<thead><tr>");
@@ -481,13 +481,16 @@ fn push_tournament(html: &mut String, tournament: &Tournament) {
     html.push_str("</tbody></table></div>\n</section>\n");
 }
 
-fn task_result(task: &TaskBracket) -> String {
+fn task_result(task: &TaskBracket, format: TournamentFormat) -> String {
     match task.status {
         TournamentStatus::Complete => match &task.winner {
+            Some(winner) if format == TournamentFormat::KingOfTheHill => {
+                format!("{}: {winner} holds the hill", task.task_id)
+            }
             Some(winner) => format!("{}: {winner} won", task.task_id),
             None => format!("{}: complete", task.task_id),
         },
-        TournamentStatus::Draw => format!("{}: draw, no winner", task.task_id),
+        TournamentStatus::Draw => format!("{}: series draw, no winner", task.task_id),
         TournamentStatus::Incomplete => format!("{}: no winner", task.task_id),
         TournamentStatus::NotJudged => format!("{}: not judged", task.task_id),
     }
@@ -505,7 +508,7 @@ fn match_result(row: &crate::tournament::TournamentMatch, format: TournamentForm
             Some(winner) => format!("{winner} won"),
             None => "Winner".to_string(),
         },
-        MatchOutcome::Draw => "Draw".to_string(),
+        MatchOutcome::Draw => "Series draw".to_string(),
         MatchOutcome::JudgmentFailed => "Judgment failed".to_string(),
         MatchOutcome::Incomplete => "Incomplete".to_string(),
     };
@@ -531,9 +534,9 @@ fn match_result(row: &crate::tournament::TournamentMatch, format: TournamentForm
 }
 
 fn push_pairs(html: &mut String, pairs: &[PairRow<'_>]) {
-    html.push_str("<section>\n<h2>Pairwise results</h2>\n");
+    html.push_str("<section>\n<h2>Judged games</h2>\n");
     html.push_str(
-        "<p class=\"note\">Resolved judgments are the primary observations. AB and BA winners are mapped into the original A/B model identities. Orientation disagreement is recorded, not interpreted as position bias.</p>\n",
+        "<p class=\"note\">Each card is one judged game for a model pairing (AB and BA orientations combined). Series outcomes for Best-of-N and elimination contests appear in the tournament section above when present.</p>\n",
     );
     if pairs.is_empty() {
         html.push_str("<p>No resolved judgments.</p>\n</section>\n");
@@ -560,7 +563,7 @@ fn push_pairs(html: &mut String, pairs: &[PairRow<'_>]) {
         html.push_str("<div class=\"outcome\"><span class=\"k\">BA</span><span class=\"v\">");
         html.push_str(&opt_decision(pair.orientation_ba.as_ref()));
         html.push_str("</span></div>");
-        html.push_str("<div class=\"outcome\"><span class=\"k\">Final</span><span class=\"v\">");
+        html.push_str("<div class=\"outcome\"><span class=\"k\">Game</span><span class=\"v\">");
         html.push_str(decision(&pair.winner));
         html.push_str("</span></div></div>\n");
         html.push_str("<details><summary>Reasons</summary>\n<p><strong>AB</strong><br>");
@@ -591,7 +594,7 @@ fn push_audit(html: &mut String, pairs: &[PairRow<'_>]) {
         dt_dd(html, "Task ID", &escape(pair.task_id));
         dt_dd(html, "Model A", &escape(&pair.model_a.to_string()));
         dt_dd(html, "Model B", &escape(&pair.model_b.to_string()));
-        dt_dd(html, "Final winner", decision(&pair.winner));
+        dt_dd(html, "Game winner", decision(&pair.winner));
         dt_dd(
             html,
             "Orientation agreement",
@@ -624,7 +627,7 @@ fn push_audit(html: &mut String, pairs: &[PairRow<'_>]) {
 fn push_failures(html: &mut String, failures: &[FailedPairRow<'_>]) {
     html.push_str("<section class=\"failures\">\n<h2>Failed judgments</h2>\n");
     html.push_str(
-        "<p class=\"note\">These pairs did not produce a resolved judgment and are not mixed into the pairwise results above.</p>\n",
+        "<p class=\"note\">These games did not produce a resolved judgment and are not mixed into the judged-game results above.</p>\n",
     );
     for failure in failures {
         html.push_str("<article>\n<dl>\n");
@@ -917,7 +920,7 @@ mod tests {
         assert!(html.contains("1 / 1"));
         assert!(html.contains("Orientation agreement"));
         assert!(html.contains("100%"));
-        assert!(html.contains("Pairwise results"));
+        assert!(html.contains("Judged games"));
         assert!(html.contains("m0"));
         assert!(html.contains("m1"));
         assert!(!html.contains("https://cdn"));
@@ -950,7 +953,7 @@ mod tests {
         assert!(html.contains("Candidate responses"));
         assert!(html.contains("Run configuration"));
         assert!(!html.contains("Orientation agreement"));
-        assert!(!html.contains("Pairwise results"));
+        assert!(!html.contains("Judged games"));
         assert!(!html.contains("Failed judgments"));
         assert!(!html.contains("Bootstrap"));
         assert!(!html.contains("no_comparisons"));
@@ -1040,7 +1043,7 @@ mod tests {
         assert!(html.contains("t2"));
         assert!(html.contains("invalid_json"));
         assert!(html.contains("class=\"failures\""));
-        let pairwise = html.find("Pairwise results").unwrap();
+        let pairwise = html.find("Judged games").unwrap();
         let failed = html.find("Failed judgments").unwrap();
         assert!(pairwise < failed);
     }
@@ -1108,8 +1111,8 @@ mod tests {
         let html = render_output(&data);
         assert!(html.contains("AB"));
         assert!(html.contains("BA"));
-        assert!(html.contains("Final"));
-        assert!(html.contains("Draw"));
+        assert!(html.contains("Game"));
+        assert!(html.contains("Game draw"));
         assert!(html.contains("orientation disagreement"));
         assert!(html.contains("a &lt; b &amp; c"));
         assert!(html.contains("&lt;/pre&gt;&lt;script&gt;alert(1)&lt;/script&gt;"));
@@ -1253,7 +1256,9 @@ mod tests {
         assert!(html.contains("rating unavailable"));
         assert!(html.contains("interval unavailable"));
         assert!(html.contains("no_comparisons"));
-        assert!(html.contains("Bradley–Terry rating · derived from resolved pairwise judgments"));
+        assert!(html.contains(
+            "Bradley–Terry rating · derived from resolved judged games (W/L/D are per game)"
+        ));
     }
 
     #[test]

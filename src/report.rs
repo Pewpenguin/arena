@@ -709,8 +709,8 @@ mod tests {
         let html = crate::html::render(&report);
         assert!(html.contains("single-elimination"));
         assert!(html.contains("Single-elimination"));
-        assert!(html.contains("t1: draw, no winner"));
-        assert!(html.contains("Draw"));
+        assert!(html.contains("t1: series draw, no winner"));
+        assert!(html.contains("Series draw"));
         assert!(html.contains("m0"));
         assert!(html.contains("m1"));
         assert!(html.contains("Best of"));
@@ -925,7 +925,7 @@ mod tests {
         let html = crate::html::render(&report);
         assert!(html.contains("king-of-the-hill"));
         assert!(html.contains("King of the Hill"));
-        assert!(html.contains("t1: m0 won"));
+        assert!(html.contains("t1: m0 holds the hill"));
         assert!(html.contains("m0 remains"));
         assert!(html.contains("configured order"));
     }
