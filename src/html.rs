@@ -10,6 +10,11 @@ use crate::tournament::{
 };
 
 pub fn render(report: &Report<'_>) -> String {
+    render_with_nav(report, None)
+}
+
+/// Same report as [`render`], with an optional back link for the web workbench.
+pub fn render_with_nav(report: &Report<'_>, back_href: Option<&str>) -> String {
     let mut html = String::new();
     html.push_str("<!doctype html>\n");
     html.push_str("<html lang=\"en\">\n<head>\n");
@@ -20,6 +25,11 @@ pub fn render(report: &Report<'_>) -> String {
     html.push_str(STYLE);
     html.push_str("</style>\n</head>\n<body>\n");
     html.push_str("<main>\n");
+    if let Some(href) = back_href {
+        html.push_str("<p class=\"nav\"><a href=\"");
+        html.push_str(&escape(href));
+        html.push_str("\">← Back to workbench</a></p>\n");
+    }
     push_header(
         &mut html,
         &report.summary,
@@ -75,6 +85,13 @@ main {
   margin: 0 auto;
   padding: 1.5rem 1.25rem 3rem;
 }
+.nav { margin: 0 0 1rem; }
+.nav a {
+  color: var(--muted);
+  text-decoration: none;
+  font-size: .9rem;
+}
+.nav a:hover { color: var(--fg); }
 h1, h2, h3 { font-weight: 650; letter-spacing: -0.02em; }
 h1 { font-size: 1.7rem; margin: 0 0 .35rem; }
 h2 { font-size: 1.15rem; margin: 0 0 .75rem; }
