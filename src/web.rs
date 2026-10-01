@@ -904,12 +904,8 @@ async fn render_live_run_report(
             "no saved experiment for this run".into(),
         ));
     };
-    let output = persist::read(&path).map_err(|error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            error.to_string(),
-        )
-    })?;
+    let output = persist::read(&path)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(html::render(&report::from_output(&output)))
 }
 
@@ -1783,7 +1779,7 @@ tr.detail-row td {
   <div class="experiment">
   <p id="dash_error" class="status error"></p>
   <p id="report_actions" class="report-actions" hidden>
-    <a id="view_report" class="report-link" href="#" target="_blank" rel="noopener">View report</a>
+    <a id="view_report" class="report-link" target="_blank" rel="noopener">View report</a>
   </p>
   <h2>Experiment</h2>
   <dl class="facts">
@@ -2472,7 +2468,7 @@ function renderDash() {
   if (canViewReport) {
     viewReport.href = "/api/runs/" + encodeURIComponent(view.run_id) + "/report";
   } else {
-    viewReport.href = "#";
+    viewReport.removeAttribute("href");
   }
   document.getElementById("ov_candidates").textContent = String(view.candidate_count || 0);
   renderCandidates();
@@ -4109,7 +4105,9 @@ mod tests {
         assert!(!html.contains(SECRET_API_KEY));
 
         let live = state.run.lock().await.clone().unwrap();
-        let served = render_live_run_report(&live).await.expect("completed report");
+        let served = render_live_run_report(&live)
+            .await
+            .expect("completed report");
         assert_eq!(served, html);
         assert!(served.contains("Arena experiment report"));
         assert!(!served.contains(SECRET_API_KEY));
@@ -4143,7 +4141,9 @@ mod tests {
             other => panic!("expected snapshot, got {other:?}"),
         }
 
-        let served = render_live_run_report(&live).await.expect("incomplete report");
+        let served = render_live_run_report(&live)
+            .await
+            .expect("incomplete report");
         let output = persist::read(web_output_path(&dir, &run_id)).unwrap();
         assert_eq!(output.run.complete, Some(false));
         assert_eq!(served, html::render(&report::from_output(&output)));
@@ -4185,7 +4185,9 @@ mod tests {
     async fn running_live_run_report_conflicts() {
         let live = live_run("running-report", &["m0", "m1"], Some("judge"));
         assert!(live.is_running());
-        let error = render_live_run_report(&live).await.expect_err("still running");
+        let error = render_live_run_report(&live)
+            .await
+            .expect_err("still running");
         assert_eq!(error.0, StatusCode::CONFLICT);
     }
 
