@@ -1,7 +1,10 @@
 use std::convert::Infallible;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path as FilePath, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Json;
 use axum::Router;
@@ -283,8 +286,33 @@ impl AppState {
         }
     }
 
-    fn alloc_id(&self) -> String {
-        self.next_run.fetch_add(1, Ordering::Relaxed).to_string()
+    fn alloc_id(&self, output_dir: &FilePath) -> String {
+        allocate_web_run_id(output_dir, &self.next_run)
+    }
+}
+
+fn unix_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
+fn format_web_run_id(millis: u128, pid: u32, seq: u64) -> String {
+    format!("{millis}-{pid}-{seq}")
+}
+
+fn allocate_web_run_id(dir: &FilePath, counter: &AtomicU64) -> String {
+    allocate_web_run_id_with(dir, counter, unix_millis(), std::process::id())
+}
+
+fn allocate_web_run_id_with(dir: &FilePath, counter: &AtomicU64, millis: u128, pid: u32) -> String {
+    loop {
+        let seq = counter.fetch_add(1, Ordering::Relaxed);
+        let id = format_web_run_id(millis, pid, seq);
+        if !web_output_path(dir, &id).exists() {
+            return id;
+        }
     }
 }
 
@@ -762,7 +790,15 @@ fn write_experiment(path: &FilePath, output: &persist::Output) -> std::result::R
     {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    persist::write(path, output).map_err(|error| error.to_string())
+    let json = persist::to_pretty_json(output).map_err(|error| error.to_string())?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    file.write_all(json.as_bytes())
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 async fn start_experiment<P>(
@@ -779,7 +815,7 @@ where
         if slot.as_ref().is_some_and(|run| run.is_running()) {
             return Err(StartRunError::Busy);
         }
-        let id = state.alloc_id();
+        let id = state.alloc_id(&output_dir);
         let live = Arc::new(LiveRun::from_config(id, &config));
         *slot = Some(live.clone());
         live
@@ -3434,8 +3470,68 @@ mod tests {
         .await
         .unwrap();
         assert!(!run_id.is_empty());
+        assert!(
+            run_id.chars().all(|ch| ch.is_ascii_digit() || ch == '-'),
+            "{run_id}"
+        );
+        assert_eq!(run_id.matches('-').count(), 2, "{run_id}");
         let live = state.run.lock().await.clone().unwrap();
         assert_eq!(live.id, run_id);
+    }
+
+    #[test]
+    fn web_run_ids_skip_existing_files_after_counter_reset() {
+        let dir = test_output_dir("id-skip");
+        let taken = format_web_run_id(1_700_000_000_000, 42, 1);
+        std::fs::write(web_output_path(&dir, &taken), "{}").unwrap();
+
+        // Restarted process: counter starts at 1 again with the same millis/pid.
+        let counter = AtomicU64::new(1);
+        let id = allocate_web_run_id_with(&dir, &counter, 1_700_000_000_000, 42);
+        assert_eq!(id, format_web_run_id(1_700_000_000_000, 42, 2));
+        assert!(!web_output_path(&dir, &id).exists());
+    }
+
+    #[test]
+    fn successive_web_run_ids_differ() {
+        let dir = test_output_dir("id-unique");
+        let state = AppState::new();
+        let first = state.alloc_id(&dir);
+        let second = state.alloc_id(&dir);
+        assert_ne!(first, second);
+        for id in [&first, &second] {
+            assert!(
+                id.chars().all(|ch| ch.is_ascii_digit() || ch == '-'),
+                "{id}"
+            );
+            assert_eq!(id.matches('-').count(), 2, "{id}");
+        }
+    }
+
+    #[test]
+    fn write_experiment_does_not_overwrite_existing_file() {
+        let dir = test_output_dir("no-overwrite");
+        let path = web_output_path(&dir, "kept");
+        std::fs::write(&path, "original").unwrap();
+        let output = persist::Output {
+            run: persist::RunMetadata::new(
+                vec![ModelId::new("m0")],
+                None,
+                None,
+                "2026-01-02T03:04:05Z".into(),
+                "https://example.test/v1",
+            ),
+            tasks: vec![],
+            results: vec![],
+            comparisons: vec![],
+            judgments: None,
+            judgment_failures: None,
+            statistics: None,
+            ratings: None,
+            tournament: None,
+        };
+        assert!(write_experiment(&path, &output).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
     }
 
     #[tokio::test]
