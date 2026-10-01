@@ -481,7 +481,7 @@ fn push_tournament(html: &mut String, tournament: &Tournament) {
     html.push_str("</tbody></table></div>\n</section>\n");
 }
 
-fn task_result(task: &TaskBracket, format: TournamentFormat) -> String {
+pub(crate) fn task_result(task: &TaskBracket, format: TournamentFormat) -> String {
     match task.status {
         TournamentStatus::Complete => match &task.winner {
             Some(winner) if format == TournamentFormat::KingOfTheHill => {
@@ -496,7 +496,7 @@ fn task_result(task: &TaskBracket, format: TournamentFormat) -> String {
     }
 }
 
-fn match_result(row: &crate::tournament::TournamentMatch, format: TournamentFormat) -> String {
+pub(crate) fn match_result(row: &crate::tournament::TournamentMatch, format: TournamentFormat) -> String {
     let text = match row.outcome {
         MatchOutcome::Winner => match &row.winner {
             Some(winner) if format == TournamentFormat::SingleElimination => {

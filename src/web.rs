@@ -21,11 +21,13 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::error::{Error, Result};
 use crate::event::ExperimentEvent;
 use crate::exec::{self, ExecConfig};
+use crate::html;
 use crate::judge::{Judgment, JudgmentFailure};
 use crate::persist;
 use crate::provider::{
     AnthropicProvider, GeminiProvider, ModelId, ModelProvider, OpenAICompatibleProvider,
 };
+use crate::report;
 use crate::task::{self, Task};
 use crate::tournament::{self, OpeningMatchup, Tournament, TournamentFormat};
 
@@ -661,6 +663,7 @@ fn router_with_state(state: Arc<AppState>) -> Router {
         .route("/api/models", post(load_models))
         .route("/api/runs", post(start_run))
         .route("/api/runs/{run_id}/events", get(run_events))
+        .route("/api/runs/{run_id}/report", get(run_report))
         .with_state(state)
 }
 
@@ -863,6 +866,51 @@ async fn run_events(State(state): State<Arc<AppState>>, Path(run_id): Path<Strin
         return json_error(StatusCode::NOT_FOUND, "run not found");
     };
     sse_stream(live).into_response()
+}
+
+async fn run_report(State(state): State<Arc<AppState>>, Path(run_id): Path<String>) -> Response {
+    let live = state.run.lock().await.clone();
+    let Some(live) = live.filter(|run| run.id == run_id) else {
+        return json_error(StatusCode::NOT_FOUND, "run not found");
+    };
+    match render_live_run_report(&live).await {
+        Ok(body) => Html(body).into_response(),
+        Err((status, message)) => json_error(status, message),
+    }
+}
+
+async fn render_live_run_report(
+    live: &LiveRun,
+) -> std::result::Result<String, (StatusCode, String)> {
+    let (status, output_path) = {
+        let inner = live.inner.lock().await;
+        (inner.status, inner.output_path.clone())
+    };
+    match status {
+        RunStatus::Running => {
+            return Err((StatusCode::CONFLICT, "run is still in progress".into()));
+        }
+        RunStatus::Failed => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                "no saved experiment for this run".into(),
+            ));
+        }
+        RunStatus::Complete | RunStatus::Incomplete => {}
+    }
+    let Some(path) = output_path else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "no saved experiment for this run".into(),
+        ));
+    };
+    let output = persist::read(&path).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error.to_string(),
+        )
+    })?;
+    Ok(html::render(&report::from_output(&output)))
 }
 
 fn sse_stream(
@@ -1115,6 +1163,21 @@ button.primary {
   text-transform: uppercase;
 }
 button.primary:hover { background: #000; border-color: #000; }
+a.report-link {
+  display: inline-block;
+  margin: 8px 0 0;
+  padding: 8px 14px;
+  border: 1px solid var(--ink);
+  background: var(--ink);
+  color: var(--bg);
+  font-size: .72rem;
+  font-weight: 600;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  text-decoration: none;
+}
+a.report-link:hover { background: #000; border-color: #000; }
+.report-actions { margin: 0 0 12px; }
 button.text-button {
   padding: 0;
   border: 0;
@@ -1719,6 +1782,9 @@ tr.detail-row td {
   </header>
   <div class="experiment">
   <p id="dash_error" class="status error"></p>
+  <p id="report_actions" class="report-actions" hidden>
+    <a id="view_report" class="report-link" href="#" target="_blank" rel="noopener">View report</a>
+  </p>
   <h2>Experiment</h2>
   <dl class="facts">
     <div>
@@ -2396,6 +2462,18 @@ function renderDash() {
     note.textContent = "";
     note.className = "status error";
   }
+  const reportActions = document.getElementById("report_actions");
+  const viewReport = document.getElementById("view_report");
+  const canViewReport =
+    (view.status === "complete" || view.status === "incomplete") &&
+    !!view.output_path &&
+    !!view.run_id;
+  reportActions.hidden = !canViewReport;
+  if (canViewReport) {
+    viewReport.href = "/api/runs/" + encodeURIComponent(view.run_id) + "/report";
+  } else {
+    viewReport.href = "#";
+  }
   document.getElementById("ov_candidates").textContent = String(view.candidate_count || 0);
   renderCandidates();
   document.getElementById("ov_tasks").textContent = String(view.task_count || 0);
@@ -3072,6 +3150,7 @@ function applyEvent(msg) {
 function showDashboard(runId) {
   document.getElementById("config").hidden = true;
   document.getElementById("dashboard").hidden = false;
+  document.getElementById("report_actions").hidden = true;
   openPairs.clear();
   view = {
     run_id: runId,
@@ -4028,7 +4107,94 @@ mod tests {
         assert!(html.contains("m0"));
         assert!(html.contains("m1"));
         assert!(!html.contains(SECRET_API_KEY));
+
+        let live = state.run.lock().await.clone().unwrap();
+        let served = render_live_run_report(&live).await.expect("completed report");
+        assert_eq!(served, html);
+        assert!(served.contains("Arena experiment report"));
+        assert!(!served.contains(SECRET_API_KEY));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn incomplete_run_report_is_served_from_saved_output() {
+        let state = Arc::new(AppState::new());
+        let dir = test_output_dir("incomplete-report");
+        let config = build_exec_config(
+            vec!["m0".into(), "m1".into()],
+            Some("judge".into()),
+            vec![task()],
+            "https://example.test/v1".into(),
+            0,
+        )
+        .unwrap();
+        let run_id = start_experiment(state.clone(), config, FailJudge, dir.clone())
+            .await
+            .unwrap();
+        wait_until_idle(&state).await;
+
+        let live = state.run.lock().await.clone().unwrap();
+        match live.snapshot().await {
+            ClientEvent::Snapshot { snapshot } => {
+                assert_eq!(snapshot.status, RunStatus::Incomplete);
+                assert!(snapshot.output_path.is_some());
+                assert_eq!(snapshot.run_id, run_id);
+            }
+            other => panic!("expected snapshot, got {other:?}"),
+        }
+
+        let served = render_live_run_report(&live).await.expect("incomplete report");
+        let output = persist::read(web_output_path(&dir, &run_id)).unwrap();
+        assert_eq!(output.run.complete, Some(false));
+        assert_eq!(served, html::render(&report::from_output(&output)));
+        assert!(served.contains("INCOMPLETE"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn failed_run_without_saved_output_has_no_report() {
+        let state = Arc::new(AppState::new());
+        let dir = test_output_dir("failed-report");
+        let config = build_exec_config(
+            vec!["m0".into()],
+            None,
+            vec![task()],
+            "https://example.test/v1".into(),
+            0,
+        )
+        .unwrap();
+        start_experiment(state.clone(), config, FailProvider, dir.clone())
+            .await
+            .unwrap();
+        wait_until_idle(&state).await;
+
+        let live = state.run.lock().await.clone().unwrap();
+        match live.snapshot().await {
+            ClientEvent::Snapshot { snapshot } => {
+                assert_eq!(snapshot.status, RunStatus::Failed);
+                assert!(snapshot.output_path.is_none());
+            }
+            other => panic!("expected snapshot, got {other:?}"),
+        }
+        let error = render_live_run_report(&live).await.expect_err("no report");
+        assert_eq!(error.0, StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn running_live_run_report_conflicts() {
+        let live = live_run("running-report", &["m0", "m1"], Some("judge"));
+        assert!(live.is_running());
+        let error = render_live_run_report(&live).await.expect_err("still running");
+        assert_eq!(error.0, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn workbench_exposes_a_completed_report_link() {
+        assert!(PAGE.contains("id=\"report_actions\""));
+        assert!(PAGE.contains("id=\"view_report\""));
+        assert!(PAGE.contains("/api/runs/\" + encodeURIComponent(view.run_id) + \"/report\""));
+        assert!(PAGE.contains("View report"));
     }
 
     #[tokio::test]
