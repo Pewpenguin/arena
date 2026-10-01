@@ -1,5 +1,5 @@
 use std::convert::Infallible;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path as FilePath, PathBuf};
 use std::sync::Arc;
@@ -29,7 +29,7 @@ use crate::provider::{
 };
 use crate::report;
 use crate::task::{self, Task};
-use crate::tournament::{self, OpeningMatchup, Tournament, TournamentFormat};
+use crate::tournament::{self, OpeningMatchup, Tournament, TournamentFormat, TournamentStatus};
 
 const BIND_HOST: [u8; 4] = [127, 0, 0, 1];
 const WEB_OUTPUT_DIR: &str = "arena-web";
@@ -661,7 +661,7 @@ fn router_with_state(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(page))
         .route("/api/models", post(load_models))
-        .route("/api/runs", post(start_run))
+        .route("/api/runs", get(list_runs).post(start_run))
         .route("/api/runs/{run_id}/events", get(run_events))
         .route("/api/runs/{run_id}/report", get(run_report))
         .with_state(state)
@@ -669,6 +669,10 @@ fn router_with_state(state: Arc<AppState>) -> Router {
 
 async fn page() -> Html<&'static str> {
     Html(PAGE)
+}
+
+async fn list_runs() -> Response {
+    Json(list_saved_runs(FilePath::new(WEB_OUTPUT_DIR))).into_response()
 }
 
 async fn load_models(
@@ -786,6 +790,202 @@ fn web_output_path(dir: &FilePath, run_id: &str) -> PathBuf {
     dir.join(format!("{run_id}.json"))
 }
 
+fn is_safe_run_id(run_id: &str) -> bool {
+    !run_id.is_empty()
+        && run_id.len() <= 128
+        && !run_id.starts_with('.')
+        && run_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+}
+
+fn resolve_saved_run_path(
+    dir: &FilePath,
+    run_id: &str,
+) -> std::result::Result<PathBuf, (StatusCode, String)> {
+    if !is_safe_run_id(run_id) {
+        return Err((StatusCode::BAD_REQUEST, "invalid run id".into()));
+    }
+    let path = web_output_path(dir, run_id);
+    if !path.is_file() {
+        return Err((StatusCode::NOT_FOUND, "run not found".into()));
+    }
+    Ok(path)
+}
+
+/// Lightweight view of a saved experiment file for the history list.
+/// Only `run` and optional tournament summary fields are retained.
+#[derive(Debug, Deserialize)]
+struct HistoryDocument {
+    run: HistoryRunMeta,
+    #[serde(default)]
+    tournament: Option<HistoryTournamentMeta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryRunMeta {
+    models: Vec<ModelId>,
+    #[serde(default)]
+    judge: Option<ModelId>,
+    started_at: String,
+    #[serde(default)]
+    complete: Option<bool>,
+    #[serde(default)]
+    expected_pairs: Option<usize>,
+    #[serde(default)]
+    resolved_pairs: Option<usize>,
+    #[serde(default)]
+    failed_pairs: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryTournamentMeta {
+    format: TournamentFormat,
+    status: TournamentStatus,
+}
+
+#[derive(Debug, Serialize)]
+struct HistoryRun {
+    run_id: String,
+    started_at: String,
+    models: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    judge: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tournament_format: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tournament_status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    complete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_pairs: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolved_pairs: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failed_pairs: Option<usize>,
+    path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HistoryError {
+    file: String,
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HistoryList {
+    runs: Vec<HistoryRun>,
+    errors: Vec<HistoryError>,
+}
+
+fn read_history_document(path: &FilePath) -> std::result::Result<HistoryDocument, String> {
+    let contents = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    serde_json::from_str(&contents).map_err(|error| error.to_string())
+}
+
+fn history_run_from_document(run_id: &str, path: &FilePath, doc: HistoryDocument) -> HistoryRun {
+    HistoryRun {
+        run_id: run_id.to_string(),
+        started_at: doc.run.started_at,
+        models: doc.run.models.iter().map(ToString::to_string).collect(),
+        judge: doc.run.judge.map(|model| model.to_string()),
+        tournament_format: doc.tournament.as_ref().map(|item| item.format.as_str()),
+        tournament_status: doc.tournament.as_ref().map(|item| item.status.as_str()),
+        complete: doc.run.complete,
+        expected_pairs: doc.run.expected_pairs,
+        resolved_pairs: doc.run.resolved_pairs,
+        failed_pairs: doc.run.failed_pairs,
+        path: path.display().to_string(),
+    }
+}
+
+fn list_saved_runs(dir: &FilePath) -> HistoryList {
+    let mut runs = Vec::new();
+    let mut errors = Vec::new();
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return HistoryList { runs, errors };
+        }
+        Err(error) => {
+            errors.push(HistoryError {
+                file: dir.display().to_string(),
+                error: error.to_string(),
+            });
+            return HistoryList { runs, errors };
+        }
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                errors.push(HistoryError {
+                    file: dir.display().to_string(),
+                    error: error.to_string(),
+                });
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            errors.push(HistoryError {
+                file: path.display().to_string(),
+                error: "file name is not valid UTF-8".into(),
+            });
+            continue;
+        };
+        if !is_safe_run_id(stem) {
+            errors.push(HistoryError {
+                file: path.display().to_string(),
+                error: "run id is not a safe filename stem".into(),
+            });
+            continue;
+        }
+        let resolved = match resolve_saved_run_path(dir, stem) {
+            Ok(resolved) => resolved,
+            Err((_, message)) => {
+                errors.push(HistoryError {
+                    file: path.display().to_string(),
+                    error: message,
+                });
+                continue;
+            }
+        };
+        match read_history_document(&resolved) {
+            Ok(doc) => runs.push(history_run_from_document(stem, &resolved, doc)),
+            Err(error) => errors.push(HistoryError {
+                file: resolved.display().to_string(),
+                error,
+            }),
+        }
+    }
+
+    runs.sort_by(|left, right| {
+        right
+            .started_at
+            .cmp(&left.started_at)
+            .then_with(|| right.run_id.cmp(&left.run_id))
+    });
+    HistoryList { runs, errors }
+}
+
+fn render_saved_run_report(
+    dir: &FilePath,
+    run_id: &str,
+) -> std::result::Result<String, (StatusCode, String)> {
+    let path = resolve_saved_run_path(dir, run_id)?;
+    let output = persist::read(&path)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(html::render_with_nav(
+        &report::from_output(&output),
+        Some("/"),
+    ))
+}
+
 fn write_experiment(path: &FilePath, output: &persist::Output) -> std::result::Result<(), String> {
     if let Some(parent) = path
         .parent()
@@ -870,10 +1070,18 @@ async fn run_events(State(state): State<Arc<AppState>>, Path(run_id): Path<Strin
 
 async fn run_report(State(state): State<Arc<AppState>>, Path(run_id): Path<String>) -> Response {
     let live = state.run.lock().await.clone();
-    let Some(live) = live.filter(|run| run.id == run_id) else {
-        return json_error(StatusCode::NOT_FOUND, "run not found");
-    };
-    match render_live_run_report(&live).await {
+    if let Some(live) = live.filter(|run| run.id == run_id) {
+        match render_live_run_report(&live).await {
+            Ok(body) => return Html(body).into_response(),
+            Err((StatusCode::CONFLICT, message)) => {
+                return json_error(StatusCode::CONFLICT, message);
+            }
+            Err(_) => {
+                // Fall through to the saved file under arena-web/.
+            }
+        }
+    }
+    match render_saved_run_report(FilePath::new(WEB_OUTPUT_DIR), &run_id) {
         Ok(body) => Html(body).into_response(),
         Err((status, message)) => json_error(status, message),
     }
@@ -906,7 +1114,10 @@ async fn render_live_run_report(
     };
     let output = persist::read(&path)
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(html::render(&report::from_output(&output)))
+    Ok(html::render_with_nav(
+        &report::from_output(&output),
+        Some("/"),
+    ))
 }
 
 fn sse_stream(
@@ -1623,6 +1834,16 @@ tr.detail-row td {
 }
 .launch-action { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
 .launch-action .status { margin: 0; text-align: right; }
+.history-section {
+  margin-top: 28px;
+  padding-top: 20px;
+  border-top: 1px solid var(--line);
+}
+.history-section h2 { margin: 0 0 8px; }
+.history-section .sheet th,
+.history-section .sheet td { padding: 6px 12px 6px 0; vertical-align: top; }
+.history-section .sheet td.actions { white-space: nowrap; }
+.history-section a.report-link { margin: 0; }
 :focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; }
 @media (max-width: 800px) {
   .wrap { padding: 16px; }
@@ -1762,6 +1983,29 @@ tr.detail-row td {
   </div>
 </section>
 </div>
+
+<section class="history-section" id="history_section">
+  <h2>History</h2>
+  <p id="history_status" class="status">Loading saved runs…</p>
+  <p id="history_errors" class="status error" hidden></p>
+  <div class="table-scroll">
+    <table class="sheet">
+      <thead>
+        <tr>
+          <th>Started</th>
+          <th>Run</th>
+          <th>Models</th>
+          <th>Judge</th>
+          <th>Format</th>
+          <th>Status</th>
+          <th>Games</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="history_list"></tbody>
+    </table>
+  </div>
+</section>
 </div>
 
 <div id="dashboard" hidden>
@@ -1779,7 +2023,7 @@ tr.detail-row td {
   <div class="experiment">
   <p id="dash_error" class="status error"></p>
   <p id="report_actions" class="report-actions" hidden>
-    <a id="view_report" class="report-link" target="_blank" rel="noopener">View report</a>
+    <a id="view_report" class="report-link">View report</a>
   </p>
   <h2>Experiment</h2>
   <dl class="facts">
@@ -3130,6 +3374,7 @@ function applyEvent(msg) {
       if (msg.tournament) view.tournament = msg.tournament;
       view.finished_at = Date.now();
       stopElapsed();
+      loadHistory();
       break;
     case "run_failed":
       view.status = "failed";
@@ -3289,7 +3534,97 @@ document.getElementById("start").addEventListener("click", async () => {
   showDashboard(body.run_id);
 });
 
+function historyStatusLabel(run) {
+  if (run.complete === true) return "Complete";
+  if (run.complete === false) return "Incomplete";
+  if (run.tournament_status === "not judged") return "Not judged";
+  return run.tournament_status || "Saved";
+}
+
+function historyGamesLabel(run) {
+  const resolved = run.resolved_pairs;
+  const failed = run.failed_pairs;
+  const expected = run.expected_pairs;
+  if (resolved == null && failed == null && expected == null) return "—";
+  const done = (resolved || 0) + (failed || 0);
+  if (expected == null) return String(done);
+  return done + " / " + expected;
+}
+
+function renderHistory(payload) {
+  const list = document.getElementById("history_list");
+  const statusEl = document.getElementById("history_status");
+  const errorsEl = document.getElementById("history_errors");
+  list.replaceChildren();
+  const runs = (payload && payload.runs) || [];
+  const errors = (payload && payload.errors) || [];
+  if (!runs.length) {
+    statusEl.textContent = "No saved runs yet.";
+  } else {
+    statusEl.textContent = runs.length === 1 ? "1 saved run" : runs.length + " saved runs";
+  }
+  if (errors.length) {
+    errorsEl.hidden = false;
+    errorsEl.textContent = errors.map((item) => item.file + ": " + item.error).join(" · ");
+  } else {
+    errorsEl.hidden = true;
+    errorsEl.textContent = "";
+  }
+  runs.forEach((run) => {
+    const tr = document.createElement("tr");
+    const started = document.createElement("td");
+    started.className = "mono";
+    started.textContent = run.started_at || "—";
+    const id = document.createElement("td");
+    id.className = "mono";
+    id.textContent = run.run_id || "—";
+    const models = document.createElement("td");
+    models.className = "mono";
+    models.textContent = (run.models || []).join(", ") || "—";
+    const judge = document.createElement("td");
+    judge.className = "mono";
+    judge.textContent = run.judge || "None";
+    const format = document.createElement("td");
+    format.textContent = run.tournament_format || "—";
+    const runStatus = document.createElement("td");
+    runStatus.textContent = historyStatusLabel(run);
+    const games = document.createElement("td");
+    games.className = "mono";
+    games.textContent = historyGamesLabel(run);
+    const actions = document.createElement("td");
+    actions.className = "actions";
+    const link = document.createElement("a");
+    link.className = "report-link";
+    link.href = "/api/runs/" + encodeURIComponent(run.run_id) + "/report";
+    link.textContent = "View report";
+    actions.append(link);
+    tr.append(started, id, models, judge, format, runStatus, games, actions);
+    list.append(tr);
+  });
+}
+
+async function loadHistory() {
+  const statusEl = document.getElementById("history_status");
+  const errorsEl = document.getElementById("history_errors");
+  try {
+    const response = await fetch("/api/runs");
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      statusEl.textContent = "Failed to load history";
+      errorsEl.hidden = false;
+      errorsEl.textContent = body.error || "Failed to load history";
+      return;
+    }
+    renderHistory(body);
+  } catch (error) {
+    statusEl.textContent = "Failed to load history";
+    errorsEl.hidden = false;
+    errorsEl.textContent = String(error);
+  }
+}
+
 applyProvider("openai");
+loadHistory();
 </script>
 </body>
 </html>
@@ -3378,6 +3713,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn history_fixture_output(
+        started_at: &str,
+        models: &[&str],
+        judge: Option<&str>,
+        complete: Option<bool>,
+        format: TournamentFormat,
+    ) -> persist::Output {
+        let mut run = persist::RunMetadata::new(
+            models.iter().map(|model| ModelId::new(*model)).collect(),
+            judge.map(ModelId::new),
+            None,
+            started_at.into(),
+            "https://example.test/v1",
+        );
+        if let Some(complete) = complete {
+            let (expected, resolved, failed) = if complete { (1, 1, 0) } else { (1, 0, 1) };
+            run = run.with_judge_coverage(expected, resolved, failed);
+        }
+        persist::Output {
+            run,
+            tasks: vec![task()],
+            results: vec![],
+            comparisons: vec![],
+            judgments: if complete.is_some() {
+                Some(vec![])
+            } else {
+                None
+            },
+            judgment_failures: if complete.is_some() {
+                Some(vec![])
+            } else {
+                None
+            },
+            statistics: if complete.is_some() {
+                Some(vec![])
+            } else {
+                None
+            },
+            ratings: if complete.is_some() {
+                Some(vec![])
+            } else {
+                None
+            },
+            tournament: Some(Tournament {
+                format,
+                candidates: models.iter().map(|model| ModelId::new(*model)).collect(),
+                status: if complete == Some(false) {
+                    TournamentStatus::Incomplete
+                } else if judge.is_some() {
+                    TournamentStatus::Complete
+                } else {
+                    TournamentStatus::NotJudged
+                },
+                best_of: tournament::DEFAULT_BEST_OF,
+                opening_matchups: None,
+                tasks: Vec::new(),
+            }),
+        }
+    }
+
+    fn write_history_fixture(dir: &FilePath, run_id: &str, output: &persist::Output) {
+        let path = web_output_path(dir, run_id);
+        std::fs::write(&path, persist::to_pretty_json(output).unwrap()).unwrap();
     }
 
     async fn wait_until_idle(state: &AppState) {
@@ -4099,10 +4499,11 @@ mod tests {
         assert_eq!(report.results.len(), 2);
         assert_eq!(report.results[0].response, "m0");
         assert_eq!(report.pairs.len(), 1);
-        let html = crate::html::render(&report);
+        let html = crate::html::render_with_nav(&report, Some("/"));
         assert!(html.contains("m0"));
         assert!(html.contains("m1"));
         assert!(!html.contains(SECRET_API_KEY));
+        assert!(html.contains("← Back to workbench"));
 
         let live = state.run.lock().await.clone().unwrap();
         let served = render_live_run_report(&live)
@@ -4111,6 +4512,13 @@ mod tests {
         assert_eq!(served, html);
         assert!(served.contains("Arena experiment report"));
         assert!(!served.contains(SECRET_API_KEY));
+
+        let listed = list_saved_runs(&dir);
+        assert!(
+            listed.runs.iter().any(|run| run.run_id == run_id),
+            "{:?}",
+            listed.runs
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4146,8 +4554,12 @@ mod tests {
             .expect("incomplete report");
         let output = persist::read(web_output_path(&dir, &run_id)).unwrap();
         assert_eq!(output.run.complete, Some(false));
-        assert_eq!(served, html::render(&report::from_output(&output)));
+        assert_eq!(
+            served,
+            html::render_with_nav(&report::from_output(&output), Some("/"))
+        );
         assert!(served.contains("INCOMPLETE"));
+        assert!(served.contains("← Back to workbench"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4197,6 +4609,160 @@ mod tests {
         assert!(PAGE.contains("id=\"view_report\""));
         assert!(PAGE.contains("/api/runs/\" + encodeURIComponent(view.run_id) + \"/report\""));
         assert!(PAGE.contains("View report"));
+    }
+
+    #[test]
+    fn workbench_exposes_run_history() {
+        assert!(PAGE.contains("id=\"history_section\""));
+        assert!(PAGE.contains("id=\"history_list\""));
+        assert!(PAGE.contains("loadHistory()"));
+        assert!(PAGE.contains("fetch(\"/api/runs\")"));
+    }
+
+    #[test]
+    fn run_id_validation_rejects_path_traversal() {
+        assert!(is_safe_run_id("1700000000000-42-1"));
+        assert!(is_safe_run_id("1"));
+        assert!(!is_safe_run_id(""));
+        assert!(!is_safe_run_id("../secret"));
+        assert!(!is_safe_run_id("a/b"));
+        assert!(!is_safe_run_id("a\\b"));
+        assert!(!is_safe_run_id("a.b"));
+        assert!(!is_safe_run_id(".hidden"));
+        let dir = test_output_dir("id-validate");
+        let err = resolve_saved_run_path(&dir, "../x").expect_err("traversal");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let err = resolve_saved_run_path(&dir, "missing-id").expect_err("missing");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_lists_newest_saved_runs_first() {
+        let dir = test_output_dir("history-order");
+        write_history_fixture(
+            &dir,
+            "older",
+            &history_fixture_output(
+                "2026-01-01T00:00:00Z",
+                &["m0", "m1"],
+                Some("judge"),
+                Some(true),
+                TournamentFormat::RoundRobin,
+            ),
+        );
+        write_history_fixture(
+            &dir,
+            "newer",
+            &history_fixture_output(
+                "2026-02-01T00:00:00Z",
+                &["a", "b"],
+                Some("judge"),
+                Some(false),
+                TournamentFormat::SingleElimination,
+            ),
+        );
+        std::fs::write(dir.join("notes.txt"), "ignore").unwrap();
+
+        let listed = list_saved_runs(&dir);
+        assert!(listed.errors.is_empty(), "{:?}", listed.errors);
+        assert_eq!(listed.runs.len(), 2);
+        assert_eq!(listed.runs[0].run_id, "newer");
+        assert_eq!(listed.runs[0].started_at, "2026-02-01T00:00:00Z");
+        assert_eq!(listed.runs[0].complete, Some(false));
+        assert_eq!(listed.runs[0].tournament_format, Some("single-elimination"));
+        assert_eq!(listed.runs[0].tournament_status, Some("incomplete"));
+        assert_eq!(
+            listed.runs[0].models,
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(listed.runs[1].run_id, "older");
+        assert_eq!(listed.runs[1].started_at, "2026-01-01T00:00:00Z");
+        assert_eq!(listed.runs[1].complete, Some(true));
+        assert_eq!(listed.runs[1].tournament_format, Some("round-robin"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_reports_malformed_files_without_failing_the_list() {
+        let dir = test_output_dir("history-bad");
+        write_history_fixture(
+            &dir,
+            "good",
+            &history_fixture_output(
+                "2026-03-01T00:00:00Z",
+                &["m0"],
+                None,
+                None,
+                TournamentFormat::KingOfTheHill,
+            ),
+        );
+        std::fs::write(dir.join("broken.json"), "{not-json").unwrap();
+        std::fs::write(dir.join("also..bad.json"), "{}").unwrap();
+
+        let listed = list_saved_runs(&dir);
+        assert_eq!(listed.runs.len(), 1);
+        assert_eq!(listed.runs[0].run_id, "good");
+        assert!(
+            listed
+                .errors
+                .iter()
+                .any(|error| error.file.contains("broken.json")),
+            "{:?}",
+            listed.errors
+        );
+        assert!(
+            listed
+                .errors
+                .iter()
+                .any(|error| error.file.contains("also..bad.json")),
+            "{:?}",
+            listed.errors
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saved_run_report_reuses_html_render() {
+        let dir = test_output_dir("history-report");
+        let output = history_fixture_output(
+            "2026-04-01T00:00:00Z",
+            &["m0", "m1"],
+            Some("judge"),
+            Some(true),
+            TournamentFormat::RoundRobin,
+        );
+        write_history_fixture(&dir, "report-me", &output);
+        let served = render_saved_run_report(&dir, "report-me").expect("report");
+        assert_eq!(
+            served,
+            html::render_with_nav(&report::from_output(&output), Some("/"))
+        );
+        assert!(served.contains("Arena experiment report"));
+        assert!(served.contains("← Back to workbench"));
+        assert!(served.contains("href=\"/\""));
+        let loaded = persist::read(web_output_path(&dir, "report-me")).unwrap();
+        assert_eq!(loaded.run.started_at, "2026-04-01T00:00:00Z");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_keeps_incomplete_runs_reportable() {
+        let dir = test_output_dir("history-incomplete");
+        let output = history_fixture_output(
+            "2026-05-01T00:00:00Z",
+            &["m0", "m1"],
+            Some("judge"),
+            Some(false),
+            TournamentFormat::RoundRobin,
+        );
+        write_history_fixture(&dir, "inc1", &output);
+        let listed = list_saved_runs(&dir);
+        assert_eq!(listed.runs.len(), 1);
+        assert_eq!(listed.runs[0].complete, Some(false));
+        let served = render_saved_run_report(&dir, "inc1").expect("incomplete report");
+        assert!(served.contains("INCOMPLETE"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
