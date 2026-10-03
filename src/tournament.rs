@@ -81,7 +81,7 @@ pub struct SeriesGame {
 }
 
 pub const DEFAULT_BEST_OF: u32 = 1;
-const MAX_TIEBREAKS: u32 = 3;
+pub(crate) const MAX_TIEBREAKS: u32 = 3;
 
 pub fn default_best_of() -> u32 {
     DEFAULT_BEST_OF
@@ -915,14 +915,19 @@ fn apply_game(
     Ok(())
 }
 
-enum SeriesEnd {
+pub(crate) enum SeriesEnd {
     WinnerA,
     WinnerB,
     Draw,
 }
 
 /// `None` means another game is still required.
-fn series_result(wins_a: u32, wins_b: u32, played: u32, best_of: u32) -> Option<SeriesEnd> {
+pub(crate) fn series_result(
+    wins_a: u32,
+    wins_b: u32,
+    played: u32,
+    best_of: u32,
+) -> Option<SeriesEnd> {
     let need = best_of / 2 + 1;
     let left = best_of.saturating_sub(played);
     if wins_a >= need {

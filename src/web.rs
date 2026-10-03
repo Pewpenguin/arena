@@ -63,6 +63,9 @@ struct RunState {
     started_at: String,
     candidate_completed: usize,
     candidate_total: usize,
+    /// Regulation-game ceiling used for live progress (series × tasks × best-of).
+    planned_games: usize,
+    /// During a run, matches [`planned_games`]. On completion, the actual submitted game count.
     expected_pairs: usize,
     resolved_pairs: usize,
     failed_pairs: usize,
@@ -70,6 +73,7 @@ struct RunState {
     output_path: Option<String>,
     tournament_format: String,
     best_of: u32,
+    seed: u64,
     tournament: Option<Tournament>,
 }
 
@@ -92,6 +96,46 @@ struct PairRow {
     judgment: Option<Judgment>,
     #[serde(skip_serializing_if = "Option::is_none")]
     failure: Option<JudgmentFailure>,
+    /// Resolved judged games in this series (survives SSE reconnect).
+    games_resolved: u32,
+    wins_a: u32,
+    wins_b: u32,
+    tiebreak_games: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    series_winner: Option<String>,
+    seeded_fallback: bool,
+    series_draw: bool,
+    series_failed: bool,
+    awaiting_tiebreak: bool,
+}
+
+impl PairRow {
+    fn waiting(task_id: String, model_a: String, model_b: String) -> Self {
+        Self {
+            task_id,
+            model_a,
+            model_b,
+            status: PairStatus::Waiting,
+            judgment: None,
+            failure: None,
+            games_resolved: 0,
+            wins_a: 0,
+            wins_b: 0,
+            tiebreak_games: 0,
+            series_winner: None,
+            seeded_fallback: false,
+            series_draw: false,
+            series_failed: false,
+            awaiting_tiebreak: false,
+        }
+    }
+
+    fn series_complete(&self) -> bool {
+        self.series_winner.is_some()
+            || self.series_draw
+            || self.series_failed
+            || self.seeded_fallback
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -117,6 +161,7 @@ struct RunSnapshot {
     started_at: String,
     candidate_completed: usize,
     candidate_total: usize,
+    planned_games: usize,
     expected_pairs: usize,
     resolved_pairs: usize,
     failed_pairs: usize,
@@ -125,6 +170,7 @@ struct RunSnapshot {
     output_path: Option<String>,
     tournament_format: String,
     best_of: u32,
+    seed: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     tournament: Option<Tournament>,
 }
@@ -145,13 +191,30 @@ enum ClientEvent {
     PairResolved {
         seq: u64,
         judgment: Judgment,
+        games_resolved: u32,
+        wins_a: u32,
+        wins_b: u32,
+        tiebreak_games: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        series_winner: Option<String>,
+        seeded_fallback: bool,
+        series_draw: bool,
+        series_failed: bool,
+        awaiting_tiebreak: bool,
     },
     PairFailed {
         seq: u64,
         failure: JudgmentFailure,
+        games_resolved: u32,
+        wins_a: u32,
+        wins_b: u32,
+        tiebreak_games: u32,
+        series_failed: bool,
+        awaiting_tiebreak: bool,
     },
     RunComplete {
         seq: u64,
+        planned_games: usize,
         expected_pairs: usize,
         resolved_pairs: usize,
         failed_pairs: usize,
@@ -344,7 +407,7 @@ impl LiveRun {
         let candidate_count = config.models.len();
         let task_count = config.tasks.len();
         let candidate_total = task_count.saturating_mul(candidate_count);
-        let expected_pairs = if config.judge.is_some() {
+        let planned_games = if config.judge.is_some() {
             tournament::planned_match_count(config.tournament, candidate_count)
                 .saturating_mul(task_count)
                 .saturating_mul(config.best_of as usize)
@@ -375,13 +438,15 @@ impl LiveRun {
                 started_at: config.started_at.clone(),
                 candidate_completed: 0,
                 candidate_total,
-                expected_pairs,
+                planned_games,
+                expected_pairs: planned_games,
                 resolved_pairs: 0,
                 failed_pairs: 0,
                 pairs,
                 output_path: None,
                 tournament_format: config.tournament.as_str().to_string(),
                 best_of: config.best_of,
+                seed: config.seed,
                 tournament: None,
             }),
             events,
@@ -448,6 +513,7 @@ impl RunState {
                 started_at: self.started_at.clone(),
                 candidate_completed: self.candidate_completed,
                 candidate_total: self.candidate_total,
+                planned_games: self.planned_games,
                 expected_pairs: self.expected_pairs,
                 resolved_pairs: self.resolved_pairs,
                 failed_pairs: self.failed_pairs,
@@ -455,6 +521,7 @@ impl RunState {
                 output_path: self.output_path.clone(),
                 tournament_format: self.tournament_format.clone(),
                 best_of: self.best_of,
+                seed: self.seed,
                 tournament: self.tournament.clone(),
             }),
         }
@@ -484,18 +551,28 @@ impl RunState {
                 judgment,
             } => {
                 self.resolved_pairs += 1;
-                upsert_pair(
+                let row = apply_resolved_game(
                     &mut self.pairs,
                     &task_id,
                     &model_a,
                     &model_b,
-                    PairStatus::Resolved,
-                    Some(judgment.clone()),
-                    None,
+                    judgment.clone(),
+                    self.best_of,
+                    &self.tournament_format,
+                    self.seed,
                 );
                 ClientEvent::PairResolved {
                     seq: self.seq,
                     judgment,
+                    games_resolved: row.games_resolved,
+                    wins_a: row.wins_a,
+                    wins_b: row.wins_b,
+                    tiebreak_games: row.tiebreak_games,
+                    series_winner: row.series_winner.clone(),
+                    seeded_fallback: row.seeded_fallback,
+                    series_draw: row.series_draw,
+                    series_failed: row.series_failed,
+                    awaiting_tiebreak: row.awaiting_tiebreak,
                 }
             }
             ExperimentEvent::PairFailed {
@@ -505,18 +582,22 @@ impl RunState {
                 failure,
             } => {
                 self.failed_pairs += 1;
-                upsert_pair(
+                let row = apply_failed_game(
                     &mut self.pairs,
                     &task_id,
                     &model_a,
                     &model_b,
-                    PairStatus::Failed,
-                    None,
-                    Some(failure.clone()),
+                    failure.clone(),
                 );
                 ClientEvent::PairFailed {
                     seq: self.seq,
                     failure,
+                    games_resolved: row.games_resolved,
+                    wins_a: row.wins_a,
+                    wins_b: row.wins_b,
+                    tiebreak_games: row.tiebreak_games,
+                    series_failed: row.series_failed,
+                    awaiting_tiebreak: row.awaiting_tiebreak,
                 }
             }
             ExperimentEvent::RunComplete {
@@ -534,6 +615,7 @@ impl RunState {
                 self.failed_pairs = failed_pairs;
                 ClientEvent::RunComplete {
                     seq: self.seq,
+                    planned_games: self.planned_games,
                     expected_pairs,
                     resolved_pairs,
                     failed_pairs,
@@ -576,34 +658,124 @@ fn same_unordered_pair(row: &PairRow, task_id: &str, model_a: &str, model_b: &st
             || (row.model_a == model_b && row.model_b == model_a))
 }
 
-fn upsert_pair(
+fn uses_elimination_tiebreaks(tournament_format: &str) -> bool {
+    matches!(tournament_format, "single-elimination" | "king-of-the-hill")
+}
+
+fn find_or_insert_pair<'a>(
+    pairs: &'a mut Vec<PairRow>,
+    task_id: &str,
+    model_a: &ModelId,
+    model_b: &ModelId,
+) -> &'a mut PairRow {
+    let a = model_a.to_string();
+    let b = model_b.to_string();
+    if let Some(index) = pairs
+        .iter()
+        .position(|row| same_unordered_pair(row, task_id, &a, &b))
+    {
+        return &mut pairs[index];
+    }
+    pairs.push(PairRow::waiting(task_id.to_string(), a, b));
+    pairs.last_mut().expect("pair just inserted")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_resolved_game(
     pairs: &mut Vec<PairRow>,
     task_id: &str,
     model_a: &ModelId,
     model_b: &ModelId,
-    status: PairStatus,
-    judgment: Option<Judgment>,
-    failure: Option<JudgmentFailure>,
-) {
-    let a = model_a.to_string();
-    let b = model_b.to_string();
-    if let Some(row) = pairs
-        .iter_mut()
-        .find(|row| same_unordered_pair(row, task_id, &a, &b))
-    {
-        row.status = status;
-        row.judgment = judgment;
-        row.failure = failure;
-        return;
+    judgment: Judgment,
+    best_of: u32,
+    tournament_format: &str,
+    seed: u64,
+) -> PairRow {
+    let row = find_or_insert_pair(pairs, task_id, model_a, model_b);
+    if row.series_complete() {
+        return row.clone();
     }
-    pairs.push(PairRow {
-        task_id: task_id.to_string(),
-        model_a: a,
-        model_b: b,
-        status,
-        judgment,
-        failure,
-    });
+
+    row.status = PairStatus::Resolved;
+    row.judgment = Some(judgment.clone());
+    row.failure = None;
+    row.games_resolved = row.games_resolved.saturating_add(1);
+
+    let winner_model = match judgment.winner {
+        crate::judge::JudgeDecision::A => Some(judgment.model_a.to_string()),
+        crate::judge::JudgeDecision::B => Some(judgment.model_b.to_string()),
+        crate::judge::JudgeDecision::Draw => None,
+    };
+    if let Some(winner) = winner_model.as_ref() {
+        if *winner == row.model_a {
+            row.wins_a = row.wins_a.saturating_add(1);
+        } else if *winner == row.model_b {
+            row.wins_b = row.wins_b.saturating_add(1);
+        }
+    }
+
+    if row.awaiting_tiebreak {
+        row.tiebreak_games = row.tiebreak_games.saturating_add(1);
+        if let Some(winner) = winner_model {
+            row.series_winner = Some(winner);
+            row.awaiting_tiebreak = false;
+            row.series_draw = false;
+            row.seeded_fallback = false;
+        } else if row.tiebreak_games >= tournament::MAX_TIEBREAKS {
+            let left = ModelId::new(row.model_a.as_str());
+            let right = ModelId::new(row.model_b.as_str());
+            row.series_winner =
+                Some(tournament::seeded_fallback_winner(seed, &left, &right).to_string());
+            row.seeded_fallback = true;
+            row.awaiting_tiebreak = false;
+            row.series_draw = false;
+        }
+    } else {
+        let regulation_played = row.games_resolved;
+        match tournament::series_result(row.wins_a, row.wins_b, regulation_played, best_of) {
+            Some(tournament::SeriesEnd::WinnerA) => {
+                row.series_winner = Some(row.model_a.clone());
+                row.series_draw = false;
+                row.awaiting_tiebreak = false;
+            }
+            Some(tournament::SeriesEnd::WinnerB) => {
+                row.series_winner = Some(row.model_b.clone());
+                row.series_draw = false;
+                row.awaiting_tiebreak = false;
+            }
+            Some(tournament::SeriesEnd::Draw) => {
+                if uses_elimination_tiebreaks(tournament_format) {
+                    row.awaiting_tiebreak = true;
+                    row.series_draw = false;
+                } else {
+                    row.series_draw = true;
+                    row.awaiting_tiebreak = false;
+                }
+            }
+            None => {}
+        }
+    }
+
+    row.clone()
+}
+
+fn apply_failed_game(
+    pairs: &mut Vec<PairRow>,
+    task_id: &str,
+    model_a: &ModelId,
+    model_b: &ModelId,
+    failure: JudgmentFailure,
+) -> PairRow {
+    let row = find_or_insert_pair(pairs, task_id, model_a, model_b);
+    row.status = PairStatus::Failed;
+    row.failure = Some(failure);
+    row.judgment = None;
+    row.series_failed = true;
+    row.awaiting_tiebreak = false;
+    row.series_draw = false;
+    row.series_winner = None;
+    row.seeded_fallback = false;
+    row.clone()
 }
 
 fn waiting_pairs(
@@ -615,14 +787,11 @@ fn waiting_pairs(
     let mut pairs = Vec::new();
     for task in tasks {
         for (model_a, model_b) in tournament::opening_pairs(format, models, opening) {
-            pairs.push(PairRow {
-                task_id: task.id.clone(),
-                model_a: model_a.to_string(),
-                model_b: model_b.to_string(),
-                status: PairStatus::Waiting,
-                judgment: None,
-                failure: None,
-            });
+            pairs.push(PairRow::waiting(
+                task.id.clone(),
+                model_a.to_string(),
+                model_b.to_string(),
+            ));
         }
     }
     pairs
@@ -2051,6 +2220,14 @@ tr.detail-row td {
       <dt>Failed games</dt>
       <dd id="ov_failed" class="num">0</dd>
     </div>
+    <div>
+      <dt>Submitted games</dt>
+      <dd id="ov_submitted" class="num">0</dd>
+    </div>
+    <div>
+      <dt>Planned games</dt>
+      <dd id="ov_planned" class="num">0</dd>
+    </div>
   </dl>
   <div id="candidate_models" class="candidate-models" hidden>
     <h2>Candidates</h2>
@@ -2067,7 +2244,7 @@ tr.detail-row td {
     <div>
       <div class="section-line">
         <h2>Games</h2>
-        <p id="pair_label" class="meta">0 / 0 games</p>
+        <p id="pair_label" class="meta">0 submitted · up to 0 planned</p>
       </div>
       <div class="bar"><span id="pair_bar"></span></div>
     </div>
@@ -2505,18 +2682,58 @@ function decisionText(decision, modelA, modelB) {
   return decision || "—";
 }
 
+function seriesGames(row) {
+  if (row.games_resolved != null) return row.games_resolved;
+  if (row.games != null) return row.games;
+  return null;
+}
+
+function seriesScore(row) {
+  if (row.wins_a == null || row.wins_b == null) return null;
+  return row.wins_a + "–" + row.wins_b;
+}
+
 function compactOutcome(row) {
-  let text = "Waiting";
-  if (row.status === "resolved" && row.judgment) {
-    text = decisionText(row.judgment.winner, row.judgment.model_a, row.judgment.model_b);
-  } else if (row.status === "failed") {
-    const first = row.failure && row.failure.orientations && row.failure.orientations[0];
-    text = first && first.error ? first.kind + ": " + first.error : "Failed";
-  } else if (row.status === "judging") {
-    text = "Judging";
+  const games = seriesGames(row);
+  const score = seriesScore(row);
+  const gamesText = games == null ? "games unknown" : games + (games === 1 ? " game judged" : " games judged");
+  if (row.seeded_fallback && row.series_winner) {
+    return row.series_winner + " advances by seeded fallback · " + gamesText;
   }
-  if (row.games > 1) text += " · " + row.games + " games judged";
-  return text;
+  if (row.series_winner) {
+    let text = row.series_winner + " wins series";
+    if (score) text += " (" + score + ")";
+    text += " · " + gamesText;
+    return text;
+  }
+  if (row.series_failed || row.status === "failed") {
+    const first = row.failure && row.failure.orientations && row.failure.orientations[0];
+    const fail = first && first.error ? first.kind + ": " + first.error : "Failed";
+    return fail + (games ? " · " + gamesText : "");
+  }
+  if (row.series_draw) {
+    return "Series draw · " + gamesText;
+  }
+  if (row.awaiting_tiebreak) {
+    let text = "Series draw · tiebreak";
+    if (score) text += " (" + score + ")";
+    text += " · " + gamesText;
+    return text;
+  }
+  if (games && games > 0 && row.status === "resolved") {
+    let text = "Series in progress";
+    if (score) text += " (" + score + ")";
+    text += " · " + gamesText;
+    if (row.judgment) {
+      text += " · latest " + decisionText(row.judgment.winner, row.judgment.model_a, row.judgment.model_b);
+    }
+    return text;
+  }
+  if (row.status === "resolved" && row.judgment) {
+    return decisionText(row.judgment.winner, row.judgment.model_a, row.judgment.model_b);
+  }
+  if (row.status === "judging") return "Judging";
+  return "Waiting";
 }
 
 function statusLabel(status) {
@@ -2567,25 +2784,52 @@ function maybeMarkJudging() {
   });
 }
 
-function upsertPair(taskId, modelA, modelB, status, judgment, failure) {
+function applySeriesFields(row, msg) {
+  if (!row || !msg) return;
+  if (msg.games_resolved != null) {
+    row.games_resolved = msg.games_resolved;
+    row.games = msg.games_resolved;
+  }
+  if (msg.wins_a != null) row.wins_a = msg.wins_a;
+  if (msg.wins_b != null) row.wins_b = msg.wins_b;
+  if (msg.tiebreak_games != null) row.tiebreak_games = msg.tiebreak_games;
+  if (msg.series_winner !== undefined) row.series_winner = msg.series_winner || null;
+  if (msg.seeded_fallback != null) row.seeded_fallback = !!msg.seeded_fallback;
+  if (msg.series_draw != null) row.series_draw = !!msg.series_draw;
+  if (msg.series_failed != null) row.series_failed = !!msg.series_failed;
+  if (msg.awaiting_tiebreak != null) row.awaiting_tiebreak = !!msg.awaiting_tiebreak;
+}
+
+function upsertPair(taskId, modelA, modelB, status, judgment, failure, seriesMsg) {
   const row = findPair(taskId, modelA, modelB);
   if (row) {
-    const another = row.status === "resolved" || row.status === "failed";
-    row.games = another ? (row.games || 1) + 1 : (row.games || 1);
     row.status = status;
     row.judgment = judgment || null;
     row.failure = failure || null;
-    return;
+    applySeriesFields(row, seriesMsg);
+    return row;
   }
-  view.pairs.push({
+  const created = {
     task_id: taskId,
     model_a: modelA,
     model_b: modelB,
     status,
-    games: 1,
+    games: seriesMsg && seriesMsg.games_resolved != null ? seriesMsg.games_resolved : 1,
+    games_resolved: seriesMsg && seriesMsg.games_resolved != null ? seriesMsg.games_resolved : 1,
+    wins_a: 0,
+    wins_b: 0,
+    tiebreak_games: 0,
+    series_winner: null,
+    seeded_fallback: false,
+    series_draw: false,
+    series_failed: false,
+    awaiting_tiebreak: false,
     judgment: judgment || null,
     failure: failure || null,
-  });
+  };
+  applySeriesFields(created, seriesMsg);
+  view.pairs.push(created);
+  return created;
 }
 
 function appendField(dl, label, value, mono) {
@@ -2616,6 +2860,22 @@ function pairDetail(row) {
   appendField(dl, "Task", row.task_id, true);
   appendField(dl, "Model A", row.model_a, true);
   appendField(dl, "Model B", row.model_b, true);
+  const games = seriesGames(row);
+  if (games != null) appendField(dl, "Games judged", String(games), true);
+  const score = seriesScore(row);
+  if (score) appendField(dl, "Series score", score, true);
+  if (row.series_winner) {
+    appendField(
+      dl,
+      "Series result",
+      row.seeded_fallback ? row.series_winner + " (seeded fallback)" : row.series_winner + " wins series",
+      true
+    );
+  } else if (row.awaiting_tiebreak) {
+    appendField(dl, "Series result", "draw — playing tiebreaks", true);
+  } else if (row.series_draw) {
+    appendField(dl, "Series result", "series draw", true);
+  }
   if (row.judgment) {
     const j = row.judgment;
     appendField(dl, "Game winner", decisionText(j.winner, j.model_a, j.model_b), true);
@@ -2728,15 +2988,29 @@ function renderDash() {
   const failed = document.getElementById("ov_failed");
   failed.textContent = String(view.failed_pairs);
   failed.className = "num" + (view.failed_pairs > 0 ? " hot" : "");
+  const submitted = (view.resolved_pairs || 0) + (view.failed_pairs || 0);
+  const planned = view.planned_games != null ? view.planned_games : view.expected_pairs;
+  const submittedEl = document.getElementById("ov_submitted");
+  submittedEl.textContent = String(submitted);
+  submittedEl.className = "num" + (submitted > 0 ? " hot" : "");
+  document.getElementById("ov_planned").textContent = String(planned || 0);
   renderElapsed();
   const candDone = view.candidate_completed;
   const candTotal = view.candidate_total;
   document.getElementById("cand_bar").style.width = candTotal ? (100 * candDone / candTotal) + "%" : "0%";
   document.getElementById("cand_label").textContent = candDone + " / " + candTotal;
-  const pairDone = view.resolved_pairs + view.failed_pairs;
-  const pairTotal = view.expected_pairs;
-  document.getElementById("pair_bar").style.width = pairTotal ? (100 * pairDone / pairTotal) + "%" : "0%";
-  document.getElementById("pair_label").textContent = pairDone + " / " + pairTotal + " games";
+  const barDenom = Math.max(planned || 0, submitted, 1);
+  document.getElementById("pair_bar").style.width = (100 * submitted / barDenom) + "%";
+  let gameLabel = submitted + " submitted";
+  if (view.status === "running") {
+    gameLabel += " · up to " + (planned || 0) + " planned";
+  } else if (submitted > (planned || 0)) {
+    gameLabel += " · " + (planned || 0) + " planned regulation (includes tiebreaks)";
+  } else {
+    gameLabel += " · " + (planned || 0) + " planned";
+  }
+  gameLabel += " · " + (view.resolved_pairs || 0) + " resolved · " + (view.failed_pairs || 0) + " failed";
+  document.getElementById("pair_label").textContent = gameLabel;
   const list = document.getElementById("pair_list");
   list.replaceChildren();
   view.pairs.forEach((row) => {
@@ -2822,7 +3096,12 @@ function pairsByTask() {
 }
 
 function liveSeriesWinner(row) {
-  if (!row || view.best_of > 1 || row.status !== "resolved" || !row.judgment) return null;
+  if (!row) return null;
+  if (row.series_winner) return row.series_winner;
+  if (row.seeded_fallback && row.series_winner) return row.series_winner;
+  if (row.series_draw || row.series_failed || row.awaiting_tiebreak) return null;
+  if (view.best_of > 1) return null;
+  if (row.status !== "resolved" || !row.judgment) return null;
   if (row.judgment.winner === "a") return row.model_a;
   if (row.judgment.winner === "b") return row.model_b;
   return null;
@@ -2830,9 +3109,13 @@ function liveSeriesWinner(row) {
 
 function liveState(row) {
   if (!row || row.status === "waiting") return "pending";
+  if (row.series_failed || row.status === "failed") return "incomplete";
+  if (row.seeded_fallback || row.series_winner) return "complete";
+  if (row.series_draw) return "draw";
+  if (row.awaiting_tiebreak) return "active";
   if (row.status === "judging") return "active";
-  if (row.status === "failed") return "incomplete";
-  if (row.status === "resolved" && view.best_of > 1 && view.status === "running") return "active";
+  const games = seriesGames(row);
+  if (games && games > 0 && !row.series_winner && !row.series_draw) return "active";
   if (row.status === "resolved" && row.judgment && row.judgment.winner === "draw") return "draw";
   if (row.status === "resolved") return "complete";
   return "pending";
@@ -2840,14 +3123,28 @@ function liveState(row) {
 
 function liveDetail(row, state) {
   if (!row || state === "pending") return "Pending";
-  if (state === "active") return "Judging";
   if (state === "incomplete") return "Judgment failed";
-  if (state === "draw") return "Series draw";
+  const games = seriesGames(row);
+  const score = seriesScore(row);
+  const gamesSuffix = games == null ? "" : " (" + games + (games === 1 ? " game" : " games") + ")";
+  if (row.seeded_fallback && row.series_winner) {
+    return row.series_winner + " advances by seeded fallback" + gamesSuffix;
+  }
+  if (state === "active") {
+    if ((!games || games === 0) && row.status === "judging" && !row.awaiting_tiebreak) {
+      return "Judging · " + row.model_a + " vs " + row.model_b;
+    }
+    let text = row.awaiting_tiebreak ? "Tiebreak" : "Series in progress";
+    if (score) text += " " + score;
+    if (row.model_a && row.model_b) text += " · " + row.model_a + " vs " + row.model_b;
+    if (games != null) text += " · " + games + (games === 1 ? " game" : " games");
+    return text;
+  }
+  if (state === "draw") return "Series draw" + gamesSuffix;
   const winner = liveSeriesWinner(row);
   if (!winner) return "Pending";
-  const games = row.games || 1;
-  if (games > 1) return winner + " advances (" + games + " games)";
-  return winner + " advances";
+  const verb = isKingOfTheHill() ? " remains" : " advances";
+  return winner + verb + gamesSuffix;
 }
 
 function liveCard(row, projected) {
@@ -3160,17 +3457,7 @@ function hillFromPairs(candidates, pairs) {
         openChallenger: !row,
       };
     }
-    if (row.status === "judging") {
-      return {
-        holder,
-        challenger,
-        champion: null,
-        state: "active",
-        detail: "Judging",
-        openChallenger: false,
-      };
-    }
-    if (row.status === "failed") {
+    if (row.series_failed || row.status === "failed") {
       return {
         holder,
         challenger,
@@ -3180,25 +3467,14 @@ function hillFromPairs(candidates, pairs) {
         openChallenger: false,
       };
     }
-    if (view.best_of > 1 && view.status === "running") {
-      const following = candidates[next + 1];
-      const advanced = following
-        ? (pairs || []).find((pair) =>
-            pair.model_b === following &&
-            (pair.model_a === holder || pair.model_a === challenger)
-          )
-        : null;
-      if (advanced) {
-        holder = advanced.model_a;
-        next += 1;
-        continue;
-      }
+    const state = liveState(row);
+    if (state === "active" || row.status === "judging" || row.awaiting_tiebreak) {
       return {
         holder,
         challenger,
         champion: null,
         state: "active",
-        detail: "Judging",
+        detail: liveDetail(row, "active"),
         openChallenger: false,
       };
     }
@@ -3208,8 +3484,8 @@ function hillFromPairs(candidates, pairs) {
         holder,
         challenger,
         champion: null,
-        state: "draw",
-        detail: "Series draw",
+        state: state === "draw" ? "draw" : "active",
+        detail: liveDetail(row, state === "draw" ? "draw" : "active"),
         openChallenger: false,
       };
     }
@@ -3356,17 +3632,18 @@ function applyEvent(msg) {
     case "pair_resolved": {
       const j = msg.judgment;
       view.resolved_pairs += 1;
-      upsertPair(j.task_id, j.model_a, j.model_b, "resolved", j, null);
+      upsertPair(j.task_id, j.model_a, j.model_b, "resolved", j, null, msg);
       break;
     }
     case "pair_failed": {
       const f = msg.failure;
       view.failed_pairs += 1;
-      upsertPair(f.task_id, f.model_a, f.model_b, "failed", null, f);
+      upsertPair(f.task_id, f.model_a, f.model_b, "failed", null, f, msg);
       break;
     }
     case "run_complete":
       view.status = msg.failed_pairs > 0 ? "incomplete" : "complete";
+      if (msg.planned_games != null) view.planned_games = msg.planned_games;
       view.expected_pairs = msg.expected_pairs;
       view.resolved_pairs = msg.resolved_pairs;
       view.failed_pairs = msg.failed_pairs;
@@ -3403,6 +3680,7 @@ function showDashboard(runId) {
     started_at: new Date().toISOString(),
     candidate_completed: 0,
     candidate_total: 0,
+    planned_games: 0,
     expected_pairs: 0,
     resolved_pairs: 0,
     failed_pairs: 0,
@@ -3411,6 +3689,7 @@ function showDashboard(runId) {
     output_path: null,
     tournament_format: "",
     best_of: 1,
+    seed: 0,
     tournament: null,
   };
   seenSeq = 0;
@@ -4069,12 +4348,29 @@ mod tests {
             other => panic!("expected CandidateFinished, got {other:?}"),
         }
         match rx.recv().await.unwrap() {
-            ClientEvent::PairResolved { judgment, .. } => {
+            ClientEvent::PairResolved {
+                judgment,
+                games_resolved,
+                wins_a,
+                wins_b,
+                series_winner,
+                seeded_fallback,
+                series_draw,
+                awaiting_tiebreak,
+                ..
+            } => {
                 assert_eq!(judgment.model_a, ModelId::new("m0"));
                 assert_eq!(judgment.model_b, ModelId::new("m1"));
                 assert_eq!(judgment.winner, JudgeDecision::A);
                 assert!(judgment.agreement);
                 assert_eq!(judgment.raw_ab.as_deref(), Some("raw-ab"));
+                assert_eq!(games_resolved, 1);
+                assert_eq!(wins_a, 1);
+                assert_eq!(wins_b, 0);
+                assert_eq!(series_winner.as_deref(), Some("m0"));
+                assert!(!seeded_fallback);
+                assert!(!series_draw);
+                assert!(!awaiting_tiebreak);
             }
             other => panic!("expected PairResolved, got {other:?}"),
         }
@@ -4120,6 +4416,8 @@ mod tests {
                 assert_eq!(snapshot.resolved_pairs, 0);
                 assert_eq!(snapshot.failed_pairs, 1);
                 assert_eq!(snapshot.pairs[0].status, PairStatus::Failed);
+                assert!(snapshot.pairs[0].series_failed);
+                assert_eq!(snapshot.planned_games, 1);
                 assert_eq!(
                     snapshot.pairs[0].failure.as_ref().unwrap().orientations[0].error,
                     "nope"
@@ -4284,6 +4582,7 @@ mod tests {
                 started_at: "2026-01-01T00:00:00Z".into(),
                 candidate_completed: 1,
                 candidate_total: 2,
+                planned_games: 1,
                 expected_pairs: 1,
                 resolved_pairs: 0,
                 failed_pairs: 0,
@@ -4291,6 +4590,7 @@ mod tests {
                 output_path: None,
                 tournament_format: "round-robin".into(),
                 best_of: 1,
+                seed: 0,
                 tournament: None,
             }),
         };
@@ -5670,6 +5970,309 @@ mod tests {
         assert_eq!(state.best_of, 3);
         assert_eq!(state.expected_pairs, 3);
         assert_eq!(state.pairs.len(), 1);
+    }
+
+    fn live_judgment(
+        task_id: &str,
+        model_a: &str,
+        model_b: &str,
+        winner: JudgeDecision,
+    ) -> Judgment {
+        Judgment {
+            task_id: task_id.into(),
+            model_a: ModelId::new(model_a),
+            model_b: ModelId::new(model_b),
+            judge_model: ModelId::new("judge"),
+            winner,
+            reason: "ok".into(),
+            duration_ms: 1,
+            agreement: true,
+            orientation_ab: None,
+            orientation_ba: None,
+            reason_ab: None,
+            reason_ba: None,
+            raw_ab: None,
+            raw_ba: None,
+            raw: None,
+        }
+    }
+
+    fn apply_live_game(
+        pairs: &mut Vec<PairRow>,
+        model_a: &str,
+        model_b: &str,
+        winner: JudgeDecision,
+        best_of: u32,
+        format: &str,
+        seed: u64,
+    ) -> PairRow {
+        apply_resolved_game(
+            pairs,
+            "t1",
+            &ModelId::new(model_a),
+            &ModelId::new(model_b),
+            live_judgment("t1", model_a, model_b, winner),
+            best_of,
+            format,
+            seed,
+        )
+    }
+
+    #[test]
+    fn live_best_of_three_two_zero_resolves_the_series() {
+        let mut pairs = Vec::new();
+        apply_live_game(
+            &mut pairs,
+            "m0",
+            "m1",
+            JudgeDecision::A,
+            3,
+            "single-elimination",
+            0,
+        );
+        let row = apply_live_game(
+            &mut pairs,
+            "m0",
+            "m1",
+            JudgeDecision::A,
+            3,
+            "single-elimination",
+            0,
+        );
+        assert_eq!(row.games_resolved, 2);
+        assert_eq!((row.wins_a, row.wins_b), (2, 0));
+        assert_eq!(row.series_winner.as_deref(), Some("m0"));
+        assert!(!row.awaiting_tiebreak);
+        assert!(!row.seeded_fallback);
+        assert!(row.series_complete());
+
+        let late = apply_live_game(
+            &mut pairs,
+            "m0",
+            "m1",
+            JudgeDecision::B,
+            3,
+            "single-elimination",
+            0,
+        );
+        assert_eq!(late.games_resolved, 2);
+        assert_eq!((late.wins_a, late.wins_b), (2, 0));
+        assert_eq!(late.series_winner.as_deref(), Some("m0"));
+    }
+
+    #[test]
+    fn live_best_of_three_two_one_resolves_the_series() {
+        let mut pairs = Vec::new();
+        apply_live_game(
+            &mut pairs,
+            "m0",
+            "m1",
+            JudgeDecision::A,
+            3,
+            "king-of-the-hill",
+            0,
+        );
+        apply_live_game(
+            &mut pairs,
+            "m0",
+            "m1",
+            JudgeDecision::B,
+            3,
+            "king-of-the-hill",
+            0,
+        );
+        let row = apply_live_game(
+            &mut pairs,
+            "m0",
+            "m1",
+            JudgeDecision::A,
+            3,
+            "king-of-the-hill",
+            0,
+        );
+        assert_eq!(row.games_resolved, 3);
+        assert_eq!((row.wins_a, row.wins_b), (2, 1));
+        assert_eq!(row.series_winner.as_deref(), Some("m0"));
+        assert!(!row.awaiting_tiebreak);
+        assert!(!row.series_draw);
+    }
+
+    #[test]
+    fn live_best_of_three_two_regulation_draws_enter_elimination_tiebreak() {
+        for format in ["single-elimination", "king-of-the-hill"] {
+            let mut pairs = Vec::new();
+            apply_live_game(&mut pairs, "m0", "m1", JudgeDecision::Draw, 3, format, 0);
+            let row = apply_live_game(&mut pairs, "m0", "m1", JudgeDecision::Draw, 3, format, 0);
+            assert_eq!(row.games_resolved, 2);
+            assert_eq!((row.wins_a, row.wins_b), (0, 0));
+            assert!(row.awaiting_tiebreak, "{format}");
+            assert!(!row.series_draw, "{format}");
+            assert!(row.series_winner.is_none(), "{format}");
+            assert!(!row.series_complete(), "{format}");
+        }
+    }
+
+    #[test]
+    fn live_decisive_tiebreak_resolves_the_series() {
+        let mut pairs = Vec::new();
+        apply_live_game(
+            &mut pairs,
+            "m0",
+            "m1",
+            JudgeDecision::Draw,
+            3,
+            "single-elimination",
+            0,
+        );
+        apply_live_game(
+            &mut pairs,
+            "m0",
+            "m1",
+            JudgeDecision::Draw,
+            3,
+            "single-elimination",
+            0,
+        );
+        let row = apply_live_game(
+            &mut pairs,
+            "m0",
+            "m1",
+            JudgeDecision::B,
+            3,
+            "single-elimination",
+            0,
+        );
+        assert_eq!(row.games_resolved, 3);
+        assert_eq!(row.tiebreak_games, 1);
+        assert_eq!(row.series_winner.as_deref(), Some("m1"));
+        assert!(!row.awaiting_tiebreak);
+        assert!(!row.seeded_fallback);
+        assert!(row.series_complete());
+    }
+
+    #[test]
+    fn live_three_drawn_tiebreaks_trigger_seeded_fallback() {
+        let seed = 11u64;
+        let mut pairs = Vec::new();
+        apply_live_game(
+            &mut pairs,
+            "m0",
+            "m1",
+            JudgeDecision::Draw,
+            1,
+            "single-elimination",
+            seed,
+        );
+        assert!(pairs[0].awaiting_tiebreak);
+        for _ in 0..tournament::MAX_TIEBREAKS {
+            apply_live_game(
+                &mut pairs,
+                "m0",
+                "m1",
+                JudgeDecision::Draw,
+                1,
+                "single-elimination",
+                seed,
+            );
+        }
+        let row = &pairs[0];
+        let expected =
+            tournament::seeded_fallback_winner(seed, &ModelId::new("m0"), &ModelId::new("m1"));
+        assert_eq!(row.games_resolved, 1 + tournament::MAX_TIEBREAKS);
+        assert_eq!(row.tiebreak_games, tournament::MAX_TIEBREAKS);
+        assert!(row.seeded_fallback);
+        assert!(!row.awaiting_tiebreak);
+        assert_eq!(row.series_winner, Some(expected.to_string()));
+        assert!(row.series_complete());
+    }
+
+    #[test]
+    fn live_round_robin_series_draw_does_not_enter_tiebreaks() {
+        let mut pairs = Vec::new();
+        apply_live_game(
+            &mut pairs,
+            "m0",
+            "m1",
+            JudgeDecision::Draw,
+            3,
+            "round-robin",
+            0,
+        );
+        let row = apply_live_game(
+            &mut pairs,
+            "m0",
+            "m1",
+            JudgeDecision::Draw,
+            3,
+            "round-robin",
+            0,
+        );
+        assert_eq!(row.games_resolved, 2);
+        assert!(row.series_draw);
+        assert!(!row.awaiting_tiebreak);
+        assert!(row.series_winner.is_none());
+        assert!(!row.seeded_fallback);
+        assert!(row.series_complete());
+
+        let late = apply_live_game(
+            &mut pairs,
+            "m0",
+            "m1",
+            JudgeDecision::A,
+            3,
+            "round-robin",
+            0,
+        );
+        assert_eq!(late.games_resolved, 2);
+        assert!(late.series_draw);
+        assert!(late.series_winner.is_none());
+    }
+
+    #[test]
+    fn live_king_of_the_hill_advances_using_the_series_winner() {
+        let mut pairs = Vec::new();
+        apply_live_game(
+            &mut pairs,
+            "m0",
+            "m1",
+            JudgeDecision::A,
+            3,
+            "king-of-the-hill",
+            0,
+        );
+        let first = apply_live_game(
+            &mut pairs,
+            "m0",
+            "m1",
+            JudgeDecision::A,
+            3,
+            "king-of-the-hill",
+            0,
+        );
+        assert_eq!(first.series_winner.as_deref(), Some("m0"));
+
+        apply_live_game(
+            &mut pairs,
+            "m0",
+            "m2",
+            JudgeDecision::B,
+            3,
+            "king-of-the-hill",
+            0,
+        );
+        let second = apply_live_game(
+            &mut pairs,
+            "m0",
+            "m2",
+            JudgeDecision::B,
+            3,
+            "king-of-the-hill",
+            0,
+        );
+        assert_eq!(second.series_winner.as_deref(), Some("m2"));
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].series_winner.as_deref(), Some("m0"));
+        assert_eq!(pairs[1].series_winner.as_deref(), Some("m2"));
     }
 
     #[tokio::test]
