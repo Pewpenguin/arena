@@ -260,6 +260,15 @@ impl WebProviderKind {
     fn supports_model_discovery(self) -> bool {
         matches!(self, Self::Openai | Self::Compatible)
     }
+
+    fn as_persisted(self) -> &'static str {
+        match self {
+            Self::Openai => "openai",
+            Self::Claude => "anthropic",
+            Self::Gemini => "gemini",
+            Self::Compatible => "compatible",
+        }
+    }
 }
 
 struct ResolvedWebProvider {
@@ -923,6 +932,7 @@ async fn start_run(
         request.judge,
         tasks,
         resolved.base_url.clone(),
+        Some(resolved.kind.as_persisted().to_string()),
         seed,
         request.tournament,
         request.best_of,
@@ -1353,6 +1363,7 @@ fn build_exec_config(
         judge,
         tasks,
         base_url,
+        None,
         seed,
         TournamentFormat::RoundRobin,
         tournament::DEFAULT_BEST_OF,
@@ -1366,6 +1377,7 @@ pub(crate) fn build_exec_config_with_format(
     judge: Option<String>,
     tasks: Vec<Task>,
     base_url: String,
+    provider: Option<String>,
     seed: u64,
     tournament: TournamentFormat,
     best_of: u32,
@@ -1400,6 +1412,7 @@ pub(crate) fn build_exec_config_with_format(
         tasks_path: None,
         started_at: persist::utc_timestamp(),
         base_url,
+        provider,
     })
 }
 
@@ -5357,6 +5370,7 @@ mod tests {
             Some("judge".into()),
             vec![task()],
             "https://example.test/v1".into(),
+            None,
             0,
             TournamentFormat::SingleElimination,
             tournament::DEFAULT_BEST_OF,
@@ -5381,6 +5395,7 @@ mod tests {
             Some("judge".into()),
             vec![task()],
             "https://example.test/v1".into(),
+            None,
             0,
             TournamentFormat::KingOfTheHill,
             tournament::DEFAULT_BEST_OF,
@@ -5403,6 +5418,7 @@ mod tests {
             Some("judge".into()),
             vec![task()],
             "https://example.test/v1".into(),
+            None,
             0,
             TournamentFormat::SingleElimination,
             tournament::DEFAULT_BEST_OF,
@@ -5880,6 +5896,7 @@ mod tests {
             Some("judge".into()),
             vec![task()],
             "https://example.test/v1".into(),
+            None,
             0,
             TournamentFormat::KingOfTheHill,
             tournament::DEFAULT_BEST_OF,
@@ -5891,6 +5908,7 @@ mod tests {
             Some("judge".into()),
             vec![task()],
             "https://example.test/v1".into(),
+            None,
             0,
             TournamentFormat::SingleElimination,
             tournament::DEFAULT_BEST_OF,
@@ -5959,6 +5977,7 @@ mod tests {
             Some("judge".into()),
             vec![task()],
             "https://example.test/v1".into(),
+            None,
             0,
             TournamentFormat::RoundRobin,
             3,

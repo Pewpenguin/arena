@@ -33,6 +33,17 @@ impl fmt::Display for ProviderChoice {
     }
 }
 
+impl ProviderChoice {
+    pub fn as_persisted(self) -> &'static str {
+        match self {
+            Self::Openai => "openai",
+            Self::Openrouter => "openrouter",
+            Self::Anthropic => "anthropic",
+            Self::Gemini => "gemini",
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
     Run {

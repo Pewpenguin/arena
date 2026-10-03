@@ -101,7 +101,16 @@ async fn exec_with_provider(
             let provider = OpenAICompatibleProvider::from_env()?;
             let base_url = provider.base_url().to_string();
             run_exec(
-                provider, base_url, tasks_path, models, output, judge, tournament, best_of, seed,
+                provider,
+                base_url,
+                Some(choice.as_persisted().to_string()),
+                tasks_path,
+                models,
+                output,
+                judge,
+                tournament,
+                best_of,
+                seed,
             )
             .await
         }
@@ -109,7 +118,16 @@ async fn exec_with_provider(
             let provider = OpenRouterProvider::from_env()?;
             let base_url = provider.base_url().to_string();
             run_exec(
-                provider, base_url, tasks_path, models, output, judge, tournament, best_of, seed,
+                provider,
+                base_url,
+                Some(choice.as_persisted().to_string()),
+                tasks_path,
+                models,
+                output,
+                judge,
+                tournament,
+                best_of,
+                seed,
             )
             .await
         }
@@ -117,7 +135,16 @@ async fn exec_with_provider(
             let provider = AnthropicProvider::from_env()?;
             let base_url = provider.base_url().to_string();
             run_exec(
-                provider, base_url, tasks_path, models, output, judge, tournament, best_of, seed,
+                provider,
+                base_url,
+                Some(choice.as_persisted().to_string()),
+                tasks_path,
+                models,
+                output,
+                judge,
+                tournament,
+                best_of,
+                seed,
             )
             .await
         }
@@ -125,7 +152,16 @@ async fn exec_with_provider(
             let provider = GeminiProvider::from_env()?;
             let base_url = provider.base_url().to_string();
             run_exec(
-                provider, base_url, tasks_path, models, output, judge, tournament, best_of, seed,
+                provider,
+                base_url,
+                Some(choice.as_persisted().to_string()),
+                tasks_path,
+                models,
+                output,
+                judge,
+                tournament,
+                best_of,
+                seed,
             )
             .await
         }
@@ -136,6 +172,7 @@ async fn exec_with_provider(
 async fn run_exec<P>(
     provider: P,
     base_url: String,
+    persisted_provider: Option<String>,
     tasks_path: PathBuf,
     models: Vec<String>,
     output: Option<PathBuf>,
@@ -171,6 +208,7 @@ where
         tasks_path: Some(tasks_path),
         started_at,
         base_url,
+        provider: persisted_provider,
     };
     let (output_data, failed_pairs) = exec::collect_exec(
         &provider,

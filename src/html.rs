@@ -878,6 +878,9 @@ fn push_config(html: &mut String, config: &RunConfig<'_>, tournament: Option<&To
             .unwrap_or_default(),
     );
     dt_dd(html, "Base URL", &escape(config.base_url));
+    if let Some(provider) = config.provider {
+        dt_dd(html, "Provider", &escape(provider));
+    }
     dt_dd(html, "Started at", &escape(config.started_at));
     dt_dd(
         html,

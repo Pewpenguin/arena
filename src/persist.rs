@@ -39,6 +39,8 @@ pub struct RunMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) tasks: Option<PathBuf>,
     pub(crate) base_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) provider: Option<String>,
     pub(crate) started_at: String,
     pub(crate) provider_concurrency: usize,
     pub(crate) request_timeout_secs: u64,
@@ -86,6 +88,7 @@ impl RunMetadata {
             judge,
             tasks,
             base_url: base_url.into(),
+            provider: None,
             started_at,
             provider_concurrency: crate::provider::PROVIDER_CONCURRENCY,
             request_timeout_secs: crate::provider::REQUEST_TIMEOUT.as_secs(),
@@ -243,6 +246,7 @@ mod tests {
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(value["models"], serde_json::json!(["a"]));
         assert_eq!(value["base_url"], "https://example.test/v1");
+        assert!(value.get("provider").is_none());
         assert!(value.get("judge").is_none());
         assert!(value.get("tasks").is_none());
         assert_eq!(value["started_at"], "2026-01-02T03:04:05Z");

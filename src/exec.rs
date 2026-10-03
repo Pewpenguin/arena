@@ -28,6 +28,7 @@ pub struct ExecConfig {
     pub tasks_path: Option<PathBuf>,
     pub started_at: String,
     pub base_url: String,
+    pub provider: Option<String>,
 }
 
 pub fn unique_models(ids: Vec<String>) -> Result<Vec<ModelId>> {
@@ -220,6 +221,7 @@ where
         config.started_at.clone(),
         config.base_url.clone(),
     );
+    run.provider = config.provider.clone();
     let (judgments, judgment_failures, statistics, ratings, expected, resolved, failed) =
         if config.judge.is_some() {
             let statistics = stats::aggregate(&judgments, &config.models);
@@ -343,6 +345,7 @@ mod tests {
             tasks_path: Some(PathBuf::from("tasks.json")),
             started_at: "2026-01-02T03:04:05Z".into(),
             base_url: "https://example.test/v1".into(),
+            provider: None,
         }
     }
 
@@ -648,6 +651,7 @@ mod tests {
             tasks_path: Some(PathBuf::from("tasks.json")),
             started_at: "2026-01-02T03:04:05Z".into(),
             base_url: "https://example.test/v1".into(),
+            provider: None,
         };
 
         let (output, failed_pairs) = collect_exec(&OkProvider, &cfg, |_| {}, |_| {}, |_| {})
