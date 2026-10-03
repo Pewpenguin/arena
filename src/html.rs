@@ -2,8 +2,8 @@ use crate::bootstrap::BootstrapUnavailable;
 use crate::judge::{JudgeDecision, OrientationFailure};
 use crate::rating::UnavailableReason;
 use crate::report::{
-    BootstrapReport, CandidateRow, FailedPairRow, ModelReport, PairRow, Report, ReportSummary,
-    RunConfig,
+    BootstrapReport, CandidateRow, ComparisonRow, FailedPairRow, ModelReport, PairRow, Report,
+    ReportSummary, RunConfig,
 };
 use crate::tournament::{
     MatchOutcome, TaskBracket, Tournament, TournamentFormat, TournamentStatus,
@@ -38,10 +38,10 @@ pub fn render_with_nav(report: &Report<'_>, back_href: Option<&str>) -> String {
         report.tournament,
     );
     push_models(&mut html, &report.models, report.summary.judge_used);
+    if let Some(tournament) = report.tournament {
+        push_tournament(&mut html, tournament, report.summary.judge_used);
+    }
     if report.summary.judge_used {
-        if let Some(tournament) = report.tournament {
-            push_tournament(&mut html, tournament);
-        }
         push_pairs(&mut html, &report.pairs);
         if !report.failed_pairs.is_empty() {
             push_failures(&mut html, &report.failed_pairs);
@@ -50,6 +50,7 @@ pub fn render_with_nav(report: &Report<'_>, back_href: Option<&str>) -> String {
             push_bootstrap(&mut html, bootstrap);
         }
     }
+    push_comparisons(&mut html, &report.comparisons);
     push_results(&mut html, &report.results);
     if report.summary.judge_used {
         push_audit(&mut html, &report.pairs);
@@ -243,12 +244,52 @@ fn unavailable(reason: UnavailableReason) -> &'static str {
     }
 }
 
+fn unavailable_detail(reason: UnavailableReason) -> &'static str {
+    match reason {
+        UnavailableReason::NoComparisons => "no resolved judgments involving this model",
+        UnavailableReason::Disconnected => {
+            "comparison graph has multiple separate components on one scale"
+        }
+        UnavailableReason::Separated => {
+            "outcomes are completely separated; no finite Bradley–Terry rating"
+        }
+        UnavailableReason::Nonconvergence => "Bradley–Terry iteration did not meet tolerance",
+        UnavailableReason::NonfiniteResult => "fitted strengths were not finite and positive",
+    }
+}
+
+fn unavailable_label(reason: UnavailableReason) -> String {
+    format!("{} — {}", unavailable(reason), unavailable_detail(reason))
+}
+
 fn bootstrap_unavailable(reason: BootstrapUnavailable) -> &'static str {
     match reason {
         BootstrapUnavailable::TooFewTasks => "too_few_tasks",
         BootstrapUnavailable::OriginalUnrated => "original_unrated",
         BootstrapUnavailable::InvalidReplicates => "invalid_replicates",
     }
+}
+
+fn bootstrap_unavailable_detail(reason: BootstrapUnavailable) -> &'static str {
+    match reason {
+        BootstrapUnavailable::TooFewTasks => {
+            "fewer than two task clusters among resolved judgments"
+        }
+        BootstrapUnavailable::OriginalUnrated => {
+            "at least one requested model has no finite full-data rating"
+        }
+        BootstrapUnavailable::InvalidReplicates => {
+            "not every bootstrap replicate produced finite ratings for every model"
+        }
+    }
+}
+
+fn bootstrap_unavailable_label(reason: BootstrapUnavailable) -> String {
+    format!(
+        "{} — {}",
+        bootstrap_unavailable(reason),
+        bootstrap_unavailable_detail(reason)
+    )
 }
 
 fn agreement_label(agreement: bool) -> &'static str {
@@ -359,6 +400,9 @@ fn push_models(html: &mut String, models: &[ModelReport<'_>], judge_used: bool) 
         html.push_str(
             "<p class=\"note\">Bradley–Terry rating · derived from resolved judged games (W/L/D are per game)</p>\n",
         );
+        html.push_str(
+            "<p class=\"note\">Candidates are executed once per task and model. Best-of-N and elimination tiebreak games re-judge those same candidate responses. Statistics and ratings count resolved judged games. A seeded fallback advances a candidate in the tournament only; it is not a judgment or rating observation.</p>\n",
+        );
         html.push_str("<div class=\"scroll\"><table>\n<thead><tr>");
         html.push_str(
             "<th>Model</th><th>W</th><th>L</th><th>D</th><th>Total</th><th>Rating</th><th>Lower bound</th><th>Upper bound</th><th>Unavailable reason</th>",
@@ -382,7 +426,9 @@ fn push_models(html: &mut String, models: &[ModelReport<'_>], judge_used: bool) 
             html.push_str("</td><td>");
             html.push_str(&bound_cell(model.rating_upper));
             html.push_str("</td><td>");
-            html.push_str(model.unavailable.map(unavailable).unwrap_or(""));
+            if let Some(reason) = model.unavailable {
+                html.push_str(&escape(&unavailable_label(reason)));
+            }
             html.push_str("</td></tr>\n");
         }
     } else {
@@ -428,22 +474,58 @@ fn push_results(html: &mut String, results: &[CandidateRow<'_>]) {
     html.push_str("</section>\n");
 }
 
-fn push_tournament(html: &mut String, tournament: &Tournament) {
+fn push_tournament(html: &mut String, tournament: &Tournament, judge_used: bool) {
     let elimination = tournament.format == TournamentFormat::SingleElimination;
     let hill = tournament.format == TournamentFormat::KingOfTheHill;
     let series = tournament.best_of > 1;
-    if !elimination && !hill && !series {
-        return;
-    }
+    let not_judged = tournament.status == TournamentStatus::NotJudged || !judge_used;
     html.push_str("<section>\n<h2>");
     if elimination {
         html.push_str("Single-elimination");
     } else if hill {
         html.push_str("King of the Hill");
     } else {
-        html.push_str(&format!("Best of {}", tournament.best_of));
+        html.push_str("Round robin");
     }
-    html.push_str("</h2>\n<p class=\"note\">");
+    if series {
+        html.push_str(&format!(" · Best of {}", tournament.best_of));
+    }
+    html.push_str("</h2>\n");
+    html.push_str("<p class=\"meta\">");
+    html.push_str(tournament.format.as_str());
+    html.push_str(" · status ");
+    html.push_str(tournament.status.as_str());
+    html.push_str(" · Best of ");
+    html.push_str(&tournament.best_of.to_string());
+    html.push_str("</p>\n");
+    if not_judged {
+        html.push_str(
+            "<p class=\"note\">Tournament format and Best-of were configured for this run, but no judge was used. No matches were judged; the table below is omitted rather than inventing results.</p>\n",
+        );
+        html.push_str("<p class=\"note\">Candidates: ");
+        for (index, model) in tournament.candidates.iter().enumerate() {
+            if index > 0 {
+                html.push_str(" · ");
+            }
+            html.push_str(&escape(&model.to_string()));
+        }
+        html.push_str("</p>\n");
+        if let Some(opening) = &tournament.opening_matchups {
+            html.push_str("<p class=\"note\">Opening matchups: ");
+            for (index, pair) in opening.iter().enumerate() {
+                if index > 0 {
+                    html.push_str(" · ");
+                }
+                html.push_str(&escape(&pair.model_a.to_string()));
+                html.push_str(" vs ");
+                html.push_str(&escape(&pair.model_b.to_string()));
+            }
+            html.push_str("</p>\n");
+        }
+        html.push_str("</section>\n");
+        return;
+    }
+    html.push_str("<p class=\"note\">");
     html.push_str(if elimination && series {
         "Each match is a best-of series. The winner advances. A drawn series plays up to three tie-break games, then a seeded fallback (not a judged win)."
     } else if elimination {
@@ -452,10 +534,15 @@ fn push_tournament(html: &mut String, tournament: &Tournament) {
         "Candidates challenge in configured order. Each match is a best-of series. The winner remains on the hill. A drawn series plays up to three tie-break games, then a seeded fallback (not a judged win)."
     } else if hill {
         "Candidates challenge in configured order. The winner remains on the hill. A drawn series plays up to three tie-break games, then a seeded fallback (not a judged win)."
-    } else {
+    } else if series {
         "Each pairing plays one best-of series. Series draws do not count as wins."
+    } else {
+        "Every unordered candidate pairing plays one series. Round robin does not name a champion."
     });
     html.push_str("</p>\n");
+    html.push_str(
+        "<p class=\"note\">Candidates are executed once per task and model. Best-of-N and elimination tiebreak games re-judge those same candidate responses. Statistics and ratings count resolved judged games. A seeded fallback advances a candidate in the tournament only; it is not a judgment or rating observation.</p>\n",
+    );
     if let Some(opening) = &tournament.opening_matchups {
         html.push_str("<p class=\"note\">Opening matchups: ");
         for (index, pair) in opening.iter().enumerate() {
@@ -494,6 +581,34 @@ fn push_tournament(html: &mut String, tournament: &Tournament) {
             html.push_str(&escape(&match_result(row, tournament.format)));
             html.push_str("</td></tr>\n");
         }
+    }
+    html.push_str("</tbody></table></div>\n</section>\n");
+}
+
+fn push_comparisons(html: &mut String, comparisons: &[ComparisonRow<'_>]) {
+    if comparisons.is_empty() {
+        return;
+    }
+    html.push_str("<section>\n<h2>Exact comparisons</h2>\n");
+    html.push_str(
+        "<p class=\"note\">Pairwise winners from exact-score evaluation. These are separate from LLM-judge results and are not used by Bradley–Terry ratings.</p>\n",
+    );
+    html.push_str("<div class=\"scroll\"><table>\n<thead><tr>");
+    html.push_str("<th>Task</th><th>Model A</th><th>Model B</th><th>Winner</th>");
+    html.push_str("</tr></thead>\n<tbody>\n");
+    for comparison in comparisons {
+        html.push_str("<tr><td>");
+        html.push_str(&escape(comparison.task_id));
+        html.push_str("</td><td class=\"model-id\">");
+        html.push_str(&escape(&comparison.model_a.to_string()));
+        html.push_str("</td><td class=\"model-id\">");
+        html.push_str(&escape(&comparison.model_b.to_string()));
+        html.push_str("</td><td class=\"model-id\">");
+        match comparison.winner {
+            Some(winner) => html.push_str(&escape(&winner.to_string())),
+            None => html.push_str("draw"),
+        }
+        html.push_str("</td></tr>\n");
     }
     html.push_str("</tbody></table></div>\n</section>\n");
 }
@@ -727,10 +842,10 @@ fn push_bootstrap(html: &mut String, bootstrap: &BootstrapReport) {
     dt_dd(
         html,
         "Unavailable reason",
-        bootstrap
+        &bootstrap
             .unavailable
-            .map(bootstrap_unavailable)
-            .unwrap_or(""),
+            .map(bootstrap_unavailable_label)
+            .unwrap_or_default(),
     );
     html.push_str("</dl>\n</section>\n");
 }

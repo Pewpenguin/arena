@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::bootstrap::BootstrapUnavailable;
+use crate::compare::Comparison;
 use crate::evaluate::EvaluatedResult;
 use crate::judge::{JudgeDecision, Judgment, JudgmentFailure, OrientationFailure};
 use crate::persist::{JudgeDecoding, Output};
@@ -15,6 +16,7 @@ pub struct Report<'a> {
     pub config: RunConfig<'a>,
     pub models: Vec<ModelReport<'a>>,
     pub results: Vec<CandidateRow<'a>>,
+    pub comparisons: Vec<ComparisonRow<'a>>,
     pub pairs: Vec<PairRow<'a>>,
     pub failed_pairs: Vec<FailedPairRow<'a>>,
     pub bootstrap: Option<BootstrapReport>,
@@ -71,6 +73,14 @@ pub struct CandidateRow<'a> {
     pub response: &'a str,
     pub score: Option<f64>,
     pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComparisonRow<'a> {
+    pub task_id: &'a str,
+    pub model_a: &'a ModelId,
+    pub model_b: &'a ModelId,
+    pub winner: Option<&'a ModelId>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -156,6 +166,7 @@ pub fn from_output(output: &Output) -> Report<'_> {
             })
             .collect(),
         results: output.results.iter().map(candidate_row).collect(),
+        comparisons: output.comparisons.iter().map(comparison_row).collect(),
         pairs: output
             .judgments
             .as_deref()
@@ -202,6 +213,15 @@ fn candidate_row(result: &EvaluatedResult) -> CandidateRow<'_> {
         response: &result.response.text,
         score: result.evaluation.as_ref().map(|item| item.score),
         duration_ms: result.duration_ms,
+    }
+}
+
+fn comparison_row(comparison: &Comparison) -> ComparisonRow<'_> {
+    ComparisonRow {
+        task_id: &comparison.task_id,
+        model_a: &comparison.model_a,
+        model_b: &comparison.model_b,
+        winner: comparison.winner.as_ref(),
     }
 }
 
@@ -356,6 +376,7 @@ mod tests {
         assert!(report.bootstrap.is_none());
         assert!(report.pairs.is_empty());
         assert!(report.failed_pairs.is_empty());
+        assert!(report.comparisons.is_empty());
         assert!(report.results.is_empty());
         assert_eq!(report.models[0].model, &ModelId::new("m0"));
         assert_eq!(report.models[1].model, &ModelId::new("m1"));
