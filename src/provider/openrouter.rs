@@ -3,7 +3,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use super::http;
-use super::{CompletionRequest, CompletionResponse, ModelProvider, ProviderError};
+use super::{CompletionRequest, CompletionResponse, ModelId, ModelProvider, ProviderError};
 
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 const API_KEY_ENV: &str = "ARENA_OPENROUTER_API_KEY";
@@ -44,6 +44,25 @@ impl OpenRouterProvider {
 
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    pub async fn list_models(&self) -> Result<Vec<ModelId>, ProviderError> {
+        let bytes = http::execute_json(
+            self.client
+                .get(models_url(&self.base_url))
+                .bearer_auth(&self.api_key),
+            &self.api_key,
+        )
+        .await?;
+
+        let parsed: ModelsResponse = serde_json::from_slice(&bytes)
+            .map_err(|error| http::invalid_json(&error, &self.api_key))?;
+
+        Ok(parsed
+            .data
+            .into_iter()
+            .map(|model| ModelId::new(model.id))
+            .collect())
     }
 }
 
@@ -90,6 +109,20 @@ impl ModelProvider for OpenRouterProvider {
 
 fn chat_completions_url(base_url: &str) -> String {
     format!("{}/chat/completions", base_url.trim_end_matches('/'))
+}
+
+fn models_url(base_url: &str) -> String {
+    format!("{}/models", base_url.trim_end_matches('/'))
+}
+
+#[derive(Deserialize)]
+struct ModelsResponse {
+    data: Vec<ModelListEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelListEntry {
+    id: String,
 }
 
 #[derive(Serialize)]

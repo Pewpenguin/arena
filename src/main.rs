@@ -5,7 +5,7 @@ use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 
 use arena::cli::{Cli, Command, ProviderChoice};
-use arena::error::Result;
+use arena::error::{Error, Result};
 use arena::exec::{self, ExecConfig};
 use arena::html;
 use arena::persist;
@@ -14,6 +14,7 @@ use arena::provider::{
     ModelProvider, OpenAICompatibleProvider, OpenRouterProvider,
 };
 use arena::report;
+use arena::selection::{self, ResolvedSelection};
 use arena::task;
 use arena::tournament::{self, TournamentFormat};
 use arena::web;
@@ -34,12 +35,23 @@ async fn main() -> Result<()> {
             models,
             output,
             judge,
+            random,
+            selection_seed,
             tournament,
             best_of,
             seed,
         } => {
             exec_with_provider(
-                provider, tasks_path, models, output, judge, tournament, best_of, seed,
+                provider,
+                tasks_path,
+                models,
+                output,
+                judge,
+                random,
+                selection_seed,
+                tournament,
+                best_of,
+                seed,
             )
             .await?;
         }
@@ -92,6 +104,8 @@ async fn exec_with_provider(
     models: Vec<String>,
     output: Option<PathBuf>,
     judge: Option<String>,
+    random: bool,
+    selection_seed: Option<u64>,
     tournament: TournamentFormat,
     best_of: u32,
     seed: u64,
@@ -100,14 +114,19 @@ async fn exec_with_provider(
         ProviderChoice::Openai => {
             let provider = OpenAICompatibleProvider::from_env()?;
             let base_url = provider.base_url().to_string();
+            let resolved = if random {
+                let universe = provider.list_models().await?;
+                autonomous_from_universe(universe, selection_seed)?
+            } else {
+                selection::manual(models, judge)?
+            };
             run_exec(
                 provider,
                 base_url,
                 Some(choice.as_persisted().to_string()),
                 tasks_path,
-                models,
+                resolved,
                 output,
-                judge,
                 tournament,
                 best_of,
                 seed,
@@ -117,14 +136,19 @@ async fn exec_with_provider(
         ProviderChoice::Openrouter => {
             let provider = OpenRouterProvider::from_env()?;
             let base_url = provider.base_url().to_string();
+            let resolved = if random {
+                let universe = provider.list_models().await?;
+                autonomous_from_universe(universe, selection_seed)?
+            } else {
+                selection::manual(models, judge)?
+            };
             run_exec(
                 provider,
                 base_url,
                 Some(choice.as_persisted().to_string()),
                 tasks_path,
-                models,
+                resolved,
                 output,
-                judge,
                 tournament,
                 best_of,
                 seed,
@@ -134,14 +158,20 @@ async fn exec_with_provider(
         ProviderChoice::Anthropic => {
             let provider = AnthropicProvider::from_env()?;
             let base_url = provider.base_url().to_string();
+            let resolved = if random {
+                return Err(Error::RandomRequiresDiscovery {
+                    provider: "anthropic",
+                });
+            } else {
+                selection::manual(models, judge)?
+            };
             run_exec(
                 provider,
                 base_url,
                 Some(choice.as_persisted().to_string()),
                 tasks_path,
-                models,
+                resolved,
                 output,
-                judge,
                 tournament,
                 best_of,
                 seed,
@@ -151,14 +181,18 @@ async fn exec_with_provider(
         ProviderChoice::Gemini => {
             let provider = GeminiProvider::from_env()?;
             let base_url = provider.base_url().to_string();
+            let resolved = if random {
+                return Err(Error::RandomRequiresDiscovery { provider: "gemini" });
+            } else {
+                selection::manual(models, judge)?
+            };
             run_exec(
                 provider,
                 base_url,
                 Some(choice.as_persisted().to_string()),
                 tasks_path,
-                models,
+                resolved,
                 output,
-                judge,
                 tournament,
                 best_of,
                 seed,
@@ -168,15 +202,22 @@ async fn exec_with_provider(
     }
 }
 
+fn autonomous_from_universe(
+    universe: Vec<ModelId>,
+    selection_seed: Option<u64>,
+) -> Result<ResolvedSelection> {
+    let ids: Vec<String> = universe.iter().map(ToString::to_string).collect();
+    selection::autonomous(ids, selection_seed)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_exec<P>(
     provider: P,
     base_url: String,
     persisted_provider: Option<String>,
     tasks_path: PathBuf,
-    models: Vec<String>,
+    resolved: ResolvedSelection,
     output: Option<PathBuf>,
-    judge: Option<String>,
     tournament: TournamentFormat,
     best_of: u32,
     seed: u64,
@@ -184,9 +225,8 @@ async fn run_exec<P>(
 where
     P: ModelProvider + Clone + Send + 'static,
 {
-    let models = exec::unique_models(models)?;
-    let judge = judge.map(ModelId::new);
-    exec::validate_judge(&models, judge.as_ref())?;
+    let models = resolved.models;
+    let judge = resolved.judge;
     let started_at = persist::utc_timestamp();
     let tasks = task::load(&tasks_path)?;
     tournament::validate(tournament, models.len())?;
@@ -209,6 +249,7 @@ where
         started_at,
         base_url,
         provider: persisted_provider,
+        selection: resolved.provenance,
     };
     let (output_data, failed_pairs) = exec::collect_exec(
         &provider,

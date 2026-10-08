@@ -28,6 +28,7 @@ use crate::provider::{
     AnthropicProvider, GeminiProvider, ModelId, ModelProvider, OpenAICompatibleProvider,
 };
 use crate::report;
+use crate::selection;
 use crate::task::{self, Task};
 use crate::tournament::{self, OpeningMatchup, Tournament, TournamentFormat, TournamentStatus};
 
@@ -332,9 +333,17 @@ struct StartRequest {
     base_url: String,
     #[serde(default)]
     api_key: String,
+    #[serde(default)]
     models: Vec<String>,
     #[serde(default)]
     judge: Option<String>,
+    /// When true, Arena chooses candidates and judge from `universe`.
+    #[serde(default)]
+    random: bool,
+    #[serde(default)]
+    universe: Vec<String>,
+    #[serde(default)]
+    selection_seed: Option<String>,
     tasks: serde_json::Value,
     #[serde(default)]
     seed: String,
@@ -344,6 +353,24 @@ struct StartRequest {
     best_of: u32,
     #[serde(default)]
     opening_matchups: Option<Vec<OpeningMatchup>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SelectRequest {
+    #[serde(default)]
+    universe: Vec<String>,
+    #[serde(default)]
+    selection_seed: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SelectResponse {
+    models: Vec<String>,
+    judge: Option<String>,
+    /// Decimal string so JavaScript can round-trip arbitrary u64 values exactly.
+    selection_seed: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    universe: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -806,6 +833,13 @@ fn waiting_pairs(
     pairs
 }
 
+fn parse_optional_seed(raw: Option<&str>) -> std::result::Result<Option<u64>, &'static str> {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(None),
+        Some(value) => parse_seed(value).map(Some),
+    }
+}
+
 fn parse_seed(raw: &str) -> std::result::Result<u64, &'static str> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -839,6 +873,7 @@ fn router_with_state(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(page))
         .route("/api/models", post(load_models))
+        .route("/api/select", post(select_models))
         .route("/api/runs", get(list_runs).post(start_run))
         .route("/api/runs/{run_id}/events", get(run_events))
         .route("/api/runs/{run_id}/report", get(run_report))
@@ -890,6 +925,34 @@ async fn load_models(
     }
 }
 
+async fn select_models(Json(request): Json<SelectRequest>) -> Response {
+    let selection_seed = match parse_optional_seed(request.selection_seed.as_deref()) {
+        Ok(seed) => seed,
+        Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
+    };
+    match selection::autonomous(request.universe, selection_seed) {
+        Ok(resolved) => {
+            let provenance = resolved.provenance.as_ref();
+            (
+                StatusCode::OK,
+                Json(SelectResponse {
+                    models: resolved.models.iter().map(ToString::to_string).collect(),
+                    judge: resolved.judge.as_ref().map(ToString::to_string),
+                    selection_seed: provenance
+                        .map(|item| item.selection_seed)
+                        .or(selection_seed)
+                        .unwrap_or(0)
+                        .to_string(),
+                    universe: provenance
+                        .map(|item| item.universe.iter().map(ToString::to_string).collect()),
+                }),
+            )
+                .into_response()
+        }
+        Err(error) => json_error(StatusCode::BAD_REQUEST, error.to_string()),
+    }
+}
+
 async fn start_run(
     State(state): State<Arc<AppState>>,
     Json(request): Json<StartRequest>,
@@ -926,10 +989,17 @@ async fn start_run(
         Ok(seed) => seed,
         Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
     };
+    let selection_seed = match parse_optional_seed(request.selection_seed.as_deref()) {
+        Ok(seed) => seed,
+        Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
+    };
 
     let config = match build_exec_config_with_format(
         request.models,
         request.judge,
+        request.random,
+        request.universe,
+        selection_seed,
         tasks,
         resolved.base_url.clone(),
         Some(resolved.kind.as_persisted().to_string()),
@@ -1361,6 +1431,9 @@ fn build_exec_config(
     build_exec_config_with_format(
         models,
         judge,
+        false,
+        Vec::new(),
+        None,
         tasks,
         base_url,
         None,
@@ -1375,6 +1448,9 @@ fn build_exec_config(
 pub(crate) fn build_exec_config_with_format(
     models: Vec<String>,
     judge: Option<String>,
+    random: bool,
+    universe: Vec<String>,
+    selection_seed: Option<u64>,
     tasks: Vec<Task>,
     base_url: String,
     provider: Option<String>,
@@ -1383,28 +1459,44 @@ pub(crate) fn build_exec_config_with_format(
     best_of: u32,
     opening_matchups: Option<Vec<OpeningMatchup>>,
 ) -> Result<ExecConfig> {
-    let models = exec::unique_models(
-        models
-            .into_iter()
-            .map(|model| model.trim().to_string())
-            .filter(|model| !model.is_empty())
-            .collect(),
-    )?;
-    if models.is_empty() {
-        return Err(Error::NoCandidates);
-    }
-    let judge = judge
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .map(ModelId::new);
-    exec::validate_judge(&models, judge.as_ref())?;
-    tournament::validate(tournament, models.len())?;
+    let resolved = if random {
+        if judge.as_ref().is_some_and(|value| !value.trim().is_empty()) {
+            return Err(Error::ConflictingSelectionMode);
+        }
+        let picked = selection::autonomous(universe, selection_seed)?;
+        if !models.is_empty() {
+            let ordered = crate::exec::unique_models(
+                models
+                    .into_iter()
+                    .map(|model| model.trim().to_string())
+                    .filter(|model| !model.is_empty())
+                    .collect(),
+            )?;
+            if !same_model_set(&ordered, &picked.models) {
+                return Err(Error::SelectionMismatch);
+            }
+            selection::ResolvedSelection {
+                models: ordered,
+                judge: picked.judge,
+                provenance: picked.provenance,
+            }
+        } else {
+            picked
+        }
+    } else {
+        selection::manual(models, judge)?
+    };
+    tournament::validate(tournament, resolved.models.len())?;
     tournament::validate_best_of(best_of)?;
-    tournament::validate_opening_matchups(tournament, &models, opening_matchups.as_deref())?;
+    tournament::validate_opening_matchups(
+        tournament,
+        &resolved.models,
+        opening_matchups.as_deref(),
+    )?;
     Ok(ExecConfig {
         tasks,
-        models,
-        judge,
+        models: resolved.models,
+        judge: resolved.judge,
         tournament,
         best_of,
         opening_matchups,
@@ -1413,7 +1505,19 @@ pub(crate) fn build_exec_config_with_format(
         started_at: persist::utc_timestamp(),
         base_url,
         provider,
+        selection: resolved.provenance,
     })
+}
+
+fn same_model_set(left: &[ModelId], right: &[ModelId]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut left_sorted = left.to_vec();
+    let mut right_sorted = right.to_vec();
+    left_sorted.sort();
+    right_sorted.sort();
+    left_sorted == right_sorted
 }
 
 const PAGE: &str = r#"<!doctype html>
@@ -1479,6 +1583,7 @@ body {
     "provider provider"
     "manual manual"
     "candidates judge"
+    "resolved resolved"
     "tasks tasks"
     "controls controls";
   gap: 16px 24px;
@@ -1489,6 +1594,7 @@ body {
 .manual { grid-area: manual; }
 .candidates { grid-area: candidates; }
 .judge { grid-area: judge; }
+.resolved { grid-area: resolved; }
 .tasks { grid-area: tasks; }
 .controls { grid-area: controls; }
 .workspace > .region { min-width: 0; }
@@ -1530,7 +1636,13 @@ textarea {
   font-size: .84rem;
   line-height: 1.45;
 }
-#seed, #best_of { max-width: 8rem; font-family: var(--mono); font-size: .9rem; }
+#seed, #best_of, #selection_seed { max-width: 8rem; font-family: var(--mono); font-size: .9rem; }
+.selection-fields { display: flex; flex-wrap: wrap; gap: 12px 16px; margin-top: 12px; align-items: end; }
+.selection-fields > div { min-width: 7rem; }
+.mode-row { margin: 0 0 12px; }
+.resolved-list { margin: 0; font: .84rem/1.45 var(--mono); }
+.resolved-list + .resolved-list { margin-top: 4px; }
+.resolved[hidden] { display: none; }
 button {
   padding: 6px 12px;
   border: 1px solid var(--line);
@@ -2031,7 +2143,7 @@ tr.detail-row td {
   .wrap { padding: 16px; }
   .workspace {
     grid-template-columns: 1fr;
-    grid-template-areas: "provider" "manual" "candidates" "judge" "tasks" "controls";
+    grid-template-areas: "provider" "manual" "candidates" "judge" "resolved" "tasks" "controls";
     gap: 16px;
   }
   .segments { gap: 8px 16px; }
@@ -2090,20 +2202,36 @@ tr.detail-row td {
 </section>
 
 <section class="region candidates">
-  <h2>Candidate models</h2>
-  <div class="picker" id="candidate_picker">
-    <button id="candidate_toggle" class="picker-toggle" type="button" aria-expanded="false" aria-controls="candidate_menu">
-      <span id="candidate_label" class="placeholder">Select candidate models</span>
-    </button>
-    <div id="candidate_menu" class="picker-menu">
-      <input id="candidate_search" type="text" placeholder="Search models..." autocomplete="off">
-      <div id="candidate_options" class="picker-options"></div>
+  <h2>Selection</h2>
+  <div class="segments mode-row" role="group" aria-label="Selection mode">
+    <button type="button" class="segment is-selected" data-selection-mode="manual" aria-pressed="true">Manual</button>
+    <button type="button" class="segment" data-selection-mode="random" aria-pressed="false">Arena selects</button>
+  </div>
+  <div id="manual_selection">
+    <h2>Candidate models</h2>
+    <div class="picker" id="candidate_picker">
+      <button id="candidate_toggle" class="picker-toggle" type="button" aria-expanded="false" aria-controls="candidate_menu">
+        <span id="candidate_label" class="placeholder">Select candidate models</span>
+      </button>
+      <div id="candidate_menu" class="picker-menu">
+        <input id="candidate_search" type="text" placeholder="Search models..." autocomplete="off">
+        <div id="candidate_options" class="picker-options"></div>
+      </div>
+    </div>
+    <ul id="selected_models" class="selected-models"></ul>
+  </div>
+  <div id="random_selection" hidden>
+    <p class="meta">Arena chooses candidates and a judge from the models available above (load or add models first).</p>
+    <div class="selection-fields">
+      <div>
+        <label for="selection_seed">Selection seed</label>
+        <input id="selection_seed" type="text" inputmode="numeric" placeholder="optional" autocomplete="off">
+      </div>
     </div>
   </div>
-  <ul id="selected_models" class="selected-models"></ul>
 </section>
 
-<section class="region judge">
+<section class="region judge" id="judge_section">
   <h2>Judge model</h2>
   <div class="picker" id="judge_picker">
     <button id="judge_toggle" class="picker-toggle" type="button" aria-expanded="false" aria-controls="judge_menu">
@@ -2115,6 +2243,14 @@ tr.detail-row td {
     </div>
   </div>
   <input id="judge" type="hidden" value="">
+</section>
+
+<section class="region resolved" id="resolved_section" hidden>
+  <h2>Arena selection</h2>
+  <p class="meta">Fixed before the run starts.</p>
+  <p id="resolved_candidates" class="resolved-list">Candidates: —</p>
+  <p id="resolved_judge" class="resolved-list">Judge: —</p>
+  <p id="resolved_status" class="status"></p>
 </section>
 
 <section class="region tasks">
@@ -2320,14 +2456,28 @@ const openingSlots = [];
 const kothOrder = [];
 let launchCandidates = [];
 let provider = "openai";
+let selectionMode = "manual";
 let candidateQuery = "";
 let judgeQuery = "";
 let activeMenu = "";
 let judgeValue = "";
+let resolvedModels = [];
+let resolvedJudge = null;
+let resolveTimer = null;
+let resolveSeq = 0;
 let view = null;
 let seenSeq = 0;
 let elapsedTimer = null;
 const openPairs = new Set();
+
+function usesRandomSelection() {
+  return selectionMode === "random";
+}
+
+function activeCandidateIds() {
+  if (usesRandomSelection()) return resolvedModels.slice();
+  return [...selected];
+}
 
 function status(id, message, ok) {
   const el = document.getElementById(id);
@@ -2353,6 +2503,108 @@ function toggleCandidate(id, on) {
   if (on) selected.add(id); else selected.delete(id);
   clearJudgeIfCandidate(id);
   render();
+  scheduleResolve();
+}
+
+function setSelectionMode(mode) {
+  if (selectionMode === mode) return;
+  selectionMode = mode;
+  document.querySelectorAll("[data-selection-mode]").forEach((button) => {
+    const on = button.dataset.selectionMode === mode;
+    button.classList.toggle("is-selected", on);
+    button.setAttribute("aria-pressed", on ? "true" : "false");
+  });
+  document.getElementById("manual_selection").hidden = mode !== "manual";
+  document.getElementById("judge_section").hidden = mode !== "manual";
+  document.getElementById("random_selection").hidden = mode !== "random";
+  document.getElementById("resolved_section").hidden = mode !== "random";
+  setMenu("");
+  render();
+  scheduleResolve();
+}
+
+function scheduleResolve() {
+  if (!usesRandomSelection()) {
+    resolvedModels = [...selected];
+    resolvedJudge = judgeValue || null;
+    renderMatchups();
+    return;
+  }
+  clearTimeout(resolveTimer);
+  resolveTimer = setTimeout(() => { refreshResolved(); }, 150);
+}
+
+async function refreshResolved() {
+  clearTimeout(resolveTimer);
+  if (!usesRandomSelection()) {
+    resolvedModels = [...selected];
+    resolvedJudge = judgeValue || null;
+    return true;
+  }
+  const seq = ++resolveSeq;
+  const seedInput = document.getElementById("selection_seed");
+  const payload = {
+    universe: models.slice(),
+    selection_seed: seedInput.value.trim() || null,
+  };
+  const response = await fetch("/api/select", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const body = await response.json().catch(() => ({}));
+  if (seq !== resolveSeq) return false;
+  if (!response.ok) {
+    resolvedModels = [];
+    resolvedJudge = null;
+    document.getElementById("resolved_candidates").textContent = "Candidates: —";
+    document.getElementById("resolved_judge").textContent = "Judge: —";
+    status("resolved_status", body.error || "Selection failed", false);
+    return false;
+  }
+  resolvedModels = body.models || [];
+  resolvedJudge = body.judge || null;
+  if (typeof body.selection_seed === "string" && body.selection_seed && !seedInput.value.trim()) {
+    seedInput.value = body.selection_seed;
+  }
+  status("resolved_status", "", true);
+  syncKothOrderFromResolved();
+  renderResolved();
+  renderMatchups();
+  return true;
+}
+
+function resolvedExecutionCandidates() {
+  if (!usesRandomSelection()) return [...selected];
+  if (document.getElementById("tournament").value === "king_of_the_hill") {
+    syncKothOrder();
+    return kothOrder.slice();
+  }
+  return resolvedModels.slice();
+}
+
+function renderResolved() {
+  if (!usesRandomSelection()) return;
+  const candidates = resolvedExecutionCandidates();
+  document.getElementById("resolved_candidates").textContent =
+    "Candidates: " + (candidates.length ? candidates.join(", ") : "—");
+  document.getElementById("resolved_judge").textContent = "Judge: " + (resolvedJudge || "None");
+}
+
+function syncKothOrderFromResolved() {
+  if (!usesRandomSelection()) return;
+  const kept = kothOrder.filter((id) => resolvedModels.includes(id));
+  resolvedModels.forEach((id) => {
+    if (!kept.includes(id)) kept.push(id);
+  });
+  kothOrder.length = 0;
+  kothOrder.push(...kept);
+  const openKept = openingSlots.filter((id) => resolvedModels.includes(id));
+  resolvedModels.forEach((id) => {
+    if (!openKept.includes(id)) openKept.push(id);
+  });
+  openingSlots.length = 0;
+  openingSlots.push(...openKept);
 }
 
 function placeMenu(menu, toggle) {
@@ -2400,8 +2652,9 @@ function powerOfTwo(count) {
 }
 
 function syncOpeningSlots() {
-  const kept = openingSlots.filter((id) => selected.has(id));
-  selected.forEach((id) => {
+  const ids = activeCandidateIds();
+  const kept = openingSlots.filter((id) => ids.includes(id));
+  ids.forEach((id) => {
     if (!kept.includes(id)) kept.push(id);
   });
   openingSlots.length = 0;
@@ -2409,8 +2662,9 @@ function syncOpeningSlots() {
 }
 
 function syncKothOrder() {
-  const kept = kothOrder.filter((id) => selected.has(id));
-  selected.forEach((id) => {
+  const ids = activeCandidateIds();
+  const kept = kothOrder.filter((id) => ids.includes(id));
+  ids.forEach((id) => {
     if (!kept.includes(id)) kept.push(id);
   });
   kothOrder.length = 0;
@@ -2423,6 +2677,7 @@ function moveKothOrder(index, delta) {
   const swap = kothOrder[index];
   kothOrder[index] = kothOrder[next];
   kothOrder[next] = swap;
+  renderResolved();
   renderMatchups();
 }
 
@@ -2503,7 +2758,7 @@ function renderMatchups() {
   if (!elimination) return;
   const custom = mode.value === "custom";
   if (custom) syncOpeningSlots();
-  const ids = custom ? openingSlots : [...selected];
+  const ids = custom ? openingSlots : activeCandidateIds();
   if (!powerOfTwo(ids.length)) {
     board.hidden = !custom;
     if (!custom) return;
@@ -2613,10 +2868,12 @@ function render() {
     document.getElementById("judge").value = "";
     setMenu("");
     render();
+    scheduleResolve();
   });
   judgeOptions.append(none);
   const judgeNeedle = judgeQuery.trim().toLowerCase();
-  const judgeModels = models.filter((id) => !selected.has(id) && (!judgeNeedle || id.toLowerCase().includes(judgeNeedle)));
+  const blocked = new Set(selected);
+  const judgeModels = models.filter((id) => !blocked.has(id) && (!judgeNeedle || id.toLowerCase().includes(judgeNeedle)));
   if (models.length === 0) {
     const empty = document.createElement("p");
     empty.className = "picker-empty";
@@ -2633,9 +2890,11 @@ function render() {
       document.getElementById("judge").value = id;
       setMenu("");
       render();
+      scheduleResolve();
     });
     judgeOptions.append(button);
   });
+  renderResolved();
   renderMatchups();
 }
 
@@ -2645,16 +2904,20 @@ function applyProvider(next) {
   selected.clear();
   kothOrder.length = 0;
   openingSlots.length = 0;
+  resolvedModels = [];
+  resolvedJudge = null;
   judgeValue = "";
   document.getElementById("judge").value = "";
   candidateQuery = "";
   judgeQuery = "";
   document.getElementById("candidate_search").value = "";
   document.getElementById("judge_search").value = "";
+  document.getElementById("selection_seed").value = "";
   document.getElementById("base_url").value = "";
   document.getElementById("api_key").value = "";
   status("status", "", true);
-  document.querySelectorAll(".segment").forEach((button) => {
+  status("resolved_status", "", true);
+  document.querySelectorAll("[data-provider]").forEach((button) => {
     const on = button.dataset.provider === next;
     button.classList.toggle("is-selected", on);
     button.setAttribute("aria-pressed", on ? "true" : "false");
@@ -2666,14 +2929,16 @@ function applyProvider(next) {
   document.getElementById("manual_field").hidden = discovery;
   setMenu("");
   render();
+  scheduleResolve();
 }
 
 function addModel(id) {
   const trimmed = id.trim();
   if (!trimmed) return;
   if (!models.includes(trimmed)) models.push(trimmed);
-  selected.add(trimmed);
+  if (!usesRandomSelection()) selected.add(trimmed);
   render();
+  scheduleResolve();
 }
 
 function pairKey(row) {
@@ -3721,8 +3986,11 @@ function showDashboard(runId) {
   };
 }
 
-document.querySelectorAll(".segment").forEach((button) => {
+document.querySelectorAll("[data-provider]").forEach((button) => {
   button.addEventListener("click", () => applyProvider(button.dataset.provider));
+});
+document.querySelectorAll("[data-selection-mode]").forEach((button) => {
+  button.addEventListener("click", () => setSelectionMode(button.dataset.selectionMode));
 });
 document.getElementById("candidate_toggle").addEventListener("click", () => {
   setMenu(activeMenu === "candidate" ? "" : "candidate");
@@ -3740,10 +4008,15 @@ document.getElementById("judge_search").addEventListener("input", () => {
   judgeQuery = document.getElementById("judge_search").value;
   render();
 });
+document.getElementById("selection_seed").addEventListener("input", scheduleResolve);
 document.addEventListener("click", (event) => {
   if (!activeMenu) return;
-  const root = document.getElementById(activeMenu === "candidate" ? "candidate_picker" : "judge_picker");
-  if (root.contains(event.target)) return;
+  const roots = {
+    candidate: "candidate_picker",
+    judge: "judge_picker",
+  };
+  const root = document.getElementById(roots[activeMenu]);
+  if (root && root.contains(event.target)) return;
   setMenu("");
   render();
 });
@@ -3784,9 +4057,13 @@ document.getElementById("load").addEventListener("click", async () => {
   }
   status("status", (body.models || []).length + " models loaded", true);
   render();
+  scheduleResolve();
 });
 
-document.getElementById("tournament").addEventListener("change", renderMatchups);
+document.getElementById("tournament").addEventListener("change", () => {
+  renderResolved();
+  renderMatchups();
+});
 document.getElementById("matchups").addEventListener("change", renderMatchups);
 
 document.getElementById("start").addEventListener("click", async () => {
@@ -3798,9 +4075,20 @@ document.getElementById("start").addEventListener("click", async () => {
     status("run_status", "Tasks JSON is invalid", false);
     return;
   }
+  if (usesRandomSelection()) {
+    clearTimeout(resolveTimer);
+    const ok = await refreshResolved();
+    if (!ok) {
+      status("run_status", document.getElementById("resolved_status").textContent || "Selection failed", false);
+      return;
+    }
+  }
   const format = document.getElementById("tournament").value;
   if (format === "king_of_the_hill") syncKothOrder();
-  const modelsPayload = format === "king_of_the_hill" ? kothOrder.slice() : [...selected];
+  const modelsPayload = usesRandomSelection()
+    ? resolvedExecutionCandidates()
+    : (format === "king_of_the_hill" ? kothOrder.slice() : [...selected]);
+  renderResolved();
   const response = await fetch("/api/runs", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -3809,7 +4097,12 @@ document.getElementById("start").addEventListener("click", async () => {
       base_url: provider === "compatible" ? baseUrl() : "",
       api_key: apiKey(),
       models: modelsPayload,
-      judge: document.getElementById("judge").value || null,
+      judge: usesRandomSelection() ? null : (document.getElementById("judge").value || null),
+      random: usesRandomSelection(),
+      universe: usesRandomSelection() ? models.slice() : [],
+      selection_seed: usesRandomSelection()
+        ? (document.getElementById("selection_seed").value.trim() || null)
+        : null,
       tasks,
       seed: document.getElementById("seed").value.trim() || "0",
       tournament: format,
@@ -4930,6 +5223,11 @@ mod tests {
         assert!(PAGE.contains("id=\"history_list\""));
         assert!(PAGE.contains("loadHistory()"));
         assert!(PAGE.contains("fetch(\"/api/runs\")"));
+        assert!(PAGE.contains("id=\"resolved_section\""));
+        assert!(PAGE.contains("id=\"selection_seed\""));
+        assert!(PAGE.contains("fetch(\"/api/select\""));
+        assert!(PAGE.contains("data-selection-mode=\"random\""));
+        assert!(PAGE.contains("Arena selects"));
     }
 
     #[test]
@@ -5243,6 +5541,9 @@ mod tests {
                 api_key: " ".into(),
                 models: vec!["m0".into(), "m1".into()],
                 judge: None,
+                random: false,
+                universe: Vec::new(),
+                selection_seed: None,
                 tasks: sample_tasks(),
                 seed: "0".into(),
                 tournament: TournamentFormat::RoundRobin,
@@ -5261,6 +5562,9 @@ mod tests {
                 api_key: "secret".into(),
                 models: vec!["m0".into(), "m1".into()],
                 judge: None,
+                random: false,
+                universe: Vec::new(),
+                selection_seed: None,
                 tasks: sample_tasks(),
                 seed: "0".into(),
                 tournament: TournamentFormat::RoundRobin,
@@ -5279,6 +5583,9 @@ mod tests {
                 api_key: "secret".into(),
                 models: vec!["judge".into()],
                 judge: Some("judge".into()),
+                random: false,
+                universe: Vec::new(),
+                selection_seed: None,
                 tasks: sample_tasks(),
                 seed: "0".into(),
                 tournament: TournamentFormat::RoundRobin,
@@ -5336,6 +5643,9 @@ mod tests {
                 api_key: "secret".into(),
                 models: vec!["m0".into(), "m1".into()],
                 judge: None,
+                random: false,
+                universe: Vec::new(),
+                selection_seed: None,
                 tasks: sample_tasks(),
                 seed: "9007199254740993.0".into(),
                 tournament: TournamentFormat::RoundRobin,
@@ -5368,6 +5678,9 @@ mod tests {
         let elimination = build_exec_config_with_format(
             vec!["m0".into(), "m1".into(), "m2".into(), "m3".into()],
             Some("judge".into()),
+            false,
+            Vec::new(),
+            None,
             vec![task()],
             "https://example.test/v1".into(),
             None,
@@ -5393,6 +5706,9 @@ mod tests {
         let config = build_exec_config_with_format(
             vec!["m2".into(), "m0".into(), "m1".into()],
             Some("judge".into()),
+            false,
+            Vec::new(),
+            None,
             vec![task()],
             "https://example.test/v1".into(),
             None,
@@ -5416,6 +5732,9 @@ mod tests {
         let config = build_exec_config_with_format(
             vec!["m0".into(), "m1".into(), "m2".into(), "m3".into()],
             Some("judge".into()),
+            false,
+            Vec::new(),
+            None,
             vec![task()],
             "https://example.test/v1".into(),
             None,
@@ -5878,6 +6197,9 @@ mod tests {
                 api_key: "secret".into(),
                 models: vec!["m0".into(), "m1".into(), "m2".into()],
                 judge: Some("judge".into()),
+                random: false,
+                universe: Vec::new(),
+                selection_seed: None,
                 tasks: sample_tasks(),
                 seed: "0".into(),
                 tournament: TournamentFormat::SingleElimination,
@@ -5894,6 +6216,9 @@ mod tests {
         let config = build_exec_config_with_format(
             vec!["m0".into(), "m1".into(), "m2".into()],
             Some("judge".into()),
+            false,
+            Vec::new(),
+            None,
             vec![task()],
             "https://example.test/v1".into(),
             None,
@@ -5906,6 +6231,9 @@ mod tests {
         let rejected = build_exec_config_with_format(
             vec!["m0".into(), "m1".into(), "m2".into()],
             Some("judge".into()),
+            false,
+            Vec::new(),
+            None,
             vec![task()],
             "https://example.test/v1".into(),
             None,
@@ -5928,6 +6256,9 @@ mod tests {
                 api_key: "secret".into(),
                 models: vec!["m0".into(), "m1".into()],
                 judge: Some("judge".into()),
+                random: false,
+                universe: Vec::new(),
+                selection_seed: None,
                 tasks: sample_tasks(),
                 seed: "0".into(),
                 tournament: TournamentFormat::RoundRobin,
@@ -5950,6 +6281,9 @@ mod tests {
                 api_key: "secret".into(),
                 models: vec!["m0".into(), "m1".into(), "m2".into(), "m3".into()],
                 judge: Some("judge".into()),
+                random: false,
+                universe: Vec::new(),
+                selection_seed: None,
                 tasks: sample_tasks(),
                 seed: "0".into(),
                 tournament: TournamentFormat::SingleElimination,
@@ -5975,6 +6309,9 @@ mod tests {
         let config = build_exec_config_with_format(
             vec!["m0".into(), "m1".into()],
             Some("judge".into()),
+            false,
+            Vec::new(),
+            None,
             vec![task()],
             "https://example.test/v1".into(),
             None,

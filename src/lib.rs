@@ -13,6 +13,7 @@ pub mod provider;
 pub mod rating;
 pub mod report;
 mod retry;
+pub mod selection;
 pub mod stats;
 pub mod task;
 pub mod tournament;

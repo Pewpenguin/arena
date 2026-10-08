@@ -12,6 +12,7 @@ use crate::execute::{ExecutionResult, execute_models};
 use crate::judge::{Judgment, JudgmentFailure};
 use crate::persist::{self, Output, RunMetadata};
 use crate::provider::{ModelId, ModelProvider};
+use crate::selection::SelectionProvenance;
 use crate::stats;
 use crate::task::Task;
 use crate::tournament::{self, TournamentFormat, TournamentStatus};
@@ -29,6 +30,7 @@ pub struct ExecConfig {
     pub started_at: String,
     pub base_url: String,
     pub provider: Option<String>,
+    pub selection: Option<SelectionProvenance>,
 }
 
 pub fn unique_models(ids: Vec<String>) -> Result<Vec<ModelId>> {
@@ -222,6 +224,12 @@ where
         config.base_url.clone(),
     );
     run.provider = config.provider.clone();
+    if let Some(selection) = &config.selection {
+        run = run.with_selection(
+            Some(selection.universe.clone()),
+            Some(selection.selection_seed),
+        );
+    }
     let (judgments, judgment_failures, statistics, ratings, expected, resolved, failed) =
         if config.judge.is_some() {
             let statistics = stats::aggregate(&judgments, &config.models);
@@ -346,6 +354,7 @@ mod tests {
             started_at: "2026-01-02T03:04:05Z".into(),
             base_url: "https://example.test/v1".into(),
             provider: None,
+            selection: None,
         }
     }
 
@@ -652,6 +661,7 @@ mod tests {
             started_at: "2026-01-02T03:04:05Z".into(),
             base_url: "https://example.test/v1".into(),
             provider: None,
+            selection: None,
         };
 
         let (output, failed_pairs) = collect_exec(&OkProvider, &cfg, |_| {}, |_| {}, |_| {})

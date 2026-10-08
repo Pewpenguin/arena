@@ -72,6 +72,10 @@ pub struct RunMetadata {
     pub(crate) bootstrap_ran: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) bootstrap_unavailable: Option<BootstrapUnavailable>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) selection_universe: Option<Vec<ModelId>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) selection_seed: Option<u64>,
 }
 
 impl RunMetadata {
@@ -108,7 +112,19 @@ impl RunMetadata {
             bootstrap_clusters: None,
             bootstrap_ran: None,
             bootstrap_unavailable: None,
+            selection_universe: None,
+            selection_seed: None,
         }
+    }
+
+    pub fn with_selection(
+        mut self,
+        selection_universe: Option<Vec<ModelId>>,
+        selection_seed: Option<u64>,
+    ) -> Self {
+        self.selection_universe = selection_universe;
+        self.selection_seed = selection_seed;
+        self
     }
 
     pub fn with_bootstrap(mut self, meta: &BootstrapMeta) -> Self {
@@ -262,6 +278,8 @@ mod tests {
         assert!(value.get("bootstrap_clusters").is_none());
         assert!(value.get("bootstrap_ran").is_none());
         assert!(value.get("bootstrap_unavailable").is_none());
+        assert!(value.get("selection_universe").is_none());
+        assert!(value.get("selection_seed").is_none());
         assert!(value.get("complete").is_none());
         assert!(value.get("expected_pairs").is_none());
         assert!(value.get("resolved_pairs").is_none());
@@ -455,6 +473,33 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn selection_provenance_serializes_only_when_set() {
+        let run = run_meta(
+            vec![ModelId::new("a"), ModelId::new("c")],
+            Some(ModelId::new("j2")),
+            None,
+        )
+        .with_selection(
+            Some(vec![
+                ModelId::new("a"),
+                ModelId::new("b"),
+                ModelId::new("c"),
+                ModelId::new("j2"),
+            ]),
+            Some(42),
+        );
+        let value = serde_json::to_value(&run).unwrap();
+        assert_eq!(value["models"], serde_json::json!(["a", "c"]));
+        assert_eq!(value["judge"], "j2");
+        assert_eq!(
+            value["selection_universe"],
+            serde_json::json!(["a", "b", "c", "j2"])
+        );
+        assert_eq!(value["selection_seed"], 42);
+        assert!(value.get("api_key").is_none());
     }
 
     #[test]

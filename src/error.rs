@@ -36,6 +36,22 @@ pub enum Error {
     },
     #[error("at least one candidate model is required")]
     NoCandidates,
+    #[error("model universe is empty; load or discover models before random selection")]
+    EmptyModelUniverse,
+    #[error(
+        "model universe is too small for random selection: need at least {needed} models, got {available}"
+    )]
+    UniverseTooSmall { needed: usize, available: usize },
+    #[error("candidate count must be between 1 and {available}, got {count}")]
+    InvalidCandidateCount { count: usize, available: usize },
+    #[error("use either manual model selection or random selection, not both")]
+    ConflictingSelectionMode,
+    #[error(
+        "random selection requires a provider that can list models (openai or openrouter); {provider} cannot"
+    )]
+    RandomRequiresDiscovery { provider: &'static str },
+    #[error("provided candidates do not match Arena's random selection for this seed")]
+    SelectionMismatch,
     #[error(
         "{format} requires a power-of-two number of candidates (2, 4, 8, ...), got {candidates}"
     )]

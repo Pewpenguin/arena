@@ -60,6 +60,16 @@ Run multiple models against a task file:
 
 `--model` can be specified multiple times. Model IDs must be unique. `--judge` must not match any `--model`. `--judge` and `--output` are optional. `--tournament` selects `round-robin` (the default), `single-elimination`, or `king-of-the-hill`. `--best-of` sets the series length and must be an odd positive integer; the default is `1`. `--seed` defaults to `0` and, when a judge is used, seeds bootstrap resampling and elimination seeded fallback; it does not control ordinary scheduling or provider completions. `--provider` selects `openai` (the default), `openrouter`, `anthropic`, or `gemini`.
 
+Let Arena choose the candidates and judge itself:
+
+    cargo run -- exec \
+      --tasks tasks.json \
+      --random \
+      --selection-seed 42 \
+      --output results.json
+
+`--random` lists models from the provider (openai or openrouter), then Arena picks the participants once before the run. Do not combine `--random` with `--model` or `--judge`. `--selection-seed` makes that choice reproducible and is independent of tournament/bootstrap `--seed`; if omitted, Arena generates a seed and persists it. The resolved models are written to the run output like a normal manual selection. Anthropic and Gemini do not support `--random` yet because they cannot list models in Arena.
+
 Without `--output`, the JSON result is written to stdout. Each candidate provider request is tried up to three times (a 1s backoff, then 2s) for provider errors and invalid provider responses. An exhausted candidate failure still aborts the run without producing output. A permanently failed judged game is saved in the output with `run.complete` set to false, and the process then exits non-zero.
 
 Render a persisted experiment JSON file as a self-contained HTML audit report:

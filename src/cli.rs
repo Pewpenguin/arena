@@ -59,12 +59,16 @@ pub enum Command {
         provider: ProviderChoice,
         #[arg(long)]
         tasks: PathBuf,
-        #[arg(long = "model", required = true)]
+        #[arg(long = "model", required_unless_present = "random")]
         models: Vec<String>,
         #[arg(long)]
         output: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "random")]
         judge: Option<String>,
+        #[arg(long, conflicts_with = "models")]
+        random: bool,
+        #[arg(long, requires = "random")]
+        selection_seed: Option<u64>,
         #[arg(long, value_enum, default_value_t = TournamentFormat::RoundRobin)]
         tournament: TournamentFormat,
         #[arg(long, default_value_t = DEFAULT_BEST_OF)]
